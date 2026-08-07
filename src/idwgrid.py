@@ -1,5 +1,4 @@
-"""
-idwgrid — CLI driver for pull-push scattered-data interpolation.
+"""idwgrid — CLI driver for pull-push scattered-data interpolation.
 
 Turns scattered geolocated point values into a continent-scale, gapless,
 capped raster surface, in minutes, on a single machine, with no GPU.
@@ -10,12 +9,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
-import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
+import rasterio
 from pyproj import Transformer
 from rasterio.transform import from_origin
 from rasterio.windows import Window
@@ -40,56 +42,66 @@ NODATA: int = -32768
 _CTX: dict[str, Any] = {}
 
 
-def _init_worker(
-    pts_path: str,
-    transform_state: dict[str, Any],
-    pct_quantiles: list[float],
-    starts: list[int],
-    nbx: int,
-    nby: int,
-    bsize: int,
-    halo: int,
-    res: float,
-    levels: int,
-    cap_km: float,
-    x0: float,
-    y0: float,
-    NX: int,
-    NY: int,
-    NXp: int,
-    NYp: int,
-    sat: float,
-    baseline: bool,
-    scale: float,
-) -> None:
+@dataclass
+class _WorkerConfig:
+    """Configuration passed to each worker process."""
+
+    pts_path: str
+    transform_state: dict[str, Any]
+    pct_quantiles: list[float]
+    starts: list[int]
+    nbx: int
+    nby: int
+    bsize: int
+    halo: int
+    res: float
+    levels: int
+    cap_km: float
+    x0: float
+    y0: float
+    nx: int
+    ny: int
+    nx_padded: int
+    ny_padded: int
+    sat: float
+    baseline: bool
+    scale: float
+
+
+def _init_worker(cfg: _WorkerConfig) -> None:
     """Initialise per-worker context."""
     global _CTX
     _CTX = {
-        "pts": np.load(pts_path, mmap_mode="r"),
-        "tf": make_transform(transform_state),
-        "pct": PercentileTransform(pct_quantiles),
-        "starts": starts,
-        "nbx": nbx,
-        "nby": nby,
-        "bsize": bsize,
-        "halo": halo,
-        "res": res,
-        "levels": levels,
-        "cap_km": cap_km,
-        "x0": x0,
-        "y0": y0,
-        "NX": NX,
-        "NY": NY,
-        "NXp": NXp,
-        "NYp": NYp,
-        "sat": sat,
-        "baseline": baseline,
-        "scale": scale,
+        "pts": np.load(cfg.pts_path, mmap_mode="r"),
+        "tf": make_transform(cfg.transform_state),
+        "pct": PercentileTransform(cfg.pct_quantiles),
+        "starts": cfg.starts,
+        "nbx": cfg.nbx,
+        "nby": cfg.nby,
+        "bsize": cfg.bsize,
+        "halo": cfg.halo,
+        "res": cfg.res,
+        "levels": cfg.levels,
+        "cap_km": cfg.cap_km,
+        "x0": cfg.x0,
+        "y0": cfg.y0,
+        "nx": cfg.nx,
+        "ny": cfg.ny,
+        "nx_padded": cfg.nx_padded,
+        "ny_padded": cfg.ny_padded,
+        "sat": cfg.sat,
+        "baseline": cfg.baseline,
+        "scale": cfg.scale,
     }
 
 
 def _block_points(bx: int, by: int) -> np.ndarray:
-    """Gather points from the 3x3 block neighbourhood (valid while halo <= bsize)."""
+    """Gather points from the 3x3 block neighbourhood (valid while halo <= bsize).
+
+    Returns:
+        Concatenated point array of shape (4, n_points).
+
+    """
     c = _CTX
     out: list[np.ndarray] = []
     for jx in range(max(0, bx - 1), min(c["nbx"], bx + 2)):
@@ -104,7 +116,12 @@ def _block_points(bx: int, by: int) -> np.ndarray:
 def _process_block(
     args: tuple[int, int],
 ) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
-    """Process a single block. Returns (bx, by, (Vq, Rq) or None)."""
+    """Process a single block.
+
+    Returns:
+        Tuple of (bx, by, output) where output is (vq, rq) or None.
+
+    """
     bx, by = args
     c = _CTX
     res = c["res"]
@@ -113,14 +130,14 @@ def _process_block(
     step = 1 << c["levels"]
     i0 = bx * bsize
     j0 = by * bsize
-    i1 = min(i0 + bsize, c["NX"])
-    j1 = min(j0 + bsize, c["NY"])
+    i1 = min(i0 + bsize, c["nx"])
+    j1 = min(j0 + bsize, c["ny"])
 
     # Snap halo origin to multiple of step for exact alignment
     hi0 = max(0, ((i0 - halo) // step) * step)
     hj0 = max(0, ((j0 - halo) // step) * step)
-    hi1 = min(c["NXp"], -(-(i1 + halo) // step) * step)
-    hj1 = min(c["NYp"], -(-(j1 + halo) // step) * step)
+    hi1 = min(c["nx_padded"], -(-(i1 + halo) // step) * step)
+    hj1 = min(c["ny_padded"], -(-(j1 + halo) // step) * step)
 
     sel = _block_points(bx, by)
     if sel.shape[1] == 0:
@@ -136,32 +153,32 @@ def _process_block(
     jloc = iy[m] - hj0
     tv = sel[2][m]
 
-    S, C = bin_points(iloc, jloc, tv, hi1 - hi0, hj1 - hj0)
-    V, R = pull_push(S, C, res, c["levels"], saturation=c["sat"])
+    s, c_grid = bin_points(iloc, jloc, tv, hi1 - hi0, hj1 - hj0)
+    val, sup = pull_push(s, c_grid, res, c["levels"], saturation=c["sat"])
 
     # Mask from exact radius query
     cap_cells = round(c["cap_km"] * 1000.0 / res)
-    near = box_count(C, cap_cells) > 0
+    near = box_count(c_grid, cap_cells) > 0
 
     # Extract output window
     a0 = i0 - hi0
     b0 = j0 - hj0
     sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
-    V_out = V[sl]
-    R_out = R[sl] / 1000.0
+    v_out = val[sl]
+    r_out = sup[sl] / 1000.0
     near_out = near[sl]
 
     # Transform: interpolate space -> raw -> percentile
     scale = c["scale"]
-    pv = c["pct"].fwd(c["tf"].inv(V_out))
-    Vq = np.where(near_out, np.round(pv * scale), NODATA).astype(np.int16)
-    Rq = np.where(
+    pv = c["pct"].fwd(c["tf"].inv(v_out))
+    vq = np.where(near_out, np.round(pv * scale), NODATA).astype(np.int16)
+    rq = np.where(
         near_out,
-        np.clip(np.round(np.log2(np.maximum(R_out, 1e-3)) * 8), -32000, 32000),
+        np.clip(np.round(np.log2(np.maximum(r_out, 1e-3)) * 8), -32000, 32000),
         NODATA,
     ).astype(np.int16)
 
-    return bx, by, (Vq, Rq)
+    return bx, by, (vq, rq)
 
 
 def _block_neighbourhood_nonempty(
@@ -171,7 +188,12 @@ def _block_neighbourhood_nonempty(
     nbx: int,
     nby: int,
 ) -> bool:
-    """True if any of the 3x3 neighbourhood has points."""
+    """Check if any of the 3x3 neighbourhood has points.
+
+    Returns:
+        True if the block neighbourhood contains data.
+
+    """
     for jx in range(max(0, bx - 1), min(nbx, bx + 2)):
         for jy in range(max(0, by - 1), min(nby, by + 2)):
             lo = starts[jx * nby + jy]
@@ -194,6 +216,7 @@ def run(
     block_size: int = 8192,
     workers: int = 4,
     calib_path: str | None = None,
+    *,
     baseline: bool = False,
     scale: float = 100.0,
     compress: str = "ZSTD",
@@ -201,17 +224,16 @@ def run(
     src_crs: int = 4326,
     skip_calibration: bool = False,
 ) -> tuple[str, str]:
-    """Full pipeline: load, calibrate, interpolate, write."""
+    """Full pipeline: load, calibrate, interpolate, write.
 
+    Returns:
+        Tuple of (value_tiff_path, support_tiff_path).
+
+    """
     # --- Ingest ---
-    print("Reading input...", file=sys.stderr)
     if input_path.endswith((".parquet", ".pq")):
-        import pandas as pd
-
         df = pd.read_parquet(input_path, columns=[value_col, lng_col, lat_col])
     else:
-        import pandas as pd
-
         df = pd.read_csv(input_path, usecols=[value_col, lng_col, lat_col])
 
     v = df[value_col].to_numpy(np.float64)
@@ -220,8 +242,7 @@ def run(
 
     good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
     v, lon, lat = v[good], lon[good], lat[good]
-    N = len(v)
-    print(f"  {N:,} valid points", file=sys.stderr)
+    n = len(v)
 
     tr = Transformer.from_crs(src_crs, WORK_CRS, always_xy=True)
     x, y = tr.transform(lon, lat)
@@ -229,15 +250,12 @@ def run(
     y = np.asarray(y)
 
     # --- Calibration ---
-    cpath = calib_path
     cal: dict[str, Any] | None = None
-    if cpath and os.path.exists(cpath):
-        print(f"Load calibration from {cpath}", file=sys.stderr)
-        with open(cpath) as f:
+    cpath_obj = Path(calib_path) if calib_path else None
+    if cpath_obj and cpath_obj.exists():
+        with cpath_obj.open(encoding="utf-8") as f:
             cal = json.load(f)
     elif not skip_calibration:
-        print("Calibrating...", file=sys.stderr)
-        n = len(v)
         if n > calib_max_points:
             sub = np.random.default_rng(0).choice(n, calib_max_points, replace=False)
             cx, cy, cv = x[sub], y[sub], v[sub]
@@ -255,24 +273,19 @@ def run(
             "transform_state": tf.state(),
             "percentile_quantiles": pct_fit.q.tolist(),
             "cap_km": cap,
-            "cv": {
-                str(k): {"overall_skill": d["overall_skill"], "cap_km": d.get("cap_km")}
-                for k, d in detail.items()
-            },
+            "cv": {str(k): {"overall_skill": d["overall_skill"], "cap_km": d.get("cap_km")} for k, d in detail.items()},
         }
-        os.makedirs(out_dir, exist_ok=True)
-        with open(cpath or os.path.join(out_dir, "calibration.json"), "w") as f:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        cal_path = cpath_obj or Path(out_dir) / "calibration.json"
+        with cal_path.open("w", encoding="utf-8") as f:
             json.dump(cal, f, indent=2)
     else:
-        print("Skip calibration, use defaults...", file=sys.stderr)
         cal = {
             "transform": "identity",
             "cap_km": float(cap_km) if cap_km != "auto" else 64.0,
         }
 
-    tname = (
-        transform if transform != "auto" else (cal["transform"] if cal else "identity")
-    )
+    tname = transform if transform != "auto" else (cal["transform"] if cal else "identity")
     if cal and "transform_state" in cal and cal["transform_state"].get("name") == tname:
         tf = make_transform(cal["transform_state"])
     else:
@@ -284,31 +297,24 @@ def run(
         else PercentileTransform().fit(v)
     )
 
-    cap_km_val = (
-        float(cap_km) if cap_km != "auto" else float(cal["cap_km"] if cal else 64.0)
-    )
-    print(f"  Transform: {tname}, cap: {cap_km_val} km", file=sys.stderr)
+    cap_km_val = float(cap_km) if cap_km != "auto" else float(cal["cap_km"] if cal else 64.0)
 
     tv = tf.fwd(v)
 
     # --- Grid geometry ---
     x0 = x.min()
     y0 = y.min()
-    NX = int((x.max() - x0) // res) + 1
-    NY = int((y.max() - y0) // res) + 1
+    nx = int((x.max() - x0) // res) + 1
+    ny = int((y.max() - y0) // res) + 1
 
     levels = max(1, math.ceil(math.log2(max(cap_km_val * 1000.0 / res, 2.0))))
     step = 1 << levels
     halo = max(math.ceil(cap_km_val * 1000.0 / res) + 2, step)
-    NXp = -(-NX // step) * step
-    NYp = -(-NY // step) * step
+    nx_padded = -(-nx // step) * step
+    ny_padded = -(-ny // step) * step
     bsize = max(block_size, step)
-    nbx = math.ceil(NX / bsize)
-    nby = math.ceil(NY / bsize)
-
-    print(f"  Grid: {NX}×{NY}, {(NX * NY):,} cells", file=sys.stderr)
-    print(f"  Pyramid: {levels} levels, step={step}, halo={halo}", file=sys.stderr)
-    print(f"  Blocks: {nbx}×{nby} ({nbx * nby} total), block={bsize}", file=sys.stderr)
+    nbx = math.ceil(nx / bsize)
+    nby = math.ceil(ny / bsize)
 
     # --- Spatial index ---
     bx_ = np.clip(((x - x0) // res // bsize).astype(np.int64), 0, nbx - 1)
@@ -318,8 +324,8 @@ def run(
     starts = np.searchsorted(bid[order], np.arange(nbx * nby + 1))
 
     # Memmap for workers
-    pts_path = os.path.join(out_dir, "_points.npy")
-    pts = np.lib.format.open_memmap(pts_path, mode="w+", dtype=np.float64, shape=(4, N))
+    pts_path = Path(out_dir) / "_points.npy"
+    pts = np.lib.format.open_memmap(pts_path, mode="w+", dtype=np.float64, shape=(4, n))
     pts[0] = x[order]
     pts[1] = y[order]
     pts[2] = tv[order]
@@ -328,55 +334,42 @@ def run(
 
     # --- Task list ---
     tasks: list[tuple[int, int]] = [
-        (i, j)
-        for i in range(nbx)
-        for j in range(nby)
-        if _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
+        (i, j) for i in range(nbx) for j in range(nby) if _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
     ]
     empty_blocks: list[tuple[int, int]] = [
-        (i, j)
-        for i in range(nbx)
-        for j in range(nby)
-        if not _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
+        (i, j) for i in range(nbx) for j in range(nby) if not _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
     ]
 
-    print(
-        f"  {len(tasks)} blocks to process, {len(empty_blocks)} empty, using {workers} workers",
-        file=sys.stderr,
-    )
-
-    # --- Worker init args ---
-    initargs = (
-        pts_path,
-        cal.get("transform_state", {"name": tname}),
-        cal.get("percentile_quantiles", pct_q.q.tolist()),
-        starts.tolist(),
-        nbx,
-        nby,
-        bsize,
-        halo,
-        res,
-        levels,
-        cap_km_val,
-        float(x0),
-        float(y0),
-        NX,
-        NY,
-        NXp,
-        NYp,
-        saturation,
-        baseline,
-        scale,
+    # --- Worker config ---
+    cfg = _WorkerConfig(
+        pts_path=str(pts_path),
+        transform_state=cal.get("transform_state", {"name": tname}),
+        pct_quantiles=cal.get("percentile_quantiles", pct_q.q.tolist()),
+        starts=starts.tolist(),
+        nbx=nbx,
+        nby=nby,
+        bsize=bsize,
+        halo=halo,
+        res=res,
+        levels=levels,
+        cap_km=cap_km_val,
+        x0=float(x0),
+        y0=float(y0),
+        nx=nx,
+        ny=ny,
+        nx_padded=nx_padded,
+        ny_padded=ny_padded,
+        sat=saturation,
+        baseline=baseline,
+        scale=scale,
     )
 
     # --- Raster profile ---
-    import rasterio
-
-    xform = from_origin(x0, y0 + NY * res, res, res)
+    xform = from_origin(x0, y0 + ny * res, res, res)
     common = {
         "driver": "GTiff",
-        "height": NY,
-        "width": NX,
+        "height": ny,
+        "width": nx,
         "count": 1,
         "crs": f"EPSG:{WORK_CRS}",
         "transform": xform,
@@ -389,8 +382,8 @@ def run(
     vprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
     sprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
 
-    vpath = os.path.join(out_dir, "value.tif")
-    spath = os.path.join(out_dir, "support_km.tif")
+    vpath = Path(out_dir) / "value.tif"
+    spath = Path(out_dir) / "support_km.tif"
 
     t_start = time.perf_counter()
 
@@ -412,24 +405,22 @@ def run(
         # Write empty blocks as nodata
         for bx, by in empty_blocks:
             i0, j0 = bx * bsize, by * bsize
-            i1, j1 = min(i0 + bsize, NX), min(j0 + bsize, NY)
-            w = Window(i0, NY - j1, i1 - i0, j1 - j0)
+            i1, j1 = min(i0 + bsize, nx), min(j0 + bsize, ny)
+            w = Window(i0, ny - j1, i1 - i0, j1 - j0)
             blank = np.full((w.height, w.width), NODATA, np.int16)
             vd.write(blank, 1, window=w)
             sd.write(blank, 1, window=w)
 
         # Process blocks with parallel workers
-        from concurrent.futures import ProcessPoolExecutor
-
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_worker,
-            initargs=initargs,
+            initargs=(cfg,),
         ) as ex:
             for bx, by, out in ex.map(_process_block, tasks, chunksize=1):
                 i0, j0 = bx * bsize, by * bsize
-                i1, j1 = min(i0 + bsize, NX), min(j0 + bsize, NY)
-                w = Window(i0, NY - j1, i1 - i0, j1 - j0)
+                i1, j1 = min(i0 + bsize, nx), min(j0 + bsize, ny)
+                w = Window(i0, ny - j1, i1 - i0, j1 - j0)
 
                 if out is None:
                     blank = np.full((w.height, w.width), NODATA, np.int16)
@@ -437,24 +428,20 @@ def run(
                     sd.write(blank, 1, window=w)
                     continue
 
-                Vq, Rq = out
-                vd.write(Vq.T[::-1, :], 1, window=w)
-                sd.write(Rq.T[::-1, :], 1, window=w)
+                vq, rq = out
+                vd.write(vq.T[::-1, :], 1, window=w)
+                sd.write(rq.T[::-1, :], 1, window=w)
 
-    dt = time.perf_counter() - t_start
-    print(f"Done in {dt:.0f}s", file=sys.stderr)
-    print(f"  {vpath}", file=sys.stderr)
-    print(f"  {spath}", file=sys.stderr)
+    time.perf_counter() - t_start
 
     # Cleanup memmap
-    os.remove(pts_path)
-    return vpath, spath
+    pts_path.unlink()
+    return str(vpath), str(spath)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Pull-push scattered-data interpolation"
-    )
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
     parser.add_argument("input", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="outputs/", help="Output directory")
     parser.add_argument("--value-col", default="value", help="Value column name")
@@ -476,19 +463,15 @@ def main() -> None:
     parser.add_argument("--block", type=int, default=8192, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers")
     parser.add_argument("--baseline", action="store_true")
-    parser.add_argument(
-        "--scale", type=float, default=100.0, help="DN = percentile * scale"
-    )
+    parser.add_argument("--scale", type=float, default=100.0, help="DN = percentile * scale")
     parser.add_argument("--compress", default="ZSTD")
     parser.add_argument("--calib-max-points", type=int, default=2_000_000)
     parser.add_argument("--calibration", default=None, help="Calibration JSON path")
     parser.add_argument("--src-crs", type=int, default=4326)
-    parser.add_argument(
-        "--skip-calibration", action="store_true", help="Skip calibration, use defaults"
-    )
+    parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
     args = parser.parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
+    Path(args.out).mkdir(parents=True, exist_ok=True)
     run(
         args.input,
         args.value_col,

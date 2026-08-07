@@ -1,6 +1,6 @@
-"""
-Per-layer calibration: pick the value transform, and derive the fill cap
-from the data rather than hardcoding it.
+"""Per-layer calibration: pick the value transform, and derive the fill cap.
+
+Derive the fill cap from the data rather than hardcoding it.
 
 1. Which transform makes the field spatially predictable?
    Scored by intraclass correlation (between-cell variance / total variance)
@@ -26,6 +26,8 @@ from .pullpush import bin_points, pad_to_pyramid, pull_push
 
 
 class Transform:
+    """Base class for value transforms."""
+
     def __init__(
         self,
         name: str,
@@ -33,21 +35,46 @@ class Transform:
         inv: Callable[[np.ndarray], np.ndarray],
         valid: Callable[[np.ndarray], bool],
     ) -> None:
+        """Initialize a stateless transform."""
         self.name: str = name
         self._fwd: Callable[[np.ndarray], np.ndarray] = fwd
         self._inv: Callable[[np.ndarray], np.ndarray] = inv
         self.valid: Callable[[np.ndarray], bool] = valid
 
-    def fit(self, v: np.ndarray) -> Transform:
+    def fit(self, _v: np.ndarray) -> Transform:
+        """Fit the transform to data. No-op for stateless transforms.
+
+        Returns:
+            Self, for chaining.
+
+        """
         return self
 
     def fwd(self, v: np.ndarray) -> np.ndarray:
+        """Apply forward transform.
+
+        Returns:
+            Transformed values.
+
+        """
         return self._fwd(v)
 
     def inv(self, v: np.ndarray) -> np.ndarray:
+        """Apply inverse transform.
+
+        Returns:
+            Inverse-transformed values.
+
+        """
         return self._inv(v)
 
     def state(self) -> dict[str, Any]:
+        """Return serialisable state.
+
+        Returns:
+            Dict with transform name and parameters.
+
+        """
         return {"name": self.name}
 
 
@@ -57,15 +84,22 @@ class PercentileTransform(Transform):
     NQ = 1001
 
     def __init__(self, q: np.ndarray | None = None) -> None:
+        """Initialize with optional pre-fitted quantiles."""
         self.name: str = "percentile"
-        self.valid: Callable[[np.ndarray], bool] = lambda v: True
+        self.valid: Callable[[np.ndarray], bool] = lambda _v: True
         self.q: np.ndarray | None = None if q is None else np.asarray(q, np.float64)
 
     def fit(self, v: np.ndarray) -> PercentileTransform:
+        """Fit quantiles from data.
+
+        Returns:
+            Self, for chaining.
+
+        """
         q = np.quantile(v.astype(np.float64), np.linspace(0, 1, self.NQ))
         self.q = np.maximum.accumulate(q)
         eps = np.arange(self.NQ) * np.spacing(np.abs(self.q).max() + 1.0)
-        self.q = self.q + eps
+        self.q += eps
         return self
 
     @property
@@ -73,19 +107,42 @@ class PercentileTransform(Transform):
         return np.linspace(0.0, 100.0, self.NQ)
 
     def fwd(self, v: np.ndarray) -> np.ndarray:
+        """Map values to percentiles.
+
+        Returns:
+            Percentile values in [0, 100].
+
+        """
         return np.interp(v, self.q, self._p)
 
     def inv(self, p: np.ndarray) -> np.ndarray:
+        """Map percentiles back to values.
+
+        Returns:
+            Original-scale values.
+
+        """
         return np.interp(p, self._p, self.q)
 
     def state(self) -> dict[str, Any]:
+        """Return serialisable state with quantiles.
+
+        Returns:
+            Dict with transform name and quantile array.
+
+        """
         return {"name": "percentile", "quantiles": self.q.tolist()}
 
 
 def transforms() -> list[Transform]:
-    """Fresh candidate instances. MUST be a factory, not a module-level list."""
+    """Fresh candidate instances. MUST be a factory, not a module-level list.
+
+    Returns:
+        List of unfitted Transform instances.
+
+    """
     return [
-        Transform("identity", lambda v: v, lambda t: t, lambda v: True),
+        Transform("identity", lambda v: v, lambda t: t, lambda _v: True),
         Transform("log10", np.log10, lambda t: 10.0**t, lambda v: v.min() > 0),
         Transform("sqrt", np.sqrt, lambda t: t**2, lambda v: v.min() >= 0),
         PercentileTransform(),
@@ -93,7 +150,12 @@ def transforms() -> list[Transform]:
 
 
 def make_transform(state: dict[str, Any]) -> Transform:
-    """Rebuild a fitted transform from its serialised state."""
+    """Rebuild a fitted transform from its serialised state.
+
+    Returns:
+        A Transform instance matching the state.
+
+    """
     if state.get("name") == "percentile":
         return PercentileTransform(state.get("quantiles"))
     return next(t for t in transforms() if t.name == state.get("name"))
@@ -106,8 +168,15 @@ def _cell_key(x: np.ndarray, y: np.ndarray, res: float) -> np.ndarray:
 
 
 def icc(values: np.ndarray, x: np.ndarray, y: np.ndarray, res: float) -> float:
-    """Intraclass correlation at cell size `res`: the share of total variance
-    explained by location. ~0 means the value is not a spatial field at all."""
+    """Intraclass correlation at cell size `res`.
+
+    The share of total variance explained by location. ~0 means the value
+    is not a spatial field at all.
+
+    Returns:
+        ICC value between 0 and 1.
+
+    """
     key = _cell_key(x, y, res)
     _, inv = np.unique(key, return_inverse=True)
     inv = inv.ravel()
@@ -126,17 +195,22 @@ def choose_transform(
     values: np.ndarray,
     scales: tuple[float, ...] = (5000.0, 25000.0, 100000.0),
 ) -> tuple[Transform, list[tuple[Transform, float, dict[float, float]]]]:
-    """Pick the transform maximising mean ICC across coarse scales."""
+    """Pick the transform maximising mean ICC across coarse scales.
+
+    Returns:
+        Tuple of (best_transform, all_results_sorted_by_score).
+
+    """
     results: list[tuple[Transform, float, dict[float, float]]] = []
-    for tf in transforms():
-        if not tf.valid(values):
+    for candidate in transforms():
+        if not candidate.valid(values):
             continue
-        tf = tf.fit(values)
-        tv = tf.fwd(values)
+        fitted = candidate.fit(values)
+        tv = fitted.fwd(values)
         if not np.all(np.isfinite(tv)):
             continue
         per_scale: dict[float, float] = {float(s): icc(tv, x, y, s) for s in scales}
-        results.append((tf, float(np.mean(list(per_scale.values()))), per_scale))
+        results.append((fitted, float(np.mean(list(per_scale.values()))), per_scale))
     results.sort(key=lambda r: -r[1])
     return results[0][0], results
 
@@ -154,9 +228,9 @@ def _fit_predict(
     iy = ((y - y0) // res).astype(np.int64)
     nx = pad_to_pyramid(int(ix.max()) + 1, levels)
     ny = pad_to_pyramid(int(iy.max()) + 1, levels)
-    S, C = bin_points(ix[train], iy[train], tv[train], nx, ny)
-    V, R = pull_push(S, C, res, levels)
-    return V[ix, iy], R[ix, iy] / 1000.0
+    s, c = bin_points(ix[train], iy[train], tv[train], nx, ny)
+    val, sup = pull_push(s, c, res, levels)
+    return val[ix, iy], sup[ix, iy] / 1000.0
 
 
 class CVDetail(dict):
@@ -191,11 +265,18 @@ def blocked_cv_skill(
     min_n: int = 150,
     boot_max_n: int = 200_000,
 ) -> tuple[float, list[CVDetail]]:
-    """Hold out whole spatial blocks, predict them, and report skill
-    (1 - RMSE/RMSE_baseline) per support-scale bin with a bootstrap CI."""
+    """Hold out whole spatial blocks, predict them, and report skill.
+
+    Report skill (1 - RMSE/RMSE_baseline) per support-scale bin with a
+    bootstrap CI.
+
+    Returns:
+        Tuple of (overall_skill, per_bin_details).
+
+    """
     rng = np.random.default_rng(seed)
-    B = block_km * 1000.0
-    bkey = _cell_key(x, y, B)
+    block_size_m = block_km * 1000.0
+    bkey = _cell_key(x, y, block_size_m)
     blocks = np.unique(bkey)
     perm = rng.permutation(len(blocks))
     folds = np.array_split(perm, n_folds)
@@ -239,7 +320,7 @@ def blocked_cv_skill(
                 "skill": float(skill),
                 "ci_lo": float(np.percentile(bs, 5)),
                 "ci_hi": float(np.percentile(bs, 95)),
-            }
+            },
         )
 
     overall = 1 - (
@@ -255,7 +336,7 @@ def calibrate_fill_cap(
     block_km: tuple[float, ...] = (50.0, 100.0, 200.0, 400.0),
     min_skill: float = 0.05,
     default_km: float = 25.0,
-    **kw: Any,
+    **kw: dict[str, Any],
 ) -> tuple[float, dict[float, CVCurve]]:
     """Derive the fill cap from blocked CV across several held-out block sizes.
 
@@ -265,6 +346,10 @@ def calibrate_fill_cap(
 
     RULE 2 (smallest admissible block wins, not the worst): a bin far below
     its block size is populated only by points near the block boundary.
+
+    Returns:
+        Tuple of (cap_km, per_block_size_cv_curves).
+
     """
     detail: dict[float, CVCurve] = {}
     curve: dict[float, tuple[float, float, int]] = {}
@@ -281,6 +366,6 @@ def calibrate_fill_cap(
             cap = hi
         else:
             break
-    for bk, curve_data in detail.items():
+    for curve_data in detail.values():
         curve_data["cap_km"] = cap
     return (float(cap) if cap else default_km), detail

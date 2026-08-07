@@ -1,7 +1,36 @@
 [project]
 name = "idwgrid"
 version = "0.1.0"
-description = "Pull-push scattered-data interpolation for continent-scale rasters"
+description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes — no GPU required."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Andryo Marzuki", email = "andryo@mrzk.io" }]
+keywords = [
+    "interpolation",
+    "idw",
+    "geospatial",
+    "raster",
+    "geotiff",
+    "gis",
+    "mipmap",
+    "spatial-analysis",
+    "scattered-data",
+    "griidding",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.24",
@@ -13,6 +42,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["ruff>=0.1", "pyarrow"]
 
+[project.urls]
+Homepage = "https://github.com/andryo/idw"
+Repository = "https://github.com/andryo/idw"
+Issues = "https://github.com/andryo/idw/issues"
+
 [project.scripts]
 idwgrid = "src.idwgrid:main"
 
@@ -21,22 +55,23 @@ target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
+preview = true
 select = ["ALL"]
 ignore = [
-    "ANN101",  # missing type self
-    "ANN102",  # missing type cls
-    "D100",    # missing docstring public module
-    "D104",    # missing docstring public package
-    "D203",    # one blank line before class
-    "D213",    # multi-line summary second line
-    "INP001",  # implicit namespace
-    "PLR0913", # too many args
-    "PLR2004", # magic value
-    "S104",    # possible binding to all interfaces
-    "SLF001",  # private member access
-    "T201",    # print
-    "TRY003",  # long message outside exception
+    "CPY001",   # no copyright headers needed
+    "D203",     # conflicts with D211 (must pick one)
+    "D213",     # conflicts with D212 (must pick one)
+    "FURB189",  # dict subclassing for JSON serialization
+    "PLR0913",  # too many args (numerical function signatures)
+    "PLR0914",  # too many local variables (pipeline functions)
+    "PLR0915",  # too many statements (pipeline function)
+    "PLR0917",  # too many positional arguments (numerical functions)
+    "PLW0603",  # global required for ProcessPoolExecutor initializer
+    "TC003",    # Callable used at runtime in function signatures
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
 
 [build-system]
 requires = ["hatchling"]
