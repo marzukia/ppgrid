@@ -1,25 +1,46 @@
-# Problem Statement
+# idwgrid — Pull-Push Scattered-Data Interpolation
 
-At present, I have to visualise (cheaply) a dataset containing ~16M points (for many different layers, each 16M) that contain floating (or sometimes integer) values for exmaple, insurance premiums. My current workflow (as IDW is too slow) is to create two raster heatmaps using a 100m2 grid one containing a cumsum of each grid divided by a count grid. This is fine but I feel like it doesn't look nice especially when data is sparse (e.g. Australia most propertys are on the coast, lots of empty land).
+Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a gapless, capped, multi-band GeoTIFF in minutes on a single machine. No GPU needed.
 
-IDW was way too slow in QGIS and ArcGIS as it looks to do things serially instead of taking advantage of things like matmuls, or convolutions.
+## What it does
 
-First, can you research what tools have been made or released which does things like IDW in a more technically sophisticated way than the mainstream GIS community. Also what would you call my current method of rasterisation?
+You have `N` points (`N` ~ 10^7) with `(longitude, latitude, value)`. You want a raster of `M` cells where every cell within a defensible distance of real data carries an interpolated value, and everything else is nodata.
 
-## Current State
+Standard IDW in QGIS/ArcGIS is `O(N×M)` — ~14 hours for 16M points. This tool uses pull-push mipmap interpolation to reduce cost to `O(M)`, independent of N.
 
-Grid binning with zonal statistics — or more colloquially, rasterized bin mean. It's the square-bin variant of a hexbin plot (like in ggplot2's geom_hex). What you're computing is essentially a weighted_mean per cell (sum of values / count).
+## How it works
 
-Single-value-per-bin means empty cells are blank. No spatial smoothing, so coast/interior boundaries look hard-edged. Nothing propagates information from coast to interior at all.
+### Pull-Push (mipmap) Interpolation
 
+From Gortler et al. 1996 (Lumigraph) and Kraus 2009.
 
-# IDW — Spatial Interpolation Experimentation
+Once points are snapped to a grid, IDW is exactly a normalised convolution:
 
-Fast spatial interpolation and visualization for large point datasets (~16M points per layer). The target use case is insurance premium heatmaps over Australia, but experimentation uses USGS earthquake data.
+```
+z = (S ⊛ K) / (C ⊛ K)   K(r) = r^-p
+```
 
-## Problem
+Pull-push evaluates this across a mipmap pyramid so cost is `O(M)`, independent of N.
 
-Grid binning with zonal statistics (rasterized bin mean: sum/count per cell) is fast but looks bad in sparse areas. Standard IDW in QGIS/ArcGIS is too slow for large datasets because it runs serially without leveraging matrix ops or convolutions.
+**Steps:**
+1. Points are binned into `S` (sum of transformed values) and `C` (count) grids
+2. A mipmap pyramid is built by repeated 2x2 block sums
+3. The coarsest level seeds the interpolation
+4. Descending the pyramid, each level blends local estimate vs upsampled parent
+5. Local confidence is `min(C/saturation, 1)` — dense cells trust themselves, sparse cells inherit
+6. A summed-area table (`box_count`) provides an exact radius fill cap
+
+**Output bands:**
+- **Value:** int16, 0-100 percentile, `percentile = DN/scale`
+- **Support km:** int16, `support_km = 2^(DN/8)`, effective spatial scale of estimate
+
+**Working CRS:** EPSG:3577 (Australian Albers). Equal-area — metres are true.
+
+### Calibration (optional)
+
+Before interpolation, the tool can:
+1. **Choose a transform** — tests identity/log10/sqrt/percentile and picks the one with highest intraclass correlation across coarse scales
+2. **Derive a fill cap** — spatially blocked cross-validation to find the honest distance beyond which interpolation has no skill
 
 ## Project Structure
 
@@ -34,33 +55,49 @@ outputs/
     support_km.tif  — effective support scale
 ```
 
-## Approach
+## Install
 
-### Pull-Push (mipmap) Interpolation
-
-From Gortler et al. 1996 (Lumigraph) and Kraus 2009.
-
-**Core insight:** Once points are snapped to a grid, IDW is exactly a normalised convolution:
+```bash
+uv sync
 ```
-z = (S ⊛ K) / (C ⊛ K)   K(r) = r^-p
+
+Or manually:
+
+```bash
+pip install numpy pandas pyproj rasterio
 ```
-Pull-push evaluates this across a mipmap pyramid so cost is `O(M)` independent of N. 44K points → 1.6M cells in 11s with 4 workers.
 
-**How it works:**
-1. Points are binned into `S` (sum of values) and `C` (count) grids at `[ix, iy]`
-2. A mipmap pyramid is built by repeated 2x2 block sums
-3. The coarsest level seeds the interpolation
-4. Descending the pyramid, each level blends local estimate vs upsampled parent
-5. Local confidence is `min(C/saturation, 1)` — dense cells trust themselves, sparse cells inherit
-6. A summed-area table (`box_count`) provides an exact radius fill cap
+## Usage
 
-**Output bands:**
-- **Value:** int16, 0-100 percentile, `percentile = DN/scale`
-- **Support km:** int16, `support_km = 2^(DN/8)`, effective spatial scale of estimate
+```bash
+# Quick run (skip calibration)
+python -m src.idwgrid data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration
 
-**Working CRS:** EPSG:3577 (Australian Albers). Equal-area — metres are true.
+# Full run with calibration
+python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km auto
 
-**Dependencies:** python ≥ 3.11, numpy, pandas, rasterio, pyproj
+# Custom params
+python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8
+```
+
+### CLI Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `input` | (required) | CSV or Parquet input path |
+| `-o, --out` | `outputs/` | Output directory |
+| `--value-col` | `value` | Value column name |
+| `--lng-col` | `longitude` | Longitude column name |
+| `--lat-col` | `latitude` | Latitude column name |
+| `--res` | `500.0` | Cell size in metres |
+| `--cap-km` | `auto` | Fill cap km, or 'auto' (blocked-CV derived) |
+| `--transform` | `auto` | auto \| identity \| log10 \| sqrt \| percentile |
+| `--saturation` | `1.0` | Counts for a cell to fully self-trust |
+| `--block` | `8192` | Block size in cells |
+| `--workers` | `4` | Number of parallel workers |
+| `--scale` | `100.0` | DN = percentile × scale |
+| `--compress` | `ZSTD` | GeoTIFF compression |
+| `--skip-calibration` | false | Skip calibration, use defaults |
 
 ## Data
 
