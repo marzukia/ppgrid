@@ -24,29 +24,43 @@ Grid binning with zonal statistics (rasterized bin mean: sum/count per cell) is 
 ## Project Structure
 
 ```
-src/idw.py       — main IDW engine (scatter + Gaussian post-process)
-outputs/          — generated rasters (GeoTIFF)
+src/
+  pullpush.py     — mipmap kernels (downsample, upsample, pull_push, box_count)
+  calibrate.py    — transform selection + blocked CV for fill cap
+  idwgrid.py      — CLI driver with block parallel processing
+outputs/
+  test_run/
+    value.tif       — 5km global IDW interpolation
+    support_km.tif  — effective support scale
 ```
 
 ## Approach
 
-### Scatter-IDW (current)
+### Pull-Push (mipmap) Interpolation
 
-Instead of "for each grid cell find nearest neighbors", we reverse it: "for each data point scatter 1/r² weight to nearby cells. This scales as O(points × radius²) instead of O(grid_cells × log(points)). Much faster when the grid is much larger than the data extent.
+From Gortler et al. 1996 (Lumigraph) and Kraus 2009.
 
-**Implementation:**
-1. Project all points to EPSG:3857 metric coordinates
-2. For each batch of points, compute target cells and distances via numpy broadcasting
-3. Apply 1/r² weight circular mask, accumulate into sum_w and sum_wv arrays
-4. Divide sum_wv/sum_w for final weighted mean
+**Core insight:** Once points are snapped to a grid, IDW is exactly a normalised convolution:
+```
+z = (S ⊛ K) / (C ⊛ K)   K(r) = r^-p
+```
+Pull-push evaluates this across a mipmap pyramid so cost is `O(M)` independent of N. 44K points → 1.6M cells in 11s with 4 workers.
 
-**Benchmarks (USGS EQ data, 44K points):**
-- 5km grid → 1.5s → 1.6M output cells (radius_factor=10)
-- 5km grid → 7.3s → 4.0M output cells (radius_factor=30, circular)
+**How it works:**
+1. Points are binned into `S` (sum of values) and `C` (count) grids at `[ix, iy]`
+2. A mipmap pyramid is built by repeated 2x2 block sums
+3. The coarsest level seeds the interpolation
+4. Descending the pyramid, each level blends local estimate vs upsampled parent
+5. Local confidence is `min(C/saturation, 1)` — dense cells trust themselves, sparse cells inherit
+6. A summed-area table (`box_count`) provides an exact radius fill cap
 
-### Alternative: kNN-IDW
+**Output bands:**
+- **Value:** int16, 0-100 percentile, `percentile = DN/scale`
+- **Support km:** int16, `support_km = 2^(DN/8)`, effective spatial scale of estimate
 
-Build a kD-tree, query k=16 nearest neighbors per grid cell. Slower for empty global grids (65M cells) but exact. Use pykdtree (not scipy.cKDTree).
+**Working CRS:** EPSG:3577 (Australian Albers). Equal-area — metres are true.
+
+**Dependencies:** python ≥ 3.11, numpy, pandas, rasterio, pyproj
 
 ## Data
 
