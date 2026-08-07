@@ -62,6 +62,7 @@ ignore = [
     "D203",     # conflicts with D211 (must pick one)
     "D213",     # conflicts with D212 (must pick one)
     "FURB189",  # dict subclassing for JSON serialization
+    "PLR0912",  # too many branches (pipeline function)
     "PLR0913",  # too many args (numerical function signatures)
     "PLR0914",  # too many local variables (pipeline functions)
     "PLR0915",  # too many statements (pipeline function)

@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ import pandas as pd
 import rasterio
 from pyproj import Transformer
 from rasterio.transform import from_origin
+from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 
 from .calibrate import (
@@ -35,7 +37,10 @@ from .pullpush import (
     pull_push,
 )
 
-WORK_CRS: int = 3577
+# Suppress rasterio internal deprecation with numpy 2.5+
+warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
+
+WORK_CRS: int = 6933  # Wagner VII — global equal-area, metres are true
 NODATA: int = -32768
 
 # Per-worker context (module-level so it's local to each process)
@@ -222,6 +227,8 @@ def run(
     compress: str = "ZSTD",
     calib_max_points: int = 2_000_000,
     src_crs: int = 4326,
+    work_crs: int = 6933,
+    out_crs: int = 3857,
     skip_calibration: bool = False,
 ) -> tuple[str, str]:
     """Full pipeline: load, calibrate, interpolate, write.
@@ -244,7 +251,7 @@ def run(
     v, lon, lat = v[good], lon[good], lat[good]
     n = len(v)
 
-    tr = Transformer.from_crs(src_crs, WORK_CRS, always_xy=True)
+    tr = Transformer.from_crs(src_crs, work_crs, always_xy=True)
     x, y = tr.transform(lon, lat)
     x = np.asarray(x)
     y = np.asarray(y)
@@ -371,7 +378,7 @@ def run(
         "height": ny,
         "width": nx,
         "count": 1,
-        "crs": f"EPSG:{WORK_CRS}",
+        "crs": f"EPSG:{work_crs}",
         "transform": xform,
         "compress": compress,
         "tiled": True,
@@ -436,6 +443,65 @@ def run(
 
     # Cleanup memmap
     pts_path.unlink()
+
+    # Reproject to output CRS if different from working CRS
+    if out_crs != work_crs:
+        tmp_v = Path(out_dir) / "_value_epsg3577.tif"
+        tmp_s = Path(out_dir) / "_support_epsg3577.tif"
+        vpath.rename(tmp_v)
+        spath.rename(tmp_s)
+
+        with rasterio.open(tmp_v) as src:
+            out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
+                src.crs, f"EPSG:{out_crs}", src.width, src.height, *src.bounds,
+            )
+            vprof_out = dict(
+                vprof,
+                width=out_width,
+                height=out_height,
+                transform=out_transform,
+                crs=f"EPSG:{out_crs}",
+            )
+            dst_v = np.empty((out_height, out_width), dtype=np.int16)
+            reproject(
+                rasterio.band(src, 1),
+                dst_v,
+                dst_transform=out_transform,
+                dst_crs=f"EPSG:{out_crs}",
+                resampling=Resampling.nearest,
+                nodata=NODATA,
+            )
+            with rasterio.open(vpath, "w", **vprof_out) as dst:
+                dst.write(dst_v, 1)
+                dst.update_tags(**src.tags())
+
+        with rasterio.open(tmp_s) as src:
+            out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
+                src.crs, f"EPSG:{out_crs}", src.width, src.height, *src.bounds,
+            )
+            sprof_out = dict(
+                sprof,
+                width=out_width,
+                height=out_height,
+                transform=out_transform,
+                crs=f"EPSG:{out_crs}",
+            )
+            dst_s = np.empty((out_height, out_width), dtype=np.int16)
+            reproject(
+                rasterio.band(src, 1),
+                dst_s,
+                dst_transform=out_transform,
+                dst_crs=f"EPSG:{out_crs}",
+                resampling=Resampling.nearest,
+                nodata=NODATA,
+            )
+            with rasterio.open(spath, "w", **sprof_out) as dst:
+                dst.write(dst_s, 1)
+                dst.update_tags(**src.tags())
+
+        tmp_v.unlink()
+        tmp_s.unlink()
+
     return str(vpath), str(spath)
 
 
@@ -468,6 +534,8 @@ def main() -> None:
     parser.add_argument("--calib-max-points", type=int, default=2_000_000)
     parser.add_argument("--calibration", default=None, help="Calibration JSON path")
     parser.add_argument("--src-crs", type=int, default=4326)
+    parser.add_argument("--work-crs", type=int, default=6933, help="Working CRS for interpolation (default 6933)")
+    parser.add_argument("--out-crs", type=int, default=3857, help="Output CRS (default 3857)")
     parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
     args = parser.parse_args()
 
@@ -490,6 +558,8 @@ def main() -> None:
         compress=args.compress,
         calib_max_points=args.calib_max_points,
         src_crs=args.src_crs,
+        work_crs=args.work_crs,
+        out_crs=args.out_crs,
         skip_calibration=args.skip_calibration,
     )
 
