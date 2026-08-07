@@ -20,19 +20,17 @@ from pyproj import Transformer
 from rasterio.transform import from_origin
 from rasterio.windows import Window
 
-from .pullpush import (
-    bin_points,
-    box_count,
-    pad_to_pyramid,
-    pull_push,
-)
 from .calibrate import (
     PercentileTransform,
-    Transform,
     calibrate_fill_cap,
     choose_transform,
     make_transform,
     transforms,
+)
+from .pullpush import (
+    bin_points,
+    box_count,
+    pull_push,
 )
 
 WORK_CRS: int = 3577
@@ -140,7 +138,7 @@ def _process_block(args: tuple[int, int]) -> tuple[int, int, tuple[np.ndarray, n
     V, R = pull_push(S, C, res, c["levels"], saturation=c["sat"])
 
     # Mask from exact radius query
-    cap_cells = int(round(c["cap_km"] * 1000.0 / res))
+    cap_cells = round(c["cap_km"] * 1000.0 / res)
     near = box_count(C, cap_cells) > 0
 
     # Extract output window
@@ -248,7 +246,7 @@ def run(
 
         cal = {
             "transform": tf.name,
-            "n_calibration_points": int(len(cv)),
+            "n_calibration_points": len(cv),
             "transform_scores": {s[0].name: s[1] for s in scores},
             "transform_state": tf.state(),
             "percentile_quantiles": pct_fit.q.tolist(),
@@ -288,9 +286,9 @@ def run(
     NX = int((x.max() - x0) // res) + 1
     NY = int((y.max() - y0) // res) + 1
 
-    levels = max(1, int(math.ceil(math.log2(max(cap_km_val * 1000.0 / res, 2.0)))))
+    levels = max(1, math.ceil(math.log2(max(cap_km_val * 1000.0 / res, 2.0))))
     step = 1 << levels
-    halo = max(int(math.ceil(cap_km_val * 1000.0 / res)) + 2, step)
+    halo = max(math.ceil(cap_km_val * 1000.0 / res) + 2, step)
     NXp = -(-NX // step) * step
     NYp = -(-NY // step) * step
     bsize = max(block_size, step)
@@ -364,19 +362,19 @@ def run(
     # --- Raster profile ---
     import rasterio
     xform = from_origin(x0, y0 + NY * res, res, res)
-    common = dict(
-        driver="GTiff",
-        height=NY,
-        width=NX,
-        count=1,
-        crs=f"EPSG:{WORK_CRS}",
-        transform=xform,
-        compress=compress,
-        tiled=True,
-        blockxsize=512,
-        blockysize=512,
-        BIGTIFF="IF_SAFER",
-    )
+    common = {
+        "driver": "GTiff",
+        "height": NY,
+        "width": NX,
+        "count": 1,
+        "crs": f"EPSG:{WORK_CRS}",
+        "transform": xform,
+        "compress": compress,
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+        "BIGTIFF": "IF_SAFER",
+    }
     vprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
     sprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
 
@@ -385,49 +383,48 @@ def run(
 
     t_start = time.perf_counter()
 
-    with rasterio.open(vpath, "w", **vprof) as vd:
-        with rasterio.open(spath, "w", **sprof) as sd:
-            vd.update_tags(
-                transform=tname,
-                cap_km=str(cap_km_val),
-                res_m=str(res),
-                scale=str(scale),
-                units="percentile",
-                decode=f"percentile = DN/{scale:g}",
-            )
-            vd.scales = (1.0 / scale,)
-            sd.update_tags(decode="support_km = 2**(DN/8)")
+    with rasterio.open(vpath, "w", **vprof) as vd, rasterio.open(spath, "w", **sprof) as sd:
+        vd.update_tags(
+            transform=tname,
+            cap_km=str(cap_km_val),
+            res_m=str(res),
+            scale=str(scale),
+            units="percentile",
+            decode=f"percentile = DN/{scale:g}",
+        )
+        vd.scales = (1.0 / scale,)
+        sd.update_tags(decode="support_km = 2**(DN/8)")
 
-            # Write empty blocks as nodata
-            for bx, by in empty_blocks:
+        # Write empty blocks as nodata
+        for bx, by in empty_blocks:
+            i0, j0 = bx * bsize, by * bsize
+            i1, j1 = min(i0 + bsize, NX), min(j0 + bsize, NY)
+            w = Window(i0, NY - j1, i1 - i0, j1 - j0)
+            blank = np.full((w.height, w.width), NODATA, np.int16)
+            vd.write(blank, 1, window=w)
+            sd.write(blank, 1, window=w)
+
+        # Process blocks with parallel workers
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_worker,
+            initargs=initargs,
+        ) as ex:
+            for bx, by, out in ex.map(_process_block, tasks, chunksize=1):
                 i0, j0 = bx * bsize, by * bsize
                 i1, j1 = min(i0 + bsize, NX), min(j0 + bsize, NY)
                 w = Window(i0, NY - j1, i1 - i0, j1 - j0)
-                blank = np.full((w.height, w.width), NODATA, np.int16)
-                vd.write(blank, 1, window=w)
-                sd.write(blank, 1, window=w)
 
-            # Process blocks with parallel workers
-            from concurrent.futures import ProcessPoolExecutor
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_worker,
-                initargs=initargs,
-            ) as ex:
-                for bx, by, out in ex.map(_process_block, tasks, chunksize=1):
-                    i0, j0 = bx * bsize, by * bsize
-                    i1, j1 = min(i0 + bsize, NX), min(j0 + bsize, NY)
-                    w = Window(i0, NY - j1, i1 - i0, j1 - j0)
+                if out is None:
+                    blank = np.full((w.height, w.width), NODATA, np.int16)
+                    vd.write(blank, 1, window=w)
+                    sd.write(blank, 1, window=w)
+                    continue
 
-                    if out is None:
-                        blank = np.full((w.height, w.width), NODATA, np.int16)
-                        vd.write(blank, 1, window=w)
-                        sd.write(blank, 1, window=w)
-                        continue
-
-                    Vq, Rq = out
-                    vd.write(Vq.T[::-1, :], 1, window=w)
-                    sd.write(Rq.T[::-1, :], 1, window=w)
+                Vq, Rq = out
+                vd.write(Vq.T[::-1, :], 1, window=w)
+                sd.write(Rq.T[::-1, :], 1, window=w)
 
     dt = time.perf_counter() - t_start
     print(f"Done in {dt:.0f}s", file=sys.stderr)

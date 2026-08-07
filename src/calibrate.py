@@ -14,12 +14,13 @@ from the data rather than hardcoding it.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import itertools
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
 from .pullpush import bin_points, pad_to_pyramid, pull_push
-
 
 # ---------------------------------------------------------------- transforms
 
@@ -210,7 +211,7 @@ def blocked_cv_skill(
     base = float(np.mean(act))
 
     rows: list[CVDetail] = []
-    for lo, hi in zip(edges[:-1], edges[1:]):
+    for lo, hi in itertools.pairwise(edges):
         m = (sup >= lo) & (sup < hi)
         n = int(m.sum())
         if n < min_n:
@@ -271,6 +272,6 @@ def calibrate_fill_cap(
             cap = hi
         else:
             break
-    for bk in detail:
-        detail[bk]["cap_km"] = cap
+    for bk, curve_data in detail.items():
+        curve_data["cap_km"] = cap
     return (float(cap) if cap else default_km), detail
