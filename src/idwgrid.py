@@ -362,6 +362,8 @@ def main():
     parser.add_argument("--calib-max-points", type=int, default=2_000_000)
     parser.add_argument("--calibration", default=None, help="Calibration JSON path")
     parser.add_argument("--src-crs", type=int, default=4326)
+    parser.add_argument("--skip-calibration", action="store_true",
+                        help="Skip calibration, use defaults")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -372,6 +374,7 @@ def main():
         workers=args.workers, calib_path=args.calibration,
         baseline=args.baseline, scale=args.scale, compress=args.compress,
         calib_max_points=args.calib_max_points, src_crs=args.src_crs,
+        skip_calibration=args.skip_calibration,
     )
 
 
