@@ -24,6 +24,7 @@ from .pullpush import bin_points, pad_to_pyramid, pull_push
 
 # ---------------------------------------------------------------- transforms
 
+
 class Transform:
     def __init__(
         self,
@@ -52,6 +53,7 @@ class Transform:
 
 class PercentileTransform(Transform):
     """Map values onto their empirical percentile, 0-100."""
+
     NQ = 1001
 
     def __init__(self, q: np.ndarray | None = None) -> None:
@@ -84,8 +86,8 @@ def transforms() -> list[Transform]:
     """Fresh candidate instances. MUST be a factory, not a module-level list."""
     return [
         Transform("identity", lambda v: v, lambda t: t, lambda v: True),
-        Transform("log10", np.log10, lambda t: 10.0 ** t, lambda v: v.min() > 0),
-        Transform("sqrt", np.sqrt, lambda t: t ** 2, lambda v: v.min() >= 0),
+        Transform("log10", np.log10, lambda t: 10.0**t, lambda v: v.min() > 0),
+        Transform("sqrt", np.sqrt, lambda t: t**2, lambda v: v.min() >= 0),
         PercentileTransform(),
     ]
 
@@ -159,6 +161,7 @@ def _fit_predict(
 
 class CVDetail(dict):
     """Single CV bin result."""
+
     lo_km: float
     hi_km: float
     n: int
@@ -169,6 +172,7 @@ class CVDetail(dict):
 
 class CVCurve(dict):
     """Per-block-size CV results."""
+
     overall_skill: float
     rows: list[CVDetail]
 
@@ -217,25 +221,30 @@ def blocked_cv_skill(
         if n < min_n:
             continue
         e_m, e_b = act[m] - pred[m], act[m] - base
-        skill = 1 - np.sqrt(np.mean(e_m ** 2)) / np.sqrt(np.mean(e_b ** 2))
+        skill = 1 - np.sqrt(np.mean(e_m**2)) / np.sqrt(np.mean(e_b**2))
         nb = min(n, boot_max_n)
         if nb < n:
             sub = rng.choice(n, nb, replace=False)
             e_m, e_b = e_m[sub], e_b[sub]
         idx = rng.integers(0, nb, size=(n_boot, nb))
-        bs = 1 - (np.sqrt(np.mean(e_m[idx] ** 2, axis=1))
-                  / np.sqrt(np.mean(e_b[idx] ** 2, axis=1)))
-        rows.append({
-            "lo_km": float(lo),
-            "hi_km": float(hi),
-            "n": n,
-            "skill": float(skill),
-            "ci_lo": float(np.percentile(bs, 5)),
-            "ci_hi": float(np.percentile(bs, 95)),
-        })
+        bs = 1 - (
+            np.sqrt(np.mean(e_m[idx] ** 2, axis=1))
+            / np.sqrt(np.mean(e_b[idx] ** 2, axis=1))
+        )
+        rows.append(
+            {
+                "lo_km": float(lo),
+                "hi_km": float(hi),
+                "n": n,
+                "skill": float(skill),
+                "ci_lo": float(np.percentile(bs, 5)),
+                "ci_hi": float(np.percentile(bs, 95)),
+            }
+        )
 
-    overall = 1 - (np.sqrt(np.mean((act - pred) ** 2))
-                   / np.sqrt(np.mean((act - base) ** 2)))
+    overall = 1 - (
+        np.sqrt(np.mean((act - pred) ** 2)) / np.sqrt(np.mean((act - base) ** 2))
+    )
     return float(overall), rows
 
 

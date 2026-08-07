@@ -101,7 +101,9 @@ def _block_points(bx: int, by: int) -> np.ndarray:
     return np.concatenate(out, axis=1) if out else np.empty((4, 0))
 
 
-def _process_block(args: tuple[int, int]) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
+def _process_block(
+    args: tuple[int, int],
+) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
     """Process a single block. Returns (bx, by, (Vq, Rq) or None)."""
     bx, by = args
     c = _CTX
@@ -205,9 +207,11 @@ def run(
     print("Reading input...", file=sys.stderr)
     if input_path.endswith((".parquet", ".pq")):
         import pandas as pd
+
         df = pd.read_parquet(input_path, columns=[value_col, lng_col, lat_col])
     else:
         import pandas as pd
+
         df = pd.read_csv(input_path, usecols=[value_col, lng_col, lat_col])
 
     v = df[value_col].to_numpy(np.float64)
@@ -261,9 +265,14 @@ def run(
             json.dump(cal, f, indent=2)
     else:
         print("Skip calibration, use defaults...", file=sys.stderr)
-        cal = {"transform": "identity", "cap_km": float(cap_km) if cap_km != "auto" else 64.0}
+        cal = {
+            "transform": "identity",
+            "cap_km": float(cap_km) if cap_km != "auto" else 64.0,
+        }
 
-    tname = transform if transform != "auto" else (cal["transform"] if cal else "identity")
+    tname = (
+        transform if transform != "auto" else (cal["transform"] if cal else "identity")
+    )
     if cal and "transform_state" in cal and cal["transform_state"].get("name") == tname:
         tf = make_transform(cal["transform_state"])
     else:
@@ -275,7 +284,9 @@ def run(
         else PercentileTransform().fit(v)
     )
 
-    cap_km_val = float(cap_km) if cap_km != "auto" else float(cal["cap_km"] if cal else 64.0)
+    cap_km_val = (
+        float(cap_km) if cap_km != "auto" else float(cal["cap_km"] if cal else 64.0)
+    )
     print(f"  Transform: {tname}, cap: {cap_km_val} km", file=sys.stderr)
 
     tv = tf.fwd(v)
@@ -295,9 +306,9 @@ def run(
     nbx = math.ceil(NX / bsize)
     nby = math.ceil(NY / bsize)
 
-    print(f"  Grid: {NX}×{NY}, {(NX*NY):,} cells", file=sys.stderr)
+    print(f"  Grid: {NX}×{NY}, {(NX * NY):,} cells", file=sys.stderr)
     print(f"  Pyramid: {levels} levels, step={step}, halo={halo}", file=sys.stderr)
-    print(f"  Blocks: {nbx}×{nby} ({nbx*nby} total), block={bsize}", file=sys.stderr)
+    print(f"  Blocks: {nbx}×{nby} ({nbx * nby} total), block={bsize}", file=sys.stderr)
 
     # --- Spatial index ---
     bx_ = np.clip(((x - x0) // res // bsize).astype(np.int64), 0, nbx - 1)
@@ -308,8 +319,7 @@ def run(
 
     # Memmap for workers
     pts_path = os.path.join(out_dir, "_points.npy")
-    pts = np.lib.format.open_memmap(pts_path, mode="w+", dtype=np.float64,
-                                    shape=(4, N))
+    pts = np.lib.format.open_memmap(pts_path, mode="w+", dtype=np.float64, shape=(4, N))
     pts[0] = x[order]
     pts[1] = y[order]
     pts[2] = tv[order]
@@ -361,6 +371,7 @@ def run(
 
     # --- Raster profile ---
     import rasterio
+
     xform = from_origin(x0, y0 + NY * res, res, res)
     common = {
         "driver": "GTiff",
@@ -383,7 +394,10 @@ def run(
 
     t_start = time.perf_counter()
 
-    with rasterio.open(vpath, "w", **vprof) as vd, rasterio.open(spath, "w", **sprof) as sd:
+    with (
+        rasterio.open(vpath, "w", **vprof) as vd,
+        rasterio.open(spath, "w", **sprof) as sd,
+    ):
         vd.update_tags(
             transform=tname,
             cap_km=str(cap_km_val),
@@ -406,6 +420,7 @@ def run(
 
         # Process blocks with parallel workers
         from concurrent.futures import ProcessPoolExecutor
+
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_worker,
@@ -437,7 +452,9 @@ def run(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
+    parser = argparse.ArgumentParser(
+        description="Pull-push scattered-data interpolation"
+    )
     parser.add_argument("input", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="outputs/", help="Output directory")
     parser.add_argument("--value-col", default="value", help="Value column name")
@@ -451,12 +468,17 @@ def main() -> None:
         choices=["auto", "identity", "log10", "sqrt", "percentile"],
     )
     parser.add_argument(
-        "--saturation", type=float, default=1.0, help="Counts for a cell to fully self-trust"
+        "--saturation",
+        type=float,
+        default=1.0,
+        help="Counts for a cell to fully self-trust",
     )
     parser.add_argument("--block", type=int, default=8192, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers")
     parser.add_argument("--baseline", action="store_true")
-    parser.add_argument("--scale", type=float, default=100.0, help="DN = percentile * scale")
+    parser.add_argument(
+        "--scale", type=float, default=100.0, help="DN = percentile * scale"
+    )
     parser.add_argument("--compress", default="ZSTD")
     parser.add_argument("--calib-max-points", type=int, default=2_000_000)
     parser.add_argument("--calibration", default=None, help="Calibration JSON path")

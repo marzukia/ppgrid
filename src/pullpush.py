@@ -102,8 +102,9 @@ def pull_push(
 
     # Seed at the coarsest level
     V = Ss[-1] / np.maximum(Cs[-1], 1e-9)
-    R = np.where(Cs[-1] > 0, np.float32(res * (1 << levels)),
-                 np.float32(unresolved_m)).astype(np.float32)
+    R = np.where(
+        Cs[-1] > 0, np.float32(res * (1 << levels)), np.float32(unresolved_m)
+    ).astype(np.float32)
 
     # Push: descend, blending local estimate against upsampled parent
     for k in range(levels - 1, -1, -1):
@@ -127,8 +128,7 @@ def bin_points(
     key = ix.astype(np.int64) * ny + iy.astype(np.int64)
     S = np.bincount(key, weights=values, minlength=nx * ny)
     C = np.bincount(key, minlength=nx * ny)
-    return (S.reshape(nx, ny).astype(np.float32),
-            C.reshape(nx, ny).astype(np.float32))
+    return (S.reshape(nx, ny).astype(np.float32), C.reshape(nx, ny).astype(np.float32))
 
 
 def pad_to_pyramid(n: int, levels: int) -> int:
