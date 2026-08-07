@@ -34,13 +34,16 @@ Pull-push evaluates this across a mipmap pyramid so cost is `O(M)`, independent 
 - **Value:** int16, 0-100 percentile, `percentile = DN/scale`
 - **Support km:** int16, `support_km = 2^(DN/8)`, effective spatial scale of estimate
 
-**Working CRS:** EPSG:3577 (Australian Albers). Equal-area — metres are true.
+**Working CRS:** EPSG:6933 (Wagner VII) by default — global equal-area, metres are true. Configurable via `--work-crs`.
+
+**Output CRS:** EPSG:3857 (Web Mercator) by default. Configurable via `--out-crs`.
 
 ### Calibration (optional)
 
 Before interpolation, the tool can:
 1. **Choose a transform** — tests identity/log10/sqrt/percentile and picks the one with highest intraclass correlation across coarse scales
 2. **Derive a fill cap** — spatially blocked cross-validation to find the honest distance beyond which interpolation has no skill
+3. **Save calibration.json** — contains the percentile-to-value lookup table for decoding the output raster back to real units
 
 ## Project Structure
 
@@ -51,8 +54,9 @@ src/
   idwgrid.py      — CLI driver with block parallel processing
 outputs/
   test_run/
-    value.tif       — 5km global IDW interpolation
+    value.tif       — interpolated value band (percentile)
     support_km.tif  — effective support scale
+    calibration.json — percentile-to-value lookup table
 ```
 
 ## Install
@@ -73,11 +77,14 @@ pip install numpy pandas pyproj rasterio
 # Quick run (skip calibration)
 python -m src.idwgrid data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration
 
-# Full run with calibration
+# Full run with calibration (saves calibration.json)
 python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km auto
 
-# Custom params
-python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8
+# Custom projection and params
+python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8 --work-crs 3857 --out-crs 3857
+
+# Reuse existing calibration
+python -m src.idwgrid data.csv --value-col premium --calibration outputs/previous/calibration.json
 ```
 
 ### CLI Options
@@ -97,7 +104,28 @@ python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km 25 --trans
 | `--workers` | `4` | Number of parallel workers |
 | `--scale` | `100.0` | DN = percentile × scale |
 | `--compress` | `ZSTD` | GeoTIFF compression |
+| `--calibration` | (none) | Path to existing calibration.json |
+| `--calib-max-points` | `2000000` | Max points to use for calibration |
+| `--src-crs` | `4326` | Input coordinate reference system |
+| `--work-crs` | `6933` | Working CRS for interpolation (equal-area) |
+| `--out-crs` | `3857` | Output CRS for final GeoTIFF |
 | `--skip-calibration` | false | Skip calibration, use defaults |
+
+## Decoding the output
+
+The value band stores percentiles, not raw values. To convert back to real units, use the `calibration.json` saved in the output folder:
+
+```python
+import json, numpy as np, rasterio
+
+with open("outputs/test_run/calibration.json") as f:
+    quantiles = np.array(json.load(f)["percentile_quantiles"])
+
+with rasterio.open("outputs/test_run/value.tif") as r:
+    percentiles = np.array(r.read(1), copy=True) / 100.0
+
+real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quantiles)
+```
 
 ## Data
 
