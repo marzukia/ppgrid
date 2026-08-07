@@ -14,21 +14,25 @@ Emits a value band and a *support* band (effective spatial scale of the
 estimate, in metres) which drives honest opacity / masking downstream.
 """
 
+from __future__ import annotations
+
+from typing import Callable
+
 import numpy as np
 
 
-def downsample_sum(a):
+def downsample_sum(a: np.ndarray) -> np.ndarray:
     """2x2 block sum. Sums (not means) so S and C stay consistent."""
     return a[0::2, 0::2] + a[1::2, 0::2] + a[0::2, 1::2] + a[1::2, 1::2]
 
 
-def upsample_nearest(a):
+def upsample_nearest(a: np.ndarray) -> np.ndarray:
     """2x nearest-neighbour. Fast, but leaves hard square edges at every
     pyramid boundary -- as vector tiles those become real polygon edges."""
     return np.repeat(np.repeat(a, 2, axis=0), 2, axis=1)
 
 
-def _smooth3(a):
+def _smooth3(a: np.ndarray) -> np.ndarray:
     """Separable [1,2,1]/4 filter, vectorised. Replicate boundary."""
     b = np.empty_like(a)
     b[1:-1] = 0.25 * (a[:-2] + 2.0 * a[1:-1] + a[2:])
@@ -41,12 +45,12 @@ def _smooth3(a):
     return c
 
 
-def upsample_bilinear(a):
+def upsample_bilinear(a: np.ndarray) -> np.ndarray:
     """2x nearest followed by a tent filter == bilinear. Removes the blocking."""
     return _smooth3(upsample_nearest(a).astype(np.float32))
 
 
-def box_count(C, r):
+def box_count(C: np.ndarray, r: int) -> np.ndarray:
     """Number of points within a (2r+1)^2 window, via a summed-area table.
 
     Cost is independent of r -- a 100km radius costs the same as 1km. This is
@@ -66,8 +70,15 @@ def box_count(C, r):
     return cs[:, hi] - cs[:, lo]
 
 
-def pull_push(S, C, res, levels, upsample=upsample_bilinear, saturation=1.0,
-              unresolved_m=1e9):
+def pull_push(
+    S: np.ndarray,
+    C: np.ndarray,
+    res: float,
+    levels: int,
+    upsample: Callable[[np.ndarray], np.ndarray] = upsample_bilinear,
+    saturation: float = 1.0,
+    unresolved_m: float = 1e9,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     S : per-cell sum of (transformed) values
     C : per-cell point count
@@ -83,7 +94,8 @@ def pull_push(S, C, res, levels, upsample=upsample_bilinear, saturation=1.0,
 
     Returns (value, support_m).
     """
-    Ss, Cs = [S], [C]
+    Ss: list[np.ndarray] = [S]
+    Cs: list[np.ndarray] = [C]
     for _ in range(levels):
         Ss.append(downsample_sum(Ss[-1]))
         Cs.append(downsample_sum(Cs[-1]))
@@ -104,7 +116,13 @@ def pull_push(S, C, res, levels, upsample=upsample_bilinear, saturation=1.0,
     return V, R
 
 
-def bin_points(ix, iy, values, nx, ny):
+def bin_points(
+    ix: np.ndarray,
+    iy: np.ndarray,
+    values: np.ndarray,
+    nx: int,
+    ny: int,
+) -> tuple[np.ndarray, np.ndarray]:
     """Scatter points into sum and count grids indexed [easting, northing]."""
     key = ix.astype(np.int64) * ny + iy.astype(np.int64)
     S = np.bincount(key, weights=values, minlength=nx * ny)
@@ -113,6 +131,6 @@ def bin_points(ix, iy, values, nx, ny):
             C.reshape(nx, ny).astype(np.float32))
 
 
-def pad_to_pyramid(n, levels):
+def pad_to_pyramid(n: int, levels: int) -> int:
     step = 1 << levels
     return ((n + step - 1) // step) * step

@@ -5,13 +5,15 @@ Turns scattered geolocated point values into a continent-scale, gapless,
 capped raster surface, in minutes, on a single machine, with no GPU.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import math
 import os
 import sys
 import time
-from functools import partial
+from typing import Any
 
 import numpy as np
 from pyproj import Transformer
@@ -19,25 +21,49 @@ from rasterio.transform import from_origin
 from rasterio.windows import Window
 
 from .pullpush import (
-    bin_points, box_count, pad_to_pyramid, pull_push, upsample_bilinear,
+    bin_points,
+    box_count,
+    pad_to_pyramid,
+    pull_push,
 )
 from .calibrate import (
-    PercentileTransform, choose_transform, calibrate_fill_cap, make_transform,
+    PercentileTransform,
+    Transform,
+    calibrate_fill_cap,
+    choose_transform,
+    make_transform,
     transforms,
 )
 
-WORK_CRS = 3577
-NODATA = -32768
+WORK_CRS: int = 3577
+NODATA: int = -32768
 
 # Per-worker context (module-level so it's local to each process)
-_CTX = {}
+_CTX: dict[str, Any] = {}
 
 
 def _init_worker(
-    pts_path, transform_state, pct_quantiles, starts, nbx, nby, bsize, halo,
-    res, levels, cap_km, x0, y0, NX, NY, NXp, NYp, sat, baseline,
-    scale,
-):
+    pts_path: str,
+    transform_state: dict[str, Any],
+    pct_quantiles: list[float],
+    starts: list[int],
+    nbx: int,
+    nby: int,
+    bsize: int,
+    halo: int,
+    res: float,
+    levels: int,
+    cap_km: float,
+    x0: float,
+    y0: float,
+    NX: int,
+    NY: int,
+    NXp: int,
+    NYp: int,
+    sat: float,
+    baseline: bool,
+    scale: float,
+) -> None:
     """Initialise per-worker context."""
     global _CTX
     _CTX = {
@@ -64,10 +90,10 @@ def _init_worker(
     }
 
 
-def _block_points(bx, by):
+def _block_points(bx: int, by: int) -> np.ndarray:
     """Gather points from the 3x3 block neighbourhood (valid while halo <= bsize)."""
     c = _CTX
-    out = []
+    out: list[np.ndarray] = []
     for jx in range(max(0, bx - 1), min(c["nbx"], bx + 2)):
         for jy in range(max(0, by - 1), min(c["nby"], by + 2)):
             lo = c["starts"][jx * c["nby"] + jy]
@@ -77,13 +103,18 @@ def _block_points(bx, by):
     return np.concatenate(out, axis=1) if out else np.empty((4, 0))
 
 
-def _process_block(args):
+def _process_block(args: tuple[int, int]) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
     """Process a single block. Returns (bx, by, (Vq, Rq) or None)."""
     bx, by = args
     c = _CTX
-    res, halo, bsize, step = c["res"], c["halo"], c["bsize"], 1 << c["levels"]
-    i0, j0 = bx * bsize, by * bsize
-    i1, j1 = min(i0 + bsize, c["NX"]), min(j0 + bsize, c["NY"])
+    res = c["res"]
+    halo = c["halo"]
+    bsize = c["bsize"]
+    step = 1 << c["levels"]
+    i0 = bx * bsize
+    j0 = by * bsize
+    i1 = min(i0 + bsize, c["NX"])
+    j1 = min(j0 + bsize, c["NY"])
 
     # Snap halo origin to multiple of step for exact alignment
     hi0 = max(0, ((i0 - halo) // step) * step)
@@ -113,7 +144,8 @@ def _process_block(args):
     near = box_count(C, cap_cells) > 0
 
     # Extract output window
-    a0, b0 = i0 - hi0, j0 - hj0
+    a0 = i0 - hi0
+    b0 = j0 - hj0
     sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
     V_out = V[sl]
     R_out = R[sl] / 1000.0
@@ -132,7 +164,13 @@ def _process_block(args):
     return bx, by, (Vq, Rq)
 
 
-def _block_neighbourhood_nonempty(bx, by, starts, nbx, nby):
+def _block_neighbourhood_nonempty(
+    bx: int,
+    by: int,
+    starts: np.ndarray,
+    nbx: int,
+    nby: int,
+) -> bool:
     """True if any of the 3x3 neighbourhood has points."""
     for jx in range(max(0, bx - 1), min(nbx, bx + 2)):
         for jy in range(max(0, by - 1), min(nby, by + 2)):
@@ -144,12 +182,25 @@ def _block_neighbourhood_nonempty(bx, by, starts, nbx, nby):
 
 
 def run(
-    input_path, value_col, lng_col, lat_col, out_dir, res=500.0,
-    cap_km="auto", transform="auto", saturation=1.0, block_size=8192,
-    workers=4, calib_path=None, baseline=False, scale=100.0,
-    compress="ZSTD", calib_max_points=2_000_000, src_crs=4326,
-    skip_calibration=False,
-):
+    input_path: str,
+    value_col: str,
+    lng_col: str,
+    lat_col: str,
+    out_dir: str,
+    res: float = 500.0,
+    cap_km: float | str = "auto",
+    transform: str = "auto",
+    saturation: float = 1.0,
+    block_size: int = 8192,
+    workers: int = 4,
+    calib_path: str | None = None,
+    baseline: bool = False,
+    scale: float = 100.0,
+    compress: str = "ZSTD",
+    calib_max_points: int = 2_000_000,
+    src_crs: int = 4326,
+    skip_calibration: bool = False,
+) -> tuple[str, str]:
     """Full pipeline: load, calibrate, interpolate, write."""
 
     # --- Ingest ---
@@ -177,10 +228,11 @@ def run(
 
     # --- Calibration ---
     cpath = calib_path
-    cal = None
+    cal: dict[str, Any] | None = None
     if cpath and os.path.exists(cpath):
         print(f"Load calibration from {cpath}", file=sys.stderr)
-        cal = json.load(open(cpath))
+        with open(cpath) as f:
+            cal = json.load(f)
     elif not skip_calibration:
         print("Calibrating...", file=sys.stderr)
         n = len(v)
@@ -207,7 +259,8 @@ def run(
             },
         }
         os.makedirs(out_dir, exist_ok=True)
-        json.dump(cal, open(cpath or os.path.join(out_dir, "calibration.json"), "w"), indent=2)
+        with open(cpath or os.path.join(out_dir, "calibration.json"), "w") as f:
+            json.dump(cal, f, indent=2)
     else:
         print("Skip calibration, use defaults...", file=sys.stderr)
         cal = {"transform": "identity", "cap_km": float(cap_km) if cap_km != "auto" else 64.0}
@@ -230,16 +283,19 @@ def run(
     tv = tf.fwd(v)
 
     # --- Grid geometry ---
-    x0, y0 = x.min(), y.min()
+    x0 = x.min()
+    y0 = y.min()
     NX = int((x.max() - x0) // res) + 1
     NY = int((y.max() - y0) // res) + 1
 
     levels = max(1, int(math.ceil(math.log2(max(cap_km_val * 1000.0 / res, 2.0)))))
     step = 1 << levels
     halo = max(int(math.ceil(cap_km_val * 1000.0 / res)) + 2, step)
-    NXp, NYp = -(-NX // step) * step, -(-NY // step) * step
+    NXp = -(-NX // step) * step
+    NYp = -(-NY // step) * step
     bsize = max(block_size, step)
-    nbx, nby = math.ceil(NX / bsize), math.ceil(NY / bsize)
+    nbx = math.ceil(NX / bsize)
+    nby = math.ceil(NY / bsize)
 
     print(f"  Grid: {NX}×{NY}, {(NX*NY):,} cells", file=sys.stderr)
     print(f"  Pyramid: {levels} levels, step={step}, halo={halo}", file=sys.stderr)
@@ -256,33 +312,69 @@ def run(
     pts_path = os.path.join(out_dir, "_points.npy")
     pts = np.lib.format.open_memmap(pts_path, mode="w+", dtype=np.float64,
                                     shape=(4, N))
-    pts[0] = x[order]; pts[1] = y[order]; pts[2] = tv[order]; pts[3] = v[order]
+    pts[0] = x[order]
+    pts[1] = y[order]
+    pts[2] = tv[order]
+    pts[3] = v[order]
     pts.flush()
 
     # --- Task list ---
-    tasks = [(i, j) for i in range(nbx) for j in range(nby)
-             if _block_neighbourhood_nonempty(i, j, starts, nbx, nby)]
-    empty_blocks = [(i, j) for i in range(nbx) for j in range(nby)
-                    if not _block_neighbourhood_nonempty(i, j, starts, nbx, nby)]
+    tasks: list[tuple[int, int]] = [
+        (i, j)
+        for i in range(nbx)
+        for j in range(nby)
+        if _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
+    ]
+    empty_blocks: list[tuple[int, int]] = [
+        (i, j)
+        for i in range(nbx)
+        for j in range(nby)
+        if not _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
+    ]
 
-    print(f"  {len(tasks)} blocks to process, {len(empty_blocks)} empty, using {workers} workers", file=sys.stderr)
+    print(
+        f"  {len(tasks)} blocks to process, {len(empty_blocks)} empty, using {workers} workers",
+        file=sys.stderr,
+    )
 
     # --- Worker init args ---
     initargs = (
         pts_path,
         cal.get("transform_state", {"name": tname}),
         cal.get("percentile_quantiles", pct_q.q.tolist()),
-        starts.tolist(), nbx, nby, bsize, halo, res, levels, cap_km_val,
-        float(x0), float(y0), NX, NY, NXp, NYp, saturation, baseline, scale,
+        starts.tolist(),
+        nbx,
+        nby,
+        bsize,
+        halo,
+        res,
+        levels,
+        cap_km_val,
+        float(x0),
+        float(y0),
+        NX,
+        NY,
+        NXp,
+        NYp,
+        saturation,
+        baseline,
+        scale,
     )
 
     # --- Raster profile ---
     import rasterio
-    transform = from_origin(x0, y0 + NY * res, res, res)
+    xform = from_origin(x0, y0 + NY * res, res, res)
     common = dict(
-        driver="GTiff", height=NY, width=NX, count=1,
-        crs=f"EPSG:{WORK_CRS}", transform=transform,
-        compress=compress, tiled=True, blockxsize=512, blockysize=512,
+        driver="GTiff",
+        height=NY,
+        width=NX,
+        count=1,
+        crs=f"EPSG:{WORK_CRS}",
+        transform=xform,
+        compress=compress,
+        tiled=True,
+        blockxsize=512,
+        blockysize=512,
         BIGTIFF="IF_SAFER",
     )
     vprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
@@ -296,9 +388,12 @@ def run(
     with rasterio.open(vpath, "w", **vprof) as vd:
         with rasterio.open(spath, "w", **sprof) as sd:
             vd.update_tags(
-                transform=tname, cap_km=str(cap_km_val),
-                res_m=str(res), scale=str(scale),
-                units="percentile", decode=f"percentile = DN/{scale:g}",
+                transform=tname,
+                cap_km=str(cap_km_val),
+                res_m=str(res),
+                scale=str(scale),
+                units="percentile",
+                decode=f"percentile = DN/{scale:g}",
             )
             vd.scales = (1.0 / scale,)
             sd.update_tags(decode="support_km = 2**(DN/8)")
@@ -314,8 +409,11 @@ def run(
 
             # Process blocks with parallel workers
             from concurrent.futures import ProcessPoolExecutor
-            with ProcessPoolExecutor(max_workers=workers,
-                                     initializer=_init_worker, initargs=initargs) as ex:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_worker,
+                initargs=initargs,
+            ) as ex:
                 for bx, by, out in ex.map(_process_block, tasks, chunksize=1):
                     i0, j0 = bx * bsize, by * bsize
                     i1, j1 = min(i0 + bsize, NX), min(j0 + bsize, NY)
@@ -341,7 +439,7 @@ def run(
     return vpath, spath
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
     parser.add_argument("input", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="outputs/", help="Output directory")
@@ -350,10 +448,14 @@ def main():
     parser.add_argument("--lat-col", default="latitude", help="Latitude column name")
     parser.add_argument("--res", type=float, default=500.0, help="Cell size in metres")
     parser.add_argument("--cap-km", default="auto", help="Fill cap km, or 'auto'")
-    parser.add_argument("--transform", default="auto",
-                        choices=["auto", "identity", "log10", "sqrt", "percentile"])
-    parser.add_argument("--saturation", type=float, default=1.0,
-                        help="Counts for a cell to fully self-trust")
+    parser.add_argument(
+        "--transform",
+        default="auto",
+        choices=["auto", "identity", "log10", "sqrt", "percentile"],
+    )
+    parser.add_argument(
+        "--saturation", type=float, default=1.0, help="Counts for a cell to fully self-trust"
+    )
     parser.add_argument("--block", type=int, default=8192, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers")
     parser.add_argument("--baseline", action="store_true")
@@ -362,18 +464,30 @@ def main():
     parser.add_argument("--calib-max-points", type=int, default=2_000_000)
     parser.add_argument("--calibration", default=None, help="Calibration JSON path")
     parser.add_argument("--src-crs", type=int, default=4326)
-    parser.add_argument("--skip-calibration", action="store_true",
-                        help="Skip calibration, use defaults")
+    parser.add_argument(
+        "--skip-calibration", action="store_true", help="Skip calibration, use defaults"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     run(
-        args.input, args.value_col, args.lng_col, args.lat_col, args.out,
-        res=args.res, cap_km=args.cap_km, transform=args.transform,
-        saturation=args.saturation, block_size=args.block,
-        workers=args.workers, calib_path=args.calibration,
-        baseline=args.baseline, scale=args.scale, compress=args.compress,
-        calib_max_points=args.calib_max_points, src_crs=args.src_crs,
+        args.input,
+        args.value_col,
+        args.lng_col,
+        args.lat_col,
+        args.out,
+        res=args.res,
+        cap_km=args.cap_km,
+        transform=args.transform,
+        saturation=args.saturation,
+        block_size=args.block,
+        workers=args.workers,
+        calib_path=args.calibration,
+        baseline=args.baseline,
+        scale=args.scale,
+        compress=args.compress,
+        calib_max_points=args.calib_max_points,
+        src_crs=args.src_crs,
         skip_calibration=args.skip_calibration,
     )
 
