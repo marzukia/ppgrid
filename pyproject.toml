@@ -41,7 +41,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.1"]
+dev = ["ruff>=0.1", "pytest>=8.0"]
 
 [project.urls]
 Homepage = "https://github.com/andryo/idw"
@@ -75,6 +75,9 @@ ignore = [
     "PLW0603",  # global required for ProcessPoolExecutor initializer
     "TC003",    # Callable used at runtime in function signatures
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["pullpush"]
