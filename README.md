@@ -74,7 +74,8 @@ The tool was benchmarked using the Melbourne Housing dataset (13,580 points) at 
 | 250m | 0.6s | 159 KB |
 | 500m | 0.6s | 49 KB |
 
-![Melbourne Housing: Resolution vs Time & Size](examples/benchmarks.png)
+![Wall Time vs Resolution](examples/bench_time.png)
+![File Size vs Resolution](examples/bench_size.png)
 
 ## Install
 
