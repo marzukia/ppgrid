@@ -9,8 +9,6 @@ Usage:
 import argparse
 from pathlib import Path
 
-import numpy as np
-
 from ppgrid.idwgrid import Pipeline
 
 
@@ -35,6 +33,7 @@ def run(resolution: float, out_dir: Path) -> None:
 
 
 def main() -> None:
+    """Parse arguments and run the pipeline at requested resolutions."""
     parser = argparse.ArgumentParser(description="Reproduce Melbourne housing example.")
     parser.add_argument(
         "--res",
