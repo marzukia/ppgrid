@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-08
+- Added `__version__` to package.
+- Moved `pyarrow` to optional `[parquet]` dependency.
+- Added `CHANGELOG.md`.
+- Added `SECURITY.md` and `SUPPORT.md`.
+- Added `CODEOWNERS` and pre-commit config.
+- Added `examples/run_melb.py` reproducible example script.
+- Added CI and PyPI badges to README.
+- Stated benchmark hardware in README.
+- Fixed README project structure and CLI table.
+- Added `python` keyword and Python 3.14 classifier.
+- Fixed emdash in pyproject.toml description.
+- Regenerated `uv.lock`.
+
 ## [0.1.4] - 2026-08-08
 - Fixed PyPI project URLs to point to the renamed GitHub repository (`ppgrid`).
 - Added homepage link between PyPI and GitHub.
