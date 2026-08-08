@@ -667,7 +667,7 @@ def run(
 def main() -> None:
     """Parse CLI arguments and run the pipeline."""
     parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
-    parser.add_argument("--version", action="version", version="ppgrid 0.1.1")
+    parser.add_argument("--version", action="version", version="ppgrid 0.1.2")
     parser.add_argument("input", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="examples/", help="Output directory")
     parser.add_argument("--value-col", default="value", help="Value column name")
