@@ -1,9 +1,9 @@
-"""Tests for pullpush.pullpush."""
+"""Tests for ppgrid.pullpush."""
 
 import numpy as np
 import pytest
 
-from pullpush.pullpush import (
+from ppgrid.pullpush import (
     bin_points,
     box_count,
     downsample_sum,
@@ -113,7 +113,7 @@ def test_pull_push_dimension_error() -> None:
 
 def test_smooth3_size_1_guard() -> None:
     """_smooth3 handles size-1 axes without error."""
-    from pullpush.pullpush import _smooth3
+    from ppgrid.pullpush import _smooth3
 
     # Single row
     a1 = np.array([[1.0, 2.0, 3.0]])

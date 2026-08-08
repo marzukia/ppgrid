@@ -1,9 +1,9 @@
-"""Tests for pullpush.calibrate."""
+"""Tests for ppgrid.calibrate."""
 
 import numpy as np
 import pytest
 
-from pullpush.calibrate import (
+from ppgrid.calibrate import (
     PercentileTransform,
     choose_transform,
     make_transform,

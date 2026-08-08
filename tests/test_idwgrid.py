@@ -1,4 +1,4 @@
-"""Tests for pullpush.idwgrid."""
+"""Tests for ppgrid.idwgrid."""
 
 from pathlib import Path
 
@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import rasterio
 
-from pullpush.idwgrid import Pipeline
+from ppgrid.idwgrid import Pipeline
 
 
 def test_empty_input_error(tmp_path: Path) -> None:

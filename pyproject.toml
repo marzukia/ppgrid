@@ -1,5 +1,5 @@
 [project]
-name = "pullpush"
+name = "ppgrid"
 version = "0.1.0"
 description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes — no GPU required."
 readme = "README.md"
@@ -48,7 +48,7 @@ Repository = "https://github.com/marzukia/pullpush"
 Issues = "https://github.com/marzukia/pullpush/issues"
 
 [project.scripts]
-pullpush = "pullpush.idwgrid:main"
+ppgrid = "ppgrid.idwgrid:main"
 
 [tool.ruff]
 target-version = "py311"
@@ -79,7 +79,7 @@ ignore = [
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["pullpush"]
+packages = ["ppgrid"]
 
 [build-system]
 requires = ["hatchling"]

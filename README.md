@@ -1,4 +1,4 @@
-# pullpush — Pull-Push Scattered-Data Interpolation
+# ppgrid — Pull-Push Scattered-Data Interpolation
 
 Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a pair of GeoTIFFs in minutes on a single machine. No GPU needed.
 
@@ -48,9 +48,9 @@ Before interpolation, the tool can:
 ## Project Structure
 
 ```
-pullpush/
+ppgrid/
   __init__.py    — package init
-  __main__.py    — entry point for `python -m pullpush`
+  __main__.py    — entry point for `python -m ppgrid`
   pullpush.py    — mipmap kernels (downsample, upsample, pull_push, box_count)
   calibrate.py   — transform selection + blocked CV for fill cap
   idwgrid.py     — CLI driver with block parallel processing
@@ -93,7 +93,7 @@ pip install numpy pandas pyproj rasterio
 
 ```bash
 # Interpolate Melbourne house prices
-pullpush data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-calibration -o examples/melb/
+ppgrid data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-calibration -o examples/melb/
 ```
 
 ## Example Outputs
@@ -116,16 +116,16 @@ Cropped to the CBD to show resolution differences:
 
 ```bash
 # Quick run (skip calibration)
-python -m pullpush data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration
+python -m ppgrid data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration
 
 # Full run with calibration (saves calibration.json)
-python -m pullpush data.csv --value-col premium --res 100 --cap-km auto
+python -m ppgrid data.csv --value-col premium --res 100 --cap-km auto
 
 # Custom projection and params
-python -m pullpush data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8 --work-crs 3857 --out-crs 3857
+python -m ppgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8 --work-crs 3857 --out-crs 3857
 
 # Reuse existing calibration
-python -m pullpush data.csv --value-col premium --calibration examples/previous/calibration.json
+python -m ppgrid data.csv --value-col premium --calibration examples/previous/calibration.json
 ```
 
 ### CLI Options

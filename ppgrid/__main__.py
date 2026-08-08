@@ -1,4 +1,4 @@
-"""Entry point: python -m pullpush ..."""
+"""Entry point: python -m ppgrid ..."""
 
 from .idwgrid import main
 
