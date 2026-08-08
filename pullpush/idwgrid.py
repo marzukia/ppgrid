@@ -646,6 +646,7 @@ def run(
 def main() -> None:
     """Parse CLI arguments and run the pipeline."""
     parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
+    parser.add_argument("--version", action="version", version="pullpush 0.1.0")
     parser.add_argument("input", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="outputs/", help="Output directory")
     parser.add_argument("--value-col", default="value", help="Value column name")
@@ -675,6 +676,15 @@ def main() -> None:
     parser.add_argument("--out-crs", type=int, default=3857, help="Output CRS (default 3857)")
     parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
     args = parser.parse_args()
+
+    if args.res <= 0:
+        parser.error("--res must be positive")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.scale <= 0:
+        parser.error("--scale must be positive")
+    if args.block < 1:
+        parser.error("--block must be at least 1")
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
     run(

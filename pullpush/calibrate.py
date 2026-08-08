@@ -327,11 +327,10 @@ def blocked_cv_skill(
         if nb < n:
             sub = rng.choice(n, nb, replace=False)
             e_m, e_b = e_m[sub], e_b[sub]
-        idx = rng.integers(0, nb, size=(n_boot, nb))
-        bs = 1 - (
-            np.sqrt(np.mean(e_m[idx] ** 2, axis=1))
-            / np.sqrt(np.mean(e_b[idx] ** 2, axis=1))
-        )
+        bs = np.empty(n_boot, dtype=np.float32)
+        for k in range(n_boot):
+            s = rng.integers(0, nb, size=nb)
+            bs[k] = 1 - np.sqrt(np.mean(e_m[s] ** 2)) / np.sqrt(np.mean(e_b[s] ** 2))
         rows.append(
             {
                 "lo_km": float(lo),

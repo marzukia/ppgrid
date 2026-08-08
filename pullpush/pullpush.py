@@ -186,9 +186,9 @@ def bin_points(
 
     """
     key = ix.astype(np.int64) * ny + iy.astype(np.int64)
-    s = np.bincount(key, weights=values, minlength=nx * ny)
-    c = np.bincount(key, minlength=nx * ny)
-    return (s.reshape(nx, ny).astype(np.float32), c.reshape(nx, ny).astype(np.float32))
+    s = np.bincount(key, weights=values, minlength=nx * ny).reshape(nx, ny).astype(np.float32)
+    c = np.bincount(key, minlength=nx * ny).reshape(nx, ny).astype(np.float32)
+    return s, c
 
 
 def pad_to_pyramid(n: int, levels: int) -> int:
