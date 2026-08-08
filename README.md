@@ -1,4 +1,4 @@
-# ppgrid — Pull-Push Scattered-Data Interpolation
+# ppgrid - Pull-Push Scattered-Data Interpolation
 
 Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a pair of GeoTIFFs in minutes on a single machine. No GPU needed.
 
@@ -6,7 +6,7 @@ Fast, continent-scale raster interpolation for scattered point data. Turns tens 
 
 You have `N` points (`N` ~ 10^7) with `(longitude, latitude, value)`. You want a raster of `M` cells where every cell within a defensible distance of real data carries an interpolated value, and everything else is nodata.
 
-Standard IDW in QGIS/ArcGIS is `O(N×M)` — ~14 hours for 16M points. This tool uses pull-push mipmap interpolation to reduce cost to `O(M)`, independent of N.
+Standard IDW in QGIS/ArcGIS is `O(N×M)` (~14 hours for 16M points. This tool uses pull-push mipmap interpolation to reduce cost to `O(M)`, independent of N.
 
 ## How it works
 
@@ -27,38 +27,38 @@ Pull-push evaluates this across a mipmap pyramid so cost is `O(M)`, independent 
 2. A mipmap pyramid is built by repeated 2x2 block sums
 3. The coarsest level seeds the interpolation
 4. Descending the pyramid, each level blends local estimate vs upsampled parent
-5. Local confidence is `min(C/saturation, 1)` — dense cells trust themselves, sparse cells inherit
+5. Local confidence is `min(C/saturation, 1)`. Dense cells trust themselves, sparse cells inherit
 6. A summed-area table (`box_count`) provides an exact radius fill cap
 
 **Output bands:**
 - **Value:** int16, 0-100 percentile, `percentile = DN/scale`
 - **Support km:** int16, `support_km = 2^(DN/8)`, effective spatial scale of estimate
 
-**Working CRS:** EPSG:6933 (Wagner VII) by default — global equal-area, metres are true. Configurable via `--work-crs`.
+**Working CRS:** EPSG:6933 (Wagner VII) by default. Global equal-area, metres are true. Configurable via `--work-crs`.
 
 **Output CRS:** EPSG:3857 (Web Mercator) by default. Configurable via `--out-crs`.
 
 ### Calibration (optional)
 
 Before interpolation, the tool can:
-1. **Choose a transform** — tests identity/log10/sqrt/percentile and picks the one with highest intraclass correlation across coarse scales
-2. **Derive a fill cap** — spatially blocked cross-validation to find the honest distance beyond which interpolation has no skill
-3. **Save calibration.json** — contains the percentile-to-value lookup table for decoding the output raster back to real units
+1. **Choose a transform**. Tests identity/log10/sqrt/percentile and picks the one with highest intraclass correlation across coarse scales
+2. **Derive a fill cap**. Spatially blocked cross-validation to find the honest distance beyond which interpolation has no skill
+3. **Save calibration.json**. Contains the percentile-to-value lookup table for decoding the output raster back to real units
 
 ## Project Structure
 
 ```
 ppgrid/
-  __init__.py    — package init
-  __main__.py    — entry point for `python -m ppgrid`
-  pullpush.py    — mipmap kernels (downsample, upsample, pull_push, box_count)
-  calibrate.py   — transform selection + blocked CV for fill cap
-  idwgrid.py     — CLI driver with block parallel processing
+  __init__.py    : package init
+  __main__.py    : entry point for `python -m ppgrid`
+  pullpush.py    : mipmap kernels (downsample, upsample, pull_push, box_count)
+  calibrate.py   : transform selection + blocked CV for fill cap
+  idwgrid.py     : CLI driver with block parallel processing
 examples/
   test_run/
-    value.tif       — interpolated value band (percentile)
-    support_km.tif  — effective support scale
-    calibration.json — percentile-to-value lookup table
+    value.tif       : interpolated value band (percentile)
+    support_km.tif  : effective support scale
+    calibration.json : percentile-to-value lookup table
 ```
 
 ## Benchmarks
@@ -74,8 +74,8 @@ The tool was benchmarked using the Melbourne Housing dataset (13,580 points) at 
 | 250m | 0.6s | 159 KB |
 | 500m | 0.6s | 49 KB |
 
-![Wall Time vs Resolution](examples/bench_time.png)
-![File Size vs Resolution](examples/bench_size.png)
+![Wall Time vs Resolution](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/bench_time.png)
+![File Size vs Resolution](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/bench_size.png)
 
 ## Install
 
@@ -100,17 +100,17 @@ ppgrid data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-calib
 
 The Melbourne Housing dataset (13,580 points) interpolated at 10m resolution:
 
-![Melbourne Housing 10m Full](examples/melb/full_10m.png)
+![Melbourne Housing 10m Full](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/full_10m.png)
 
 Cropped to the CBD to show resolution differences:
 
 | 10m | 25m | 50m |
 |-----|-----|-----|
-| ![10m](examples/melb/10m/value.png) | ![25m](examples/melb/25m/value.png) | ![50m](examples/melb/50m/value.png) |
+| ![10m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/10m/value.png) | ![25m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/25m/value.png) | ![50m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/50m/value.png) |
 
 | 100m | 250m | 500m |
 |------|------|------|
-| ![100m](examples/melb/100m/value.png) | ![250m](examples/melb/250m/value.png) | ![500m](examples/melb/500m/value.png) |
+| ![100m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/100m/value.png) | ![250m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/250m/value.png) | ![500m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/500m/value.png) |
 
 ## Usage
 
@@ -170,9 +170,9 @@ real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quanti
 
 ## Data
 
-`data/melb_houses.csv` — 13,580 Melbourne property sales with latitude, longitude, and price. Sourced from the [Melbourne Housing Snapshot](https://www.kaggle.com/datasets/dansbecker/melbourne-housing-snapshot) (CC BY-NC-SA 4.0).
+`data/melb_houses.csv`: 13,580 Melbourne property sales with latitude, longitude, and price. Sourced from the [Melbourne Housing Snapshot](https://www.kaggle.com/datasets/dansbecker/melbourne-housing-snapshot) (CC BY-NC-SA 4.0).
 
-`data/all_equakes.csv` — 44,376 earthquake events from Jan–Aug 2026, mag ≥ 1.5.
+`data/all_equakes.csv`: 44,376 earthquake events from Jan–Aug 2026, mag ≥ 1.5.
 
 ### Data Lineage
 
@@ -186,7 +186,7 @@ real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quanti
 
 ### Columns Used
 
-- `latitude` / `longitude` — spatial coordinates (WGS 84)
-- `mag` — earthquake magnitude (continuous, for interpolation)
-- `depth` — focal depth in km (optional value layer)
-- `time` — event timestamp (ISO 8601)
+- `latitude` / `longitude`: spatial coordinates (WGS 84)
+- `mag`: earthquake magnitude (continuous, for interpolation)
+- `depth`: focal depth in km (optional value layer)
+- `time`: event timestamp (ISO 8601)
