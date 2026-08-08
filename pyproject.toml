@@ -1,6 +1,6 @@
 [project]
 name = "ppgrid"
-version = "0.1.2"
+version = "0.1.3"
 description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes — no GPU required."
 readme = "README.md"
 license = "MIT"
