@@ -113,7 +113,7 @@ ppgrid data.csv --value-col premium --calibration calibration.json
 | `--src-crs` | `4326` | Input coordinate reference system |
 | `--work-crs` | `6933` | Working CRS for interpolation (equal-area) |
 | `--out-crs` | `3857` | Output CRS for final GeoTIFF |
-| `--skip-calibration` | false | Skip calibration, use defaults |
+| `--skip-calibration` | False | Skip calibration, use defaults |
 
 ## Decoding the output
 

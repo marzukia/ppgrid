@@ -1,7 +1,7 @@
 [project]
 name = "ppgrid"
 version = "0.1.4"
-description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes — no GPU required."
+description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes. No GPU required."
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Andryo Marzuki", email = "andryo@mrzk.io" }]
@@ -16,6 +16,7 @@ keywords = [
     "spatial-analysis",
     "scattered-data",
     "gridding",
+    "python",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -26,6 +27,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: GIS",
     "Topic :: Scientific/Engineering :: Information Analysis",
     "Topic :: Scientific/Engineering :: Mathematics",
@@ -39,11 +41,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.1", "pytest>=8.0", "parquet"]
+dev = ["ruff>=0.1", "pytest>=8.0", "pre-commit>=4.0"]
 parquet = ["pyarrow"]
 
 [project.urls]
-Homepage = "https://pypi.org/project/ppgrid/"
+Homepage = "https://github.com/marzukia/ppgrid"
 Repository = "https://github.com/marzukia/ppgrid"
 Issues = "https://github.com/marzukia/ppgrid/issues"
 
