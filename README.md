@@ -98,13 +98,15 @@ pullpush data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-cal
 
 ## Example Outputs
 
-**Earthquake magnitude interpolation** (44,376 global events, mag ≥ 1.5):
+The Melbourne Housing dataset (13,580 points) interpolated at various resolutions:
 
-![Earthquake magnitude interpolation](examples/equakes/value.png)
+| 10m | 25m | 50m |
+|-----|-----|-----|
+| ![10m](examples/melb/10m/value.png) | ![25m](examples/melb/25m/value.png) | ![50m](examples/melb/50m/value.png) |
 
-**Melbourne house price interpolation** (13,580 property sales):
-
-![Melbourne house price interpolation](examples/melb/value.png)
+| 100m | 250m | 500m |
+|------|------|------|
+| ![100m](examples/melb/100m/value.png) | ![250m](examples/melb/250m/value.png) | ![500m](examples/melb/500m/value.png) |
 
 ## Usage
 
