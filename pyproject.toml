@@ -37,10 +37,11 @@ dependencies = [
     "pandas>=2.0",
     "pyproj>=3.6",
     "rasterio>=1.3",
+    "pyarrow",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.1", "pyarrow"]
+dev = ["ruff>=0.1"]
 
 [project.urls]
 Homepage = "https://github.com/andryo/idw"
@@ -61,6 +62,8 @@ ignore = [
     "ANN401",   # Any allowed in **kwargs annotations
     "CPY001",   # no copyright headers needed
     "PLW0717",  # too many statements in try (reproject block)
+    "PLR1702",  # too many nested blocks (reproject block)
+    "C901",     # function too complex (Pipeline.run)
     "D203",     # conflicts with D211 (must pick one)
     "D213",     # conflicts with D212 (must pick one)
     "FURB189",  # dict subclassing for JSON serialization

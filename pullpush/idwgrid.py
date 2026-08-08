@@ -36,11 +36,9 @@ from .pullpush import (
     pull_push,
 )
 
-# Suppress rasterio internal deprecation with numpy 2.5+
-warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
-
 WORK_CRS: int = 6933  # Wagner VII — global equal-area, metres are true
 NODATA: int = -32768
+INT16_MAX: int = 32767
 
 # Per-worker context (module-level so it's local to each process)
 _CTX: dict[str, Any] = {}
@@ -97,7 +95,7 @@ def _init_worker(cfg: _WorkerConfig) -> None:
 
 
 def _block_points(bx: int, by: int) -> np.ndarray:
-    """Gather points from the 3x3 block neighbourhood (valid while halo <= bsize).
+    """Gather points from the 3x3 block neighbourhood.
 
     Returns:
         Stacked point array of shape (4, n_points).
@@ -224,7 +222,12 @@ class Pipeline:
         out_crs: int = 3857,
         skip_calibration: bool = False,
     ) -> None:
-        """Initialise the interpolation pipeline."""
+        """Initialise the interpolation pipeline.
+
+        Raises:
+            ValueError: If scale * 100 exceeds int16 max.
+
+        """
         self.input_path = input_path
         self.value_col = value_col
         self.lng_col = lng_col
@@ -244,6 +247,13 @@ class Pipeline:
         self.work_crs = work_crs
         self.out_crs = out_crs
         self.skip_calibration = skip_calibration
+
+        if self.scale * 100 > INT16_MAX:
+            msg = (
+                f"scale * 100 exceeds int16 max: {self.scale * 100} > {INT16_MAX}. "
+                f"Reduce scale."
+            )
+            raise ValueError(msg)
 
         # Ingest outputs
         self.v: np.ndarray
@@ -279,7 +289,12 @@ class Pipeline:
         self._cal: dict[str, Any] | None
 
     def ingest(self) -> None:
-        """Read input, filter, project to working CRS."""
+        """Read input, filter, project to working CRS.
+
+        Raises:
+            ValueError: If no valid points remain after filtering.
+
+        """
         if self.input_path.endswith((".parquet", ".pq")):
             df = pd.read_parquet(self.input_path, columns=[self.value_col, self.lng_col, self.lat_col])
         else:
@@ -292,6 +307,10 @@ class Pipeline:
         good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
         v, lon, lat = v[good], lon[good], lat[good]
         self.n = len(v)
+
+        if self.n == 0:
+            msg = "No valid points found in input. Check columns and data."
+            raise ValueError(msg)
 
         tr = Transformer.from_crs(self.src_crs, self.work_crs, always_xy=True)
         x, y = tr.transform(lon, lat)
@@ -338,7 +357,11 @@ class Pipeline:
                 "cap_km": float(self.cap_km) if self.cap_km != "auto" else 64.0,
             }
 
-        self.tname = self.transform if self.transform != "auto" else (cal["transform"] if cal else "identity")
+        self.tname = (
+            self.transform
+            if self.transform != "auto"
+            else (cal.get("transform", "identity") if cal else "identity")
+        )
         if cal and "transform_state" in cal and cal["transform_state"].get("name") == self.tname:
             self.tf = make_transform(cal["transform_state"])
         else:
@@ -350,13 +373,22 @@ class Pipeline:
             else PercentileTransform().fit(self.v)
         )
 
-        self.cap_km_val = float(self.cap_km) if self.cap_km != "auto" else float(cal["cap_km"] if cal else 64.0)
+        self.cap_km_val = (
+            float(self.cap_km)
+            if self.cap_km != "auto"
+            else float(cal.get("cap_km", 64.0) if cal else 64.0)
+        )
 
         self.tv = self.tf.fwd(self.v)
         self._cal = cal
 
     def grid(self) -> None:
-        """Compute grid geometry and spatial index."""
+        """Compute grid geometry and spatial index.
+
+        Raises:
+            ValueError: If halo exceeds block size.
+
+        """
         self.x0 = self.x.min()
         self.y0 = self.y.min()
         self.nx = int((self.x.max() - self.x0) // self.res) + 1
@@ -368,6 +400,14 @@ class Pipeline:
         self.nx_padded = -(-self.nx // self.step) * self.step
         self.ny_padded = -(-self.ny // self.step) * self.step
         self.bsize = max(self.block_size, self.step)
+        if self.halo > self.bsize:
+            msg = (
+                f"halo ({self.halo}) exceeds block size ({self.bsize}). "
+                 f"Reduce cap_km or increase block size. "
+                 f"Currently: cap_km={self.cap_km_val}, res={self.res}, "
+                 f"block={self.block_size}"
+            )
+            raise ValueError(msg)
         self.nbx = math.ceil(self.nx / self.bsize)
         self.nby = math.ceil(self.ny / self.bsize)
 
@@ -485,98 +525,92 @@ class Pipeline:
                 sd.write(blank, 1, window=w)
 
             # Process blocks with parallel workers
-            with ProcessPoolExecutor(
-                max_workers=self.workers,
-                initializer=_init_worker,
-                initargs=(self.cfg,),
-            ) as ex:
-                for bx, by, out in ex.map(_process_block, self.tasks, chunksize=1):
-                    i0, j0 = bx * self.bsize, by * self.bsize
-                    i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
-                    w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
+                with ProcessPoolExecutor(
+                    max_workers=self.workers,
+                    initializer=_init_worker,
+                    initargs=(self.cfg,),
+                ) as ex:
+                    for bx, by, out in ex.map(_process_block, self.tasks, chunksize=1):
+                        i0, j0 = bx * self.bsize, by * self.bsize
+                        i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
+                        w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
 
-                    if out is None:
-                        blank = np.full((w.height, w.width), NODATA, np.int16)
-                        vd.write(blank, 1, window=w)
-                        sd.write(blank, 1, window=w)
-                        continue
+                        if out is None:
+                            blank = np.full((w.height, w.width), NODATA, np.int16)
+                            vd.write(blank, 1, window=w)
+                            sd.write(blank, 1, window=w)
+                            continue
 
-                    vq, rq = out
-                    vd.write(vq.T[::-1, :], 1, window=w)
-                    sd.write(rq.T[::-1, :], 1, window=w)
+                        vq, rq = out
+                        vd.write(vq.T[::-1, :], 1, window=w)
+                        sd.write(rq.T[::-1, :], 1, window=w)
 
         try:
-            # Cleanup memmap
             self.pts_path.unlink()
 
-            # Reproject to output CRS if different from working CRS
             if self.out_crs != self.work_crs:
                 tmp_v = Path(self.out_dir) / "_value_tmp.tif"
                 tmp_s = Path(self.out_dir) / "_support_tmp.tif"
                 vpath.rename(tmp_v)
                 spath.rename(tmp_s)
                 try:
-                    with rasterio.open(tmp_v) as src:
-                        out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
-                            src.crs,
-                            f"EPSG:{self.out_crs}",
-                            src.width,
-                            src.height,
-                            *src.bounds,
-                        )
-                        vprof_out = dict(
-                            vprof,
-                            width=out_width,
-                            height=out_height,
-                            transform=out_transform,
-                            crs=f"EPSG:{self.out_crs}",
-                        )
-                        dst_v = np.empty((out_height, out_width), dtype=np.int16)
-                        reproject(
-                            rasterio.band(src, 1),
-                            dst_v,
-                            dst_transform=out_transform,
-                            dst_crs=f"EPSG:{self.out_crs}",
-                            resampling=Resampling.nearest,
-                            nodata=NODATA,
-                        )
-                        with rasterio.open(vpath, "w", **vprof_out) as dst:
-                            dst.write(dst_v, 1)
-                            dst.update_tags(**src.tags())
+                    def _reproject_band(
+                        src_path: str,
+                        dst_path: str,
+                        profile: dict[str, Any],
+                        dst_crs: str,
+                    ) -> None:
+                        with rasterio.open(src_path) as src:
+                            dst_transform, dst_width, dst_height = (
+                                rasterio.warp.calculate_default_transform(
+                                    src.crs, dst_crs, src.width, src.height, *src.bounds,
+                                )
+                            )
+                            dst_profile = dict(
+                                profile,
+                                width=dst_width,
+                                height=dst_height,
+                                transform=dst_transform,
+                                crs=dst_crs,
+                            )
+                            with rasterio.open(dst_path, "w", **dst_profile) as dst:
+                                dst.update_tags(**src.tags())
+                                if hasattr(src, "scales") and src.scales:
+                                    dst.scales = src.scales
+                                if hasattr(src, "offsets") and src.offsets:
+                                    dst.offsets = src.offsets
+                                tile = 512
+                                for j in range(0, dst_height, tile):
+                                    for i in range(0, dst_width, tile):
+                                        w_h = min(tile, dst_height - j)
+                                        w_w = min(tile, dst_width - i)
+                                        dst_w = rasterio.windows.Window(i, j, w_w, w_h)
+                                        dst_arr = np.zeros((dst_w.height, dst_w.width), dtype=np.int16)
+                                        reproject(
+                                            rasterio.band(src, 1),
+                                            dst_arr,
+                                            dst_transform=dst_transform,
+                                            dst_crs=dst_crs,
+                                            dst_window=dst_w,
+                                            resampling=Resampling.nearest,
+                                            nodata=NODATA,
+                                        )
+                                        dst.write(dst_arr, 1, window=dst_w)
 
-                    with rasterio.open(tmp_s) as src:
-                        out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
-                            src.crs,
-                            f"EPSG:{self.out_crs}",
-                            src.width,
-                            src.height,
-                            *src.bounds,
-                        )
-                        sprof_out = dict(
-                            sprof,
-                            width=out_width,
-                            height=out_height,
-                            transform=out_transform,
-                            crs=f"EPSG:{self.out_crs}",
-                        )
-                        dst_s = np.empty((out_height, out_width), dtype=np.int16)
-                        reproject(
-                            rasterio.band(src, 1),
-                            dst_s,
-                            dst_transform=out_transform,
-                            dst_crs=f"EPSG:{self.out_crs}",
-                            resampling=Resampling.nearest,
-                            nodata=NODATA,
-                        )
-                        with rasterio.open(spath, "w", **sprof_out) as dst:
-                            dst.write(dst_s, 1)
-                            dst.update_tags(**src.tags())
+                    _reproject_band(str(tmp_v), str(vpath), vprof, f"EPSG:{self.out_crs}")
+                    _reproject_band(str(tmp_s), str(spath), sprof, f"EPSG:{self.out_crs}")
                 except Exception:
-                    tmp_v.rename(vpath)
-                    tmp_s.rename(spath)
+                    if tmp_v.exists():
+                        tmp_v.rename(vpath)
+                    if tmp_s.exists():
+                        tmp_s.rename(spath)
                     raise
-                tmp_v.unlink()
-                tmp_s.unlink()
+                if tmp_v.exists():
+                    tmp_v.unlink()
+                if tmp_s.exists():
+                    tmp_s.unlink()
         finally:
             if self.pts_path.exists():
                 self.pts_path.unlink()
@@ -590,21 +624,7 @@ def run(
     lng_col: str,
     lat_col: str,
     out_dir: str,
-    res: float = 500.0,
-    cap_km: float | str = "auto",
-    transform: str = "auto",
-    saturation: float = 1.0,
-    block_size: int = 8192,
-    workers: int = 4,
-    calib_path: str | None = None,
-    *,
-    scale: float = 100.0,
-    compress: str = "ZSTD",
-    calib_max_points: int = 2_000_000,
-    src_crs: int = 4326,
-    work_crs: int = 6933,
-    out_crs: int = 3857,
-    skip_calibration: bool = False,
+    **kwargs: Any,
 ) -> tuple[str, str]:
     """Full pipeline: load, calibrate, interpolate, write.
 
@@ -618,20 +638,7 @@ def run(
         lng_col,
         lat_col,
         out_dir,
-        res=res,
-        cap_km=cap_km,
-        transform=transform,
-        saturation=saturation,
-        block_size=block_size,
-        workers=workers,
-        calib_path=calib_path,
-        scale=scale,
-        compress=compress,
-        calib_max_points=calib_max_points,
-        src_crs=src_crs,
-        work_crs=work_crs,
-        out_crs=out_crs,
-        skip_calibration=skip_calibration,
+        **kwargs,
     )
     return p.run()
 

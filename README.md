@@ -1,6 +1,6 @@
 # pullpush — Pull-Push Scattered-Data Interpolation
 
-Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a gapless, capped, multi-band GeoTIFF in minutes on a single machine. No GPU needed.
+Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a pair of GeoTIFFs in minutes on a single machine. No GPU needed.
 
 ## What it does
 
@@ -48,13 +48,12 @@ Before interpolation, the tool can:
 ## Project Structure
 
 ```
-src/
-  pullpush/
-    __init__.py    — package init
-    __main__.py    — entry point for `python -m pullpush`
-    pullpush.py    — mipmap kernels (downsample, upsample, pull_push, box_count)
-    calibrate.py   — transform selection + blocked CV for fill cap
-    idwgrid.py     — CLI driver with block parallel processing
+pullpush/
+  __init__.py    — package init
+  __main__.py    — entry point for `python -m pullpush`
+  pullpush.py    — mipmap kernels (downsample, upsample, pull_push, box_count)
+  calibrate.py   — transform selection + blocked CV for fill cap
+  idwgrid.py     — CLI driver with block parallel processing
 outputs/
   test_run/
     value.tif       — interpolated value band (percentile)

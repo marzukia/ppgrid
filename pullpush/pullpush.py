@@ -50,6 +50,11 @@ def _smooth3(a: np.ndarray) -> np.ndarray:
         Smoothed array with same shape as input.
 
     """
+    if a.shape[0] == 1:
+        return a.copy()
+    if a.shape[1] == 1:
+        return a.copy()
+
     b = np.empty_like(a)
     b[1:-1] = 0.25 * (a[:-2] + 2.0 * a[1:-1] + a[2:])
     b[0] = 0.25 * (3.0 * a[0] + a[1])
@@ -85,11 +90,11 @@ def box_count(counts: np.ndarray, radius: int) -> np.ndarray:
 
     """
     n0, n1 = counts.shape
-    cs = np.pad(np.cumsum(counts, axis=0, dtype=np.float32), ((1, 0), (0, 0)))
+    cs = np.pad(np.cumsum(counts, axis=0, dtype=np.int64), ((1, 0), (0, 0)))
     lo = np.clip(np.arange(n0) - radius, 0, n0)
     hi = np.clip(np.arange(n0) + radius + 1, 0, n0)
     a = cs[hi] - cs[lo]
-    cs = np.pad(np.cumsum(a, axis=1, dtype=np.float32), ((0, 0), (1, 0)))
+    cs = np.pad(np.cumsum(a, axis=1, dtype=np.int64), ((0, 0), (1, 0)))
     lo = np.clip(np.arange(n1) - radius, 0, n1)
     hi = np.clip(np.arange(n1) + radius + 1, 0, n1)
     return cs[:, hi] - cs[:, lo]
@@ -123,7 +128,25 @@ def pull_push(
     Returns:
         Tuple of interpolated value grid and support grid in metres.
 
+    Raises:
+        ValueError: If grid shapes mismatch or dimensions are not divisible
+            by 2**levels.
+
     """
+    if sum_grid.shape != count_grid.shape:
+        msg = (
+            f"sum_grid shape {sum_grid.shape} != count_grid shape {count_grid.shape}",
+        )
+        raise ValueError(msg)
+    step = 1 << levels
+    for dim in sum_grid.shape:
+        if dim % step != 0:
+            msg = (
+                f"Grid dimensions must be divisible by 2**levels ({step}): "
+                 f"got shape {sum_grid.shape}"
+            )
+            raise ValueError(msg)
+
     sums: list[np.ndarray] = [sum_grid]
     counts: list[np.ndarray] = [count_grid]
     for _ in range(levels):
