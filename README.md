@@ -49,9 +49,12 @@ Before interpolation, the tool can:
 
 ```
 src/
-  pullpush.py     — mipmap kernels (downsample, upsample, pull_push, box_count)
-  calibrate.py    — transform selection + blocked CV for fill cap
-  idwgrid.py      — CLI driver with block parallel processing
+  pullpush/
+    __init__.py    — package init
+    __main__.py    — entry point for `python -m pullpush`
+    pullpush.py    — mipmap kernels (downsample, upsample, pull_push, box_count)
+    calibrate.py   — transform selection + blocked CV for fill cap
+    idwgrid.py     — CLI driver with block parallel processing
 outputs/
   test_run/
     value.tif       — interpolated value band (percentile)
@@ -75,16 +78,16 @@ pip install numpy pandas pyproj rasterio
 
 ```bash
 # Quick run (skip calibration)
-python -m src.idwgrid data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration
+python -m pullpush data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration
 
 # Full run with calibration (saves calibration.json)
-python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km auto
+python -m pullpush data.csv --value-col premium --res 100 --cap-km auto
 
 # Custom projection and params
-python -m src.idwgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8 --work-crs 3857 --out-crs 3857
+python -m pullpush data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8 --work-crs 3857 --out-crs 3857
 
 # Reuse existing calibration
-python -m src.idwgrid data.csv --value-col premium --calibration outputs/previous/calibration.json
+python -m pullpush data.csv --value-col premium --calibration outputs/previous/calibration.json
 ```
 
 ### CLI Options
