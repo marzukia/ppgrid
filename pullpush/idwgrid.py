@@ -598,19 +598,23 @@ class Pipeline:
                                     dst.scales = src.scales
                                 if hasattr(src, "offsets") and src.offsets:
                                     dst.offsets = src.offsets
+                                from rasterio.transform import from_bounds
                                 tile = 512
                                 for j in range(0, dst_height, tile):
                                     for i in range(0, dst_width, tile):
                                         w_h = min(tile, dst_height - j)
                                         w_w = min(tile, dst_width - i)
                                         dst_w = rasterio.windows.Window(i, j, w_w, w_h)
-                                        dst_arr = np.zeros((dst_w.height, dst_w.width), dtype=np.int16)
+                                        # Compute local transform for this window
+                                        w_bounds = rasterio.windows.bounds(dst_w, dst_transform)
+                                        local_dst_transform = from_bounds(*w_bounds, w_w, w_h)
+                                        dst_arr = np.zeros((w_h, w_w), dtype=np.int16)
                                         reproject(
                                             rasterio.band(src, 1),
                                             dst_arr,
-                                            dst_transform=dst_transform,
+                                            src_transform=src.transform,
+                                            dst_transform=local_dst_transform,
                                             dst_crs=dst_crs,
-                                            dst_window=dst_w,
                                             resampling=Resampling.nearest,
                                             nodata=NODATA,
                                         )
