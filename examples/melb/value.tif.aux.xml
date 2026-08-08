@@ -1,0 +1,21 @@
+<PAMDataset>
+  <Metadata>
+    <MDI key="cap_km">10.0</MDI>
+    <MDI key="decode">percentile = DN/100</MDI>
+    <MDI key="res_m">10.0</MDI>
+    <MDI key="scale">100.0</MDI>
+    <MDI key="transform">identity</MDI>
+    <MDI key="units">percentile</MDI>
+  </Metadata>
+  <PAMRasterBand band="1">
+    <Scale>0.01</Scale>
+    <Metadata>
+      <MDI key="STATISTICS_APPROXIMATE">YES</MDI>
+      <MDI key="STATISTICS_MAXIMUM">8546</MDI>
+      <MDI key="STATISTICS_MEAN">2453.8633736055</MDI>
+      <MDI key="STATISTICS_MINIMUM">0</MDI>
+      <MDI key="STATISTICS_STDDEV">2127.6702147209</MDI>
+      <MDI key="STATISTICS_VALID_PERCENT">66.9</MDI>
+    </Metadata>
+  </PAMRasterBand>
+</PAMDataset>
