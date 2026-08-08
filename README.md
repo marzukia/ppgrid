@@ -80,6 +80,16 @@ pip install numpy pandas pyproj rasterio
 pullpush data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-calibration -o examples/melb/
 ```
 
+## Example Outputs
+
+**Earthquake magnitude interpolation** (44,376 global events, mag ≥ 1.5):
+
+![Earthquake magnitude interpolation](examples/equakes/value.png)
+
+**Melbourne house price interpolation** (13,580 property sales):
+
+![Melbourne house price interpolation](examples/melb/value.png)
+
 ## Usage
 
 ```bash
