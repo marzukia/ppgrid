@@ -73,6 +73,13 @@ Or manually:
 pip install numpy pandas pyproj rasterio
 ```
 
+## Quick Start
+
+```bash
+# Interpolate Melbourne house prices
+pullpush data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-calibration -o outputs/melb/
+```
+
 ## Usage
 
 ```bash
@@ -130,6 +137,8 @@ real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quanti
 ```
 
 ## Data
+
+`data/melb_houses.csv` — 13,580 Melbourne property sales with latitude, longitude, and price. Sourced from the [Melbourne Housing Snapshot](https://www.kaggle.com/datasets/dansbecker/melbourne-housing-snapshot) (CC BY-NC-SA 4.0).
 
 `data/all_equakes.csv` — 44,376 earthquake events from Jan–Aug 2026, mag ≥ 1.5.
 
