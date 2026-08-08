@@ -98,7 +98,11 @@ pullpush data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-cal
 
 ## Example Outputs
 
-The Melbourne Housing dataset (13,580 points) interpolated at various resolutions:
+The Melbourne Housing dataset (13,580 points) interpolated at 10m resolution:
+
+![Melbourne Housing 10m Full](examples/melb/full_10m.png)
+
+Cropped to the CBD to show resolution differences:
 
 | 10m | 25m | 50m |
 |-----|-----|-----|
