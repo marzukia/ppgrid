@@ -10,7 +10,7 @@ import argparse
 import json
 import math
 import warnings
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -210,7 +210,7 @@ class Pipeline:
         cap_km: float | str = "auto",
         transform: str = "auto",
         saturation: float = 1.0,
-        block_size: int = 8192,
+        block_size: int = 2048,
         workers: int = 4,
         calib_path: str | None = None,
         *,
@@ -527,12 +527,29 @@ class Pipeline:
             # Process blocks with parallel workers
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
-                with ProcessPoolExecutor(
-                    max_workers=self.workers,
-                    initializer=_init_worker,
-                    initargs=(self.cfg,),
-                ) as ex:
-                    for bx, by, out in ex.map(_process_block, self.tasks, chunksize=1):
+                _CTX.update({
+                    "pts": np.load(self.cfg.pts_path, mmap_mode="r"),
+                    "tf": make_transform(self.cfg.transform_state),
+                    "pct": PercentileTransform(self.cfg.pct_quantiles),
+                    "starts": self.cfg.starts,
+                    "nbx": self.cfg.nbx,
+                    "nby": self.cfg.nby,
+                    "bsize": self.cfg.bsize,
+                    "halo": self.cfg.halo,
+                    "res": self.cfg.res,
+                    "levels": self.cfg.levels,
+                    "cap_km": self.cfg.cap_km,
+                    "x0": self.cfg.x0,
+                    "y0": self.cfg.y0,
+                    "nx": self.cfg.nx,
+                    "ny": self.cfg.ny,
+                    "nx_padded": self.cfg.nx_padded,
+                    "ny_padded": self.cfg.ny_padded,
+                    "sat": self.cfg.sat,
+                    "scale": self.cfg.scale,
+                })
+                with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                    for bx, by, out in ex.map(_process_block, self.tasks):
                         i0, j0 = bx * self.bsize, by * self.bsize
                         i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
                         w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
@@ -665,7 +682,7 @@ def main() -> None:
         default=1.0,
         help="Counts for a cell to fully self-trust",
     )
-    parser.add_argument("--block", type=int, default=8192, help="Block size in cells")
+    parser.add_argument("--block", type=int, default=2048, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers")
     parser.add_argument("--scale", type=float, default=100.0, help="DN = percentile * scale")
     parser.add_argument("--compress", default="ZSTD")
