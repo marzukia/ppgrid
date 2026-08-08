@@ -136,23 +136,23 @@ Melbourne Housing dataset (13,580 points) at various resolutions on a single mac
 | 250m | 0.6s | 159 KB |
 | 500m | 0.6s | 49 KB |
 
-![Benchmarks](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/bench_combined.png)
+![Benchmarks](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/bench_combined.png)
 
 ## Example Outputs
 
 Melbourne Housing dataset (13,580 points) interpolated at 10m resolution:
 
-![Melbourne Housing 10m Full](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/full_10m.png)
+![Melbourne Housing 10m Full](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/full_10m.png)
 
 Cropped to the CBD to show resolution differences:
 
 | 10m | 25m | 50m |
 |-----|-----|-----|
-| ![10m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/10m/value.png) | ![25m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/25m/value.png) | ![50m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/50m/value.png) |
+| ![10m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/10m/value.png) | ![25m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/25m/value.png) | ![50m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/50m/value.png) |
 
 | 100m | 250m | 500m |
 |------|------|------|
-| ![100m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/100m/value.png) | ![250m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/250m/value.png) | ![500m](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/melb/500m/value.png) |
+| ![100m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/100m/value.png) | ![250m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/250m/value.png) | ![500m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/500m/value.png) |
 
 ## Data
 
