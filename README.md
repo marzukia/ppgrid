@@ -61,6 +61,21 @@ examples/
     calibration.json — percentile-to-value lookup table
 ```
 
+## Benchmarks
+
+The tool was benchmarked using the Melbourne Housing dataset (13,580 points) at various resolutions on a single machine.
+
+| Resolution | Wall Time | File Size |
+|------------|-----------|-----------|
+| 10m | 26.6s | 27.3 MB |
+| 25m | 4.0s | 6.8 MB |
+| 50m | 1.3s | 2.3 MB |
+| 100m | 0.8s | 749 KB |
+| 250m | 0.6s | 159 KB |
+| 500m | 0.6s | 49 KB |
+
+![Melbourne Housing: Resolution vs Time & Size](examples/benchmarks.png)
+
 ## Install
 
 ```bash
