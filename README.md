@@ -1,5 +1,8 @@
 # ppgrid - Pull-Push Scattered-Data Interpolation
 
+[![CI](https://github.com/marzukia/ppgrid/actions/workflows/ci.yml/badge.svg)](https://github.com/marzukia/ppgrid/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/ppgrid.svg)](https://pypi.org/project/ppgrid/)
+
 Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a pair of GeoTIFFs in minutes on a single machine. No GPU needed.
 
 ## What it does
@@ -49,6 +52,11 @@ Before interpolation, the tool can:
 
 ```bash
 pip install ppgrid
+```
+
+For Parquet support:
+```bash
+pip install ppgrid[parquet]
 ```
 
 Or from source:
@@ -125,7 +133,7 @@ real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quanti
 
 ## Benchmarks
 
-Melbourne Housing dataset (13,580 points) at various resolutions on a single machine.
+Melbourne Housing dataset (13,580 points) at various resolutions on a single machine (Apple M-series, 32GB RAM).
 
 | Resolution | Wall Time | File Size |
 |------------|-----------|-----------|

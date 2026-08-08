@@ -265,9 +265,15 @@ class Pipeline:
 
         Raises:
             ValueError: If no valid points remain after filtering.
+            ImportError: If pyarrow is missing for Parquet input.
 
         """
         if self.input_path.endswith((".parquet", ".pq")):
+            try:
+                import pyarrow as pa  # ruff: ignore[unused-import]
+            except ImportError:
+                msg = "pyarrow is required for Parquet files. Install with: pip install ppgrid[parquet]"
+                raise ImportError(msg) from None
             df = pd.read_parquet(self.input_path, columns=[self.value_col, self.lng_col, self.lat_col])
         else:
             df = pd.read_csv(self.input_path, usecols=[self.value_col, self.lng_col, self.lat_col])

@@ -36,11 +36,11 @@ dependencies = [
     "pandas>=2.0,<3",
     "pyproj>=3.6,<4",
     "rasterio>=1.3,<2",
-    "pyarrow",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.1", "pytest>=8.0"]
+dev = ["ruff>=0.1", "pytest>=8.0", "parquet"]
+parquet = ["pyarrow"]
 
 [project.urls]
 Homepage = "https://pypi.org/project/ppgrid/"
