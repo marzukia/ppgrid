@@ -342,9 +342,7 @@ def blocked_cv_skill(
             },
         )
 
-    overall = 1 - (
-        np.sqrt(np.mean((act - pred) ** 2)) / np.sqrt(np.mean((act - base) ** 2))
-    )
+    overall = 1 - (np.sqrt(np.mean((act - pred) ** 2)) / np.sqrt(np.mean((act - base) ** 2)))
     return float(overall), rows
 
 

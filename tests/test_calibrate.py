@@ -37,7 +37,7 @@ def test_choose_transform() -> None:
     best, results = choose_transform(x, y, values)
     assert best is not None
     assert len(results) > 0
-    assert best.name in ("identity", "log10", "sqrt", "percentile")
+    assert best.name in {"identity", "log10", "sqrt", "percentile"}
 
 
 def test_make_transform_error() -> None:

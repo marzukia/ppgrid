@@ -34,7 +34,8 @@ def test_upsample_nearest() -> None:
     result = upsample_nearest(a)
     assert result.shape == (4, 4)
     expected = np.array(
-        [[1, 1, 2, 2], [1, 1, 2, 2], [3, 3, 4, 4], [3, 3, 4, 4]], dtype=np.float32
+        [[1, 1, 2, 2], [1, 1, 2, 2], [3, 3, 4, 4], [3, 3, 4, 4]],
+        dtype=np.float32,
     )
     np.testing.assert_array_equal(result, expected)
 

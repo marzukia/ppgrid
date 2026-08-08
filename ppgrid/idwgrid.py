@@ -69,31 +69,6 @@ class _WorkerConfig:
     scale: float
 
 
-def _init_worker(cfg: _WorkerConfig) -> None:
-    global _CTX
-    _CTX = {
-        "pts": np.load(cfg.pts_path, mmap_mode="r"),
-        "tf": make_transform(cfg.transform_state),
-        "pct": PercentileTransform(cfg.pct_quantiles),
-        "starts": cfg.starts,
-        "nbx": cfg.nbx,
-        "nby": cfg.nby,
-        "bsize": cfg.bsize,
-        "halo": cfg.halo,
-        "res": cfg.res,
-        "levels": cfg.levels,
-        "cap_km": cfg.cap_km,
-        "x0": cfg.x0,
-        "y0": cfg.y0,
-        "nx": cfg.nx,
-        "ny": cfg.ny,
-        "nx_padded": cfg.nx_padded,
-        "ny_padded": cfg.ny_padded,
-        "sat": cfg.sat,
-        "scale": cfg.scale,
-    }
-
-
 def _block_points(bx: int, by: int) -> np.ndarray:
     """Gather points from the 3x3 block neighbourhood.
 
@@ -249,10 +224,7 @@ class Pipeline:
         self.skip_calibration = skip_calibration
 
         if self.scale * 100 > INT16_MAX:
-            msg = (
-                f"scale * 100 exceeds int16 max: {self.scale * 100} > {INT16_MAX}. "
-                f"Reduce scale."
-            )
+            msg = f"scale * 100 exceeds int16 max: {self.scale * 100} > {INT16_MAX}. Reduce scale."
             raise ValueError(msg)
 
         # Ingest outputs
@@ -358,9 +330,7 @@ class Pipeline:
             }
 
         self.tname = (
-            self.transform
-            if self.transform != "auto"
-            else (cal.get("transform", "identity") if cal else "identity")
+            self.transform if self.transform != "auto" else (cal.get("transform", "identity") if cal else "identity")
         )
         if cal and "transform_state" in cal and cal["transform_state"].get("name") == self.tname:
             self.tf = make_transform(cal["transform_state"])
@@ -374,9 +344,7 @@ class Pipeline:
         )
 
         self.cap_km_val = (
-            float(self.cap_km)
-            if self.cap_km != "auto"
-            else float(cal.get("cap_km", 64.0) if cal else 64.0)
+            float(self.cap_km) if self.cap_km != "auto" else float(cal.get("cap_km", 64.0) if cal else 64.0)
         )
 
         self.tv = self.tf.fwd(self.v)
@@ -403,9 +371,9 @@ class Pipeline:
         if self.halo > self.bsize:
             msg = (
                 f"halo ({self.halo}) exceeds block size ({self.bsize}). "
-                 f"Reduce cap_km or increase block size. "
-                 f"Currently: cap_km={self.cap_km_val}, res={self.res}, "
-                 f"block={self.block_size}"
+                f"Reduce cap_km or increase block size. "
+                f"Currently: cap_km={self.cap_km_val}, res={self.res}, "
+                f"block={self.block_size}"
             )
             raise ValueError(msg)
         self.nbx = math.ceil(self.nx / self.bsize)
@@ -527,27 +495,29 @@ class Pipeline:
             # Process blocks with parallel workers
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
-                _CTX.update({
-                    "pts": np.load(self.cfg.pts_path, mmap_mode="r"),
-                    "tf": make_transform(self.cfg.transform_state),
-                    "pct": PercentileTransform(self.cfg.pct_quantiles),
-                    "starts": self.cfg.starts,
-                    "nbx": self.cfg.nbx,
-                    "nby": self.cfg.nby,
-                    "bsize": self.cfg.bsize,
-                    "halo": self.cfg.halo,
-                    "res": self.cfg.res,
-                    "levels": self.cfg.levels,
-                    "cap_km": self.cfg.cap_km,
-                    "x0": self.cfg.x0,
-                    "y0": self.cfg.y0,
-                    "nx": self.cfg.nx,
-                    "ny": self.cfg.ny,
-                    "nx_padded": self.cfg.nx_padded,
-                    "ny_padded": self.cfg.ny_padded,
-                    "sat": self.cfg.sat,
-                    "scale": self.cfg.scale,
-                })
+                _CTX.update(
+                    {
+                        "pts": np.load(self.cfg.pts_path, mmap_mode="r"),
+                        "tf": make_transform(self.cfg.transform_state),
+                        "pct": PercentileTransform(self.cfg.pct_quantiles),
+                        "starts": self.cfg.starts,
+                        "nbx": self.cfg.nbx,
+                        "nby": self.cfg.nby,
+                        "bsize": self.cfg.bsize,
+                        "halo": self.cfg.halo,
+                        "res": self.cfg.res,
+                        "levels": self.cfg.levels,
+                        "cap_km": self.cfg.cap_km,
+                        "x0": self.cfg.x0,
+                        "y0": self.cfg.y0,
+                        "nx": self.cfg.nx,
+                        "ny": self.cfg.ny,
+                        "nx_padded": self.cfg.nx_padded,
+                        "ny_padded": self.cfg.ny_padded,
+                        "sat": self.cfg.sat,
+                        "scale": self.cfg.scale,
+                    },
+                )
                 with ThreadPoolExecutor(max_workers=self.workers) as ex:
                     for bx, by, out in ex.map(_process_block, self.tasks):
                         i0, j0 = bx * self.bsize, by * self.bsize
@@ -573,6 +543,7 @@ class Pipeline:
                 vpath.rename(tmp_v)
                 spath.rename(tmp_s)
                 try:
+
                     def _reproject_band(
                         src_path: str,
                         dst_path: str,
@@ -580,10 +551,12 @@ class Pipeline:
                         dst_crs: str,
                     ) -> None:
                         with rasterio.open(src_path) as src:
-                            dst_transform, dst_width, dst_height = (
-                                rasterio.warp.calculate_default_transform(
-                                    src.crs, dst_crs, src.width, src.height, *src.bounds,
-                                )
+                            dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
+                                src.crs,
+                                dst_crs,
+                                src.width,
+                                src.height,
+                                *src.bounds,
                             )
                             dst_profile = dict(
                                 profile,
@@ -599,6 +572,7 @@ class Pipeline:
                                 if hasattr(src, "offsets") and src.offsets:
                                     dst.offsets = src.offsets
                                 from rasterio.transform import from_bounds
+
                                 tile = 512
                                 for j in range(0, dst_height, tile):
                                     for i in range(0, dst_width, tile):

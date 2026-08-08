@@ -58,21 +58,32 @@ line-length = 120
 preview = true
 select = ["ALL"]
 ignore = [
-    "ANN401",   # Any allowed in **kwargs annotations
-    "CPY001",   # no copyright headers needed
-    "PLW0717",  # too many statements in try (reproject block)
-    "PLR1702",  # too many nested blocks (reproject block)
-    "C901",     # function too complex (Pipeline.run)
-    "D203",     # conflicts with D211 (must pick one)
-    "D213",     # conflicts with D212 (must pick one)
-    "FURB189",  # dict subclassing for JSON serialization
-    "PLR0912",  # too many branches (pipeline function)
-    "PLR0913",  # too many args (numerical function signatures)
-    "PLR0914",  # too many local variables (pipeline functions)
-    "PLR0915",  # too many statements (pipeline function)
-    "PLR0917",  # too many positional arguments (numerical functions)
-    "PLW0603",  # global required for ProcessPoolExecutor initializer
-    "TC003",    # Callable used at runtime in function signatures
+    "any-type",   # Any allowed in **kwargs annotations
+    "missing-copyright-notice",   # no copyright headers needed
+    "too-many-statements-in-try-clause",  # too many statements in try (reproject block)
+    "too-many-nested-blocks",  # too many nested blocks (reproject block)
+    "complex-structure",     # function too complex (Pipeline.run)
+    "incorrect-blank-line-before-class",     # conflicts with D211 (must pick one)
+    "multi-line-summary-second-line",     # conflicts with D212 (must pick one)
+    "subclass-builtin",  # dict subclassing for JSON serialization
+    "too-many-branches",  # too many branches (pipeline function)
+    "too-many-arguments",  # too many args (numerical function signatures)
+    "too-many-locals",  # too many local variables (pipeline functions)
+    "too-many-statements",  # too many statements (pipeline function)
+    "too-many-positional-arguments",  # too many positional arguments (numerical functions)
+    "global-statement",  # global required for ProcessPoolExecutor initializer
+    "typing-only-standard-library-import",    # Callable used at runtime in function signatures
+    "assert",      # assert usage in tests
+    "magic-value-comparison",   # magic value comparison in tests
+    "numpy-legacy-random",    # numpy legacy random in tests
+    "float-equality-comparison",   # float equality comparison in tests
+    "literal-membership",     # literal membership (list vs set in tests)
+    "pytest-raises-ambiguous-pattern",     # pytest raises ambiguous pattern
+    "import-outside-top-level",   # import outside top-level (lazy-loaded reprojection)
+    "undocumented-public-package",    # undocumented public package (tests/__init__.py)
+    "docstring-missing-returns",    # docstring missing returns (test helper functions)
+    "import-private-name",    # import private name (test imports _smooth3)
+    "future-rewritable-type-annotation",     # missing from __future__ import annotations
 ]
 
 [tool.pytest.ini_options]

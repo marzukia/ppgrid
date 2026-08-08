@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import pytest
 import rasterio
 
@@ -46,7 +44,7 @@ def test_halo_exceeds_block_error(tmp_path: Path) -> None:
     )
     p.ingest()
     p.calibrate()
-    with pytest.raises(ValueError, match="halo.*exceeds block size"):
+    with pytest.raises(ValueError, match=r"halo.*exceeds block size"):
         p.grid()
 
 

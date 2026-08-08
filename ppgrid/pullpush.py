@@ -134,17 +134,12 @@ def pull_push(
 
     """
     if sum_grid.shape != count_grid.shape:
-        msg = (
-            f"sum_grid shape {sum_grid.shape} != count_grid shape {count_grid.shape}",
-        )
+        msg = f"sum_grid shape {sum_grid.shape} != count_grid shape {count_grid.shape}"
         raise ValueError(msg)
     step = 1 << levels
     for dim in sum_grid.shape:
         if dim % step != 0:
-            msg = (
-                f"Grid dimensions must be divisible by 2**levels ({step}): "
-                 f"got shape {sum_grid.shape}"
-            )
+            msg = f"Grid dimensions must be divisible by 2**levels ({step}): got shape {sum_grid.shape}"
             raise ValueError(msg)
 
     sums: list[np.ndarray] = [sum_grid]
@@ -181,10 +176,26 @@ def bin_points(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Scatter points into sum and count grids indexed [easting, northing].
 
+    Args:
+        ix: X indices, must be in [0, nx).
+        iy: Y indices, must be in [0, ny).
+        values: Values to scatter.
+        nx: Grid width.
+        ny: Grid height.
+
     Returns:
         Tuple of (sum_grid, count_grid) of shape (nx, ny).
 
+    Raises:
+        ValueError: If indices are out of range.
+
     """
+    if ix.min() < 0 or ix.max() >= nx:
+        msg = f"ix indices out of range [0, {nx}): min={ix.min()}, max={ix.max()}"
+        raise ValueError(msg)
+    if iy.min() < 0 or iy.max() >= ny:
+        msg = f"iy indices out of range [0, {ny}): min={iy.min()}, max={iy.max()}"
+        raise ValueError(msg)
     key = ix.astype(np.int64) * ny + iy.astype(np.int64)
     s = np.bincount(key, weights=values, minlength=nx * ny).reshape(nx, ny).astype(np.float32)
     c = np.bincount(key, minlength=nx * ny).reshape(nx, ny).astype(np.float32)
