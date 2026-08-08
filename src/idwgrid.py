@@ -1,4 +1,4 @@
-"""idwgrid — CLI driver for pull-push scattered-data interpolation.
+"""pullpush — CLI driver for pull-push scattered-data interpolation.
 
 Turns scattered geolocated point values into a continent-scale, gapless,
 capped raster surface, in minutes, on a single machine, with no GPU.
@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -74,7 +73,6 @@ class _WorkerConfig:
 
 
 def _init_worker(cfg: _WorkerConfig) -> None:
-    """Initialise per-worker context."""
     global _CTX
     _CTX = {
         "pts": np.load(cfg.pts_path, mmap_mode="r"),
@@ -104,7 +102,7 @@ def _block_points(bx: int, by: int) -> np.ndarray:
     """Gather points from the 3x3 block neighbourhood (valid while halo <= bsize).
 
     Returns:
-        Concatenated point array of shape (4, n_points).
+        Stacked point array of shape (4, n_points).
 
     """
     c = _CTX
@@ -121,10 +119,10 @@ def _block_points(bx: int, by: int) -> np.ndarray:
 def _process_block(
     args: tuple[int, int],
 ) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
-    """Process a single block.
+    """Interpolate a single output block using pull-push. Returns nodata if the block neighbourhood has no points.
 
     Returns:
-        Tuple of (bx, by, output) where output is (vq, rq) or None.
+        Tuple of block coords and optional (value, support) grids.
 
     """
     bx, by = args
@@ -193,12 +191,6 @@ def _block_neighbourhood_nonempty(
     nbx: int,
     nby: int,
 ) -> bool:
-    """Check if any of the 3x3 neighbourhood has points.
-
-    Returns:
-        True if the block neighbourhood contains data.
-
-    """
     for jx in range(max(0, bx - 1), min(nbx, bx + 2)):
         for jy in range(max(0, by - 1), min(nby, by + 2)):
             lo = starts[jx * nby + jy]
@@ -206,6 +198,388 @@ def _block_neighbourhood_nonempty(
             if hi > lo:
                 return True
     return False
+
+
+class Pipeline:
+    """Pull-push interpolation pipeline."""
+
+    def __init__(
+        self,
+        input_path: str,
+        value_col: str,
+        lng_col: str,
+        lat_col: str,
+        out_dir: str,
+        res: float = 500.0,
+        cap_km: float | str = "auto",
+        transform: str = "auto",
+        saturation: float = 1.0,
+        block_size: int = 8192,
+        workers: int = 4,
+        calib_path: str | None = None,
+        *,
+        baseline: bool = False,
+        scale: float = 100.0,
+        compress: str = "ZSTD",
+        calib_max_points: int = 2_000_000,
+        src_crs: int = 4326,
+        work_crs: int = 6933,
+        out_crs: int = 3857,
+        skip_calibration: bool = False,
+    ) -> None:
+        """Initialise the interpolation pipeline."""
+        self.input_path = input_path
+        self.value_col = value_col
+        self.lng_col = lng_col
+        self.lat_col = lat_col
+        self.out_dir = out_dir
+        self.res = res
+        self.cap_km = cap_km
+        self.transform = transform
+        self.saturation = saturation
+        self.block_size = block_size
+        self.workers = workers
+        self.calib_path = calib_path
+        self.baseline = baseline
+        self.scale = scale
+        self.compress = compress
+        self.calib_max_points = calib_max_points
+        self.src_crs = src_crs
+        self.work_crs = work_crs
+        self.out_crs = out_crs
+        self.skip_calibration = skip_calibration
+
+        # Ingest outputs
+        self.v: np.ndarray
+        self.x: np.ndarray
+        self.y: np.ndarray
+        self.n: int
+
+        # Calibration outputs
+        self.tf: Any
+        self.pct_q: Any
+        self.cap_km_val: float
+        self.tv: np.ndarray
+        self.tname: str
+
+        # Grid outputs
+        self.x0: float
+        self.y0: float
+        self.nx: int
+        self.ny: int
+        self.levels: int
+        self.step: int
+        self.halo: int
+        self.nx_padded: int
+        self.ny_padded: int
+        self.bsize: int
+        self.nbx: int
+        self.nby: int
+        self.starts: np.ndarray
+        self.tasks: list[tuple[int, int]]
+        self.empty_blocks: list[tuple[int, int]]
+        self.pts_path: Path
+        self.cfg: _WorkerConfig
+        self._cal: dict[str, Any] | None
+
+    def ingest(self) -> None:
+        """Read input, filter, project to working CRS."""
+        if self.input_path.endswith((".parquet", ".pq")):
+            df = pd.read_parquet(self.input_path, columns=[self.value_col, self.lng_col, self.lat_col])
+        else:
+            df = pd.read_csv(self.input_path, usecols=[self.value_col, self.lng_col, self.lat_col])
+
+        v = df[self.value_col].to_numpy(np.float64)
+        lon = df[self.lng_col].to_numpy(np.float64)
+        lat = df[self.lat_col].to_numpy(np.float64)
+
+        good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
+        v, lon, lat = v[good], lon[good], lat[good]
+        self.n = len(v)
+
+        tr = Transformer.from_crs(self.src_crs, self.work_crs, always_xy=True)
+        x, y = tr.transform(lon, lat)
+        self.x = np.asarray(x)
+        self.y = np.asarray(y)
+        self.v = v
+
+    def calibrate(self) -> None:
+        """Load or run calibration. Sets transform, percentile, cap."""
+        cal: dict[str, Any] | None = None
+        cpath_obj = Path(self.calib_path) if self.calib_path else None
+        if cpath_obj and cpath_obj.exists():
+            with cpath_obj.open(encoding="utf-8") as f:
+                cal = json.load(f)
+        elif not self.skip_calibration:
+            if self.n > self.calib_max_points:
+                sub = np.random.default_rng(0).choice(self.n, self.calib_max_points, replace=False)
+                cx, cy, cv = self.x[sub], self.y[sub], self.v[sub]
+            else:
+                cx, cy, cv = self.x, self.y, self.v
+
+            tf, scores = choose_transform(cx, cy, cv)
+            pct_fit = PercentileTransform().fit(cv)
+            cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv))
+
+            cal = {
+                "transform": tf.name,
+                "n_calibration_points": len(cv),
+                "transform_scores": {s[0].name: s[1] for s in scores},
+                "transform_state": tf.state(),
+                "percentile_quantiles": pct_fit.q.tolist(),
+                "cap_km": cap,
+                "cv": {
+                    str(k): {"overall_skill": d["overall_skill"], "cap_km": d.get("cap_km")} for k, d in detail.items()
+                },
+            }
+            Path(self.out_dir).mkdir(parents=True, exist_ok=True)
+            cal_path = cpath_obj or Path(self.out_dir) / "calibration.json"
+            with cal_path.open("w", encoding="utf-8") as f:
+                json.dump(cal, f, indent=2)
+        else:
+            cal = {
+                "transform": "identity",
+                "cap_km": float(self.cap_km) if self.cap_km != "auto" else 64.0,
+            }
+
+        self.tname = self.transform if self.transform != "auto" else (cal["transform"] if cal else "identity")
+        if cal and "transform_state" in cal and cal["transform_state"].get("name") == self.tname:
+            self.tf = make_transform(cal["transform_state"])
+        else:
+            self.tf = next(t for t in transforms() if t.name == self.tname).fit(self.v)
+
+        self.pct_q = (
+            PercentileTransform(cal["percentile_quantiles"])
+            if cal and "percentile_quantiles" in cal
+            else PercentileTransform().fit(self.v)
+        )
+
+        self.cap_km_val = float(self.cap_km) if self.cap_km != "auto" else float(cal["cap_km"] if cal else 64.0)
+
+        self.tv = self.tf.fwd(self.v)
+        self._cal = cal
+
+    def grid(self) -> None:
+        """Compute grid geometry and spatial index."""
+        self.x0 = self.x.min()
+        self.y0 = self.y.min()
+        self.nx = int((self.x.max() - self.x0) // self.res) + 1
+        self.ny = int((self.y.max() - self.y0) // self.res) + 1
+
+        self.levels = max(1, math.ceil(math.log2(max(self.cap_km_val * 1000.0 / self.res, 2.0))))
+        self.step = 1 << self.levels
+        self.halo = max(math.ceil(self.cap_km_val * 1000.0 / self.res) + 2, self.step)
+        self.nx_padded = -(-self.nx // self.step) * self.step
+        self.ny_padded = -(-self.ny // self.step) * self.step
+        self.bsize = max(self.block_size, self.step)
+        self.nbx = math.ceil(self.nx / self.bsize)
+        self.nby = math.ceil(self.ny / self.bsize)
+
+        # Spatial index
+        bx_ = np.clip(((self.x - self.x0) // self.res // self.bsize).astype(np.int64), 0, self.nbx - 1)
+        by_ = np.clip(((self.y - self.y0) // self.res // self.bsize).astype(np.int64), 0, self.nby - 1)
+        bid = bx_ * self.nby + by_
+        order = np.argsort(bid, kind="stable")
+        self.starts = np.searchsorted(bid[order], np.arange(self.nbx * self.nby + 1))
+
+        # Memmap for workers
+        self.pts_path = Path(self.out_dir) / "_points.npy"
+        pts = np.lib.format.open_memmap(self.pts_path, mode="w+", dtype=np.float64, shape=(4, self.n))
+        pts[0] = self.x[order]
+        pts[1] = self.y[order]
+        pts[2] = self.tv[order]
+        pts[3] = self.v[order]
+        pts.flush()
+
+        # Task list
+        self.tasks: list[tuple[int, int]] = [
+            (i, j)
+            for i in range(self.nbx)
+            for j in range(self.nby)
+            if _block_neighbourhood_nonempty(i, j, self.starts, self.nbx, self.nby)
+        ]
+        self.empty_blocks: list[tuple[int, int]] = [
+            (i, j)
+            for i in range(self.nbx)
+            for j in range(self.nby)
+            if not _block_neighbourhood_nonempty(i, j, self.starts, self.nbx, self.nby)
+        ]
+
+        # Worker config
+        self.cfg = _WorkerConfig(
+            pts_path=str(self.pts_path),
+            transform_state=self._cal.get("transform_state", {"name": self.tname})
+            if self._cal
+            else {"name": self.tname},
+            pct_quantiles=self._cal.get("percentile_quantiles", self.pct_q.q.tolist())
+            if self._cal
+            else self.pct_q.q.tolist(),
+            starts=self.starts.tolist(),
+            nbx=self.nbx,
+            nby=self.nby,
+            bsize=self.bsize,
+            halo=self.halo,
+            res=self.res,
+            levels=self.levels,
+            cap_km=self.cap_km_val,
+            x0=float(self.x0),
+            y0=float(self.y0),
+            nx=self.nx,
+            ny=self.ny,
+            nx_padded=self.nx_padded,
+            ny_padded=self.ny_padded,
+            sat=self.saturation,
+            baseline=self.baseline,
+            scale=self.scale,
+        )
+
+    def run(self) -> tuple[str, str]:
+        """Execute the full pipeline.
+
+        Returns:
+            Tuple of value and support GeoTIFF file paths.
+
+        """
+        self.ingest()
+        self.calibrate()
+        self.grid()
+
+        # Raster profile
+        xform = from_origin(self.x0, self.y0 + self.ny * self.res, self.res, self.res)
+        common = {
+            "driver": "GTiff",
+            "height": self.ny,
+            "width": self.nx,
+            "count": 1,
+            "crs": f"EPSG:{self.work_crs}",
+            "transform": xform,
+            "compress": self.compress,
+            "tiled": True,
+            "blockxsize": 512,
+            "blockysize": 512,
+            "BIGTIFF": "IF_SAFER",
+        }
+        vprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
+        sprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
+
+        vpath = Path(self.out_dir) / "value.tif"
+        spath = Path(self.out_dir) / "support_km.tif"
+
+        with (
+            rasterio.open(vpath, "w", **vprof) as vd,
+            rasterio.open(spath, "w", **sprof) as sd,
+        ):
+            vd.update_tags(
+                transform=self.tname,
+                cap_km=str(self.cap_km_val),
+                res_m=str(self.res),
+                scale=str(self.scale),
+                units="percentile",
+                decode=f"percentile = DN/{self.scale:g}",
+            )
+            vd.scales = (1.0 / self.scale,)
+            sd.update_tags(decode="support_km = 2**(DN/8)")
+
+            # Write empty blocks as nodata
+            for bx, by in self.empty_blocks:
+                i0, j0 = bx * self.bsize, by * self.bsize
+                i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
+                w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
+                blank = np.full((w.height, w.width), NODATA, np.int16)
+                vd.write(blank, 1, window=w)
+                sd.write(blank, 1, window=w)
+
+            # Process blocks with parallel workers
+            with ProcessPoolExecutor(
+                max_workers=self.workers,
+                initializer=_init_worker,
+                initargs=(self.cfg,),
+            ) as ex:
+                for bx, by, out in ex.map(_process_block, self.tasks, chunksize=1):
+                    i0, j0 = bx * self.bsize, by * self.bsize
+                    i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
+                    w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
+
+                    if out is None:
+                        blank = np.full((w.height, w.width), NODATA, np.int16)
+                        vd.write(blank, 1, window=w)
+                        sd.write(blank, 1, window=w)
+                        continue
+
+                    vq, rq = out
+                    vd.write(vq.T[::-1, :], 1, window=w)
+                    sd.write(rq.T[::-1, :], 1, window=w)
+
+        # Cleanup memmap
+        self.pts_path.unlink()
+
+        # Reproject to output CRS if different from working CRS
+        if self.out_crs != self.work_crs:
+            tmp_v = Path(self.out_dir) / "_value_epsg3577.tif"
+            tmp_s = Path(self.out_dir) / "_support_epsg3577.tif"
+            vpath.rename(tmp_v)
+            spath.rename(tmp_s)
+
+            with rasterio.open(tmp_v) as src:
+                out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
+                    src.crs,
+                    f"EPSG:{self.out_crs}",
+                    src.width,
+                    src.height,
+                    *src.bounds,
+                )
+                vprof_out = dict(
+                    vprof,
+                    width=out_width,
+                    height=out_height,
+                    transform=out_transform,
+                    crs=f"EPSG:{self.out_crs}",
+                )
+                dst_v = np.empty((out_height, out_width), dtype=np.int16)
+                reproject(
+                    rasterio.band(src, 1),
+                    dst_v,
+                    dst_transform=out_transform,
+                    dst_crs=f"EPSG:{self.out_crs}",
+                    resampling=Resampling.nearest,
+                    nodata=NODATA,
+                )
+                with rasterio.open(vpath, "w", **vprof_out) as dst:
+                    dst.write(dst_v, 1)
+                    dst.update_tags(**src.tags())
+
+            with rasterio.open(tmp_s) as src:
+                out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
+                    src.crs,
+                    f"EPSG:{self.out_crs}",
+                    src.width,
+                    src.height,
+                    *src.bounds,
+                )
+                sprof_out = dict(
+                    sprof,
+                    width=out_width,
+                    height=out_height,
+                    transform=out_transform,
+                    crs=f"EPSG:{self.out_crs}",
+                )
+                dst_s = np.empty((out_height, out_width), dtype=np.int16)
+                reproject(
+                    rasterio.band(src, 1),
+                    dst_s,
+                    dst_transform=out_transform,
+                    dst_crs=f"EPSG:{self.out_crs}",
+                    resampling=Resampling.nearest,
+                    nodata=NODATA,
+                )
+                with rasterio.open(spath, "w", **sprof_out) as dst:
+                    dst.write(dst_s, 1)
+                    dst.update_tags(**src.tags())
+
+            tmp_v.unlink()
+            tmp_s.unlink()
+
+        return str(vpath), str(spath)
 
 
 def run(
@@ -234,279 +608,36 @@ def run(
     """Full pipeline: load, calibrate, interpolate, write.
 
     Returns:
-        Tuple of (value_tiff_path, support_tiff_path).
+        Tuple of value and support GeoTIFF file paths.
 
     """
-    # --- Ingest ---
-    if input_path.endswith((".parquet", ".pq")):
-        df = pd.read_parquet(input_path, columns=[value_col, lng_col, lat_col])
-    else:
-        df = pd.read_csv(input_path, usecols=[value_col, lng_col, lat_col])
-
-    v = df[value_col].to_numpy(np.float64)
-    lon = df[lng_col].to_numpy(np.float64)
-    lat = df[lat_col].to_numpy(np.float64)
-
-    good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
-    v, lon, lat = v[good], lon[good], lat[good]
-    n = len(v)
-
-    tr = Transformer.from_crs(src_crs, work_crs, always_xy=True)
-    x, y = tr.transform(lon, lat)
-    x = np.asarray(x)
-    y = np.asarray(y)
-
-    # --- Calibration ---
-    cal: dict[str, Any] | None = None
-    cpath_obj = Path(calib_path) if calib_path else None
-    if cpath_obj and cpath_obj.exists():
-        with cpath_obj.open(encoding="utf-8") as f:
-            cal = json.load(f)
-    elif not skip_calibration:
-        if n > calib_max_points:
-            sub = np.random.default_rng(0).choice(n, calib_max_points, replace=False)
-            cx, cy, cv = x[sub], y[sub], v[sub]
-        else:
-            cx, cy, cv = x, y, v
-
-        tf, scores = choose_transform(cx, cy, cv)
-        pct_fit = PercentileTransform().fit(cv)
-        cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv))
-
-        cal = {
-            "transform": tf.name,
-            "n_calibration_points": len(cv),
-            "transform_scores": {s[0].name: s[1] for s in scores},
-            "transform_state": tf.state(),
-            "percentile_quantiles": pct_fit.q.tolist(),
-            "cap_km": cap,
-            "cv": {str(k): {"overall_skill": d["overall_skill"], "cap_km": d.get("cap_km")} for k, d in detail.items()},
-        }
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        cal_path = cpath_obj or Path(out_dir) / "calibration.json"
-        with cal_path.open("w", encoding="utf-8") as f:
-            json.dump(cal, f, indent=2)
-    else:
-        cal = {
-            "transform": "identity",
-            "cap_km": float(cap_km) if cap_km != "auto" else 64.0,
-        }
-
-    tname = transform if transform != "auto" else (cal["transform"] if cal else "identity")
-    if cal and "transform_state" in cal and cal["transform_state"].get("name") == tname:
-        tf = make_transform(cal["transform_state"])
-    else:
-        tf = next(t for t in transforms() if t.name == tname).fit(v)
-
-    pct_q = (
-        PercentileTransform(cal["percentile_quantiles"])
-        if cal and "percentile_quantiles" in cal
-        else PercentileTransform().fit(v)
-    )
-
-    cap_km_val = float(cap_km) if cap_km != "auto" else float(cal["cap_km"] if cal else 64.0)
-
-    tv = tf.fwd(v)
-
-    # --- Grid geometry ---
-    x0 = x.min()
-    y0 = y.min()
-    nx = int((x.max() - x0) // res) + 1
-    ny = int((y.max() - y0) // res) + 1
-
-    levels = max(1, math.ceil(math.log2(max(cap_km_val * 1000.0 / res, 2.0))))
-    step = 1 << levels
-    halo = max(math.ceil(cap_km_val * 1000.0 / res) + 2, step)
-    nx_padded = -(-nx // step) * step
-    ny_padded = -(-ny // step) * step
-    bsize = max(block_size, step)
-    nbx = math.ceil(nx / bsize)
-    nby = math.ceil(ny / bsize)
-
-    # --- Spatial index ---
-    bx_ = np.clip(((x - x0) // res // bsize).astype(np.int64), 0, nbx - 1)
-    by_ = np.clip(((y - y0) // res // bsize).astype(np.int64), 0, nby - 1)
-    bid = bx_ * nby + by_
-    order = np.argsort(bid, kind="stable")
-    starts = np.searchsorted(bid[order], np.arange(nbx * nby + 1))
-
-    # Memmap for workers
-    pts_path = Path(out_dir) / "_points.npy"
-    pts = np.lib.format.open_memmap(pts_path, mode="w+", dtype=np.float64, shape=(4, n))
-    pts[0] = x[order]
-    pts[1] = y[order]
-    pts[2] = tv[order]
-    pts[3] = v[order]
-    pts.flush()
-
-    # --- Task list ---
-    tasks: list[tuple[int, int]] = [
-        (i, j) for i in range(nbx) for j in range(nby) if _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
-    ]
-    empty_blocks: list[tuple[int, int]] = [
-        (i, j) for i in range(nbx) for j in range(nby) if not _block_neighbourhood_nonempty(i, j, starts, nbx, nby)
-    ]
-
-    # --- Worker config ---
-    cfg = _WorkerConfig(
-        pts_path=str(pts_path),
-        transform_state=cal.get("transform_state", {"name": tname}),
-        pct_quantiles=cal.get("percentile_quantiles", pct_q.q.tolist()),
-        starts=starts.tolist(),
-        nbx=nbx,
-        nby=nby,
-        bsize=bsize,
-        halo=halo,
+    p = Pipeline(
+        input_path,
+        value_col,
+        lng_col,
+        lat_col,
+        out_dir,
         res=res,
-        levels=levels,
-        cap_km=cap_km_val,
-        x0=float(x0),
-        y0=float(y0),
-        nx=nx,
-        ny=ny,
-        nx_padded=nx_padded,
-        ny_padded=ny_padded,
-        sat=saturation,
+        cap_km=cap_km,
+        transform=transform,
+        saturation=saturation,
+        block_size=block_size,
+        workers=workers,
+        calib_path=calib_path,
         baseline=baseline,
         scale=scale,
+        compress=compress,
+        calib_max_points=calib_max_points,
+        src_crs=src_crs,
+        work_crs=work_crs,
+        out_crs=out_crs,
+        skip_calibration=skip_calibration,
     )
-
-    # --- Raster profile ---
-    xform = from_origin(x0, y0 + ny * res, res, res)
-    common = {
-        "driver": "GTiff",
-        "height": ny,
-        "width": nx,
-        "count": 1,
-        "crs": f"EPSG:{work_crs}",
-        "transform": xform,
-        "compress": compress,
-        "tiled": True,
-        "blockxsize": 512,
-        "blockysize": 512,
-        "BIGTIFF": "IF_SAFER",
-    }
-    vprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
-    sprof = dict(common, dtype="int16", nodata=NODATA, predictor=2)
-
-    vpath = Path(out_dir) / "value.tif"
-    spath = Path(out_dir) / "support_km.tif"
-
-    t_start = time.perf_counter()
-
-    with (
-        rasterio.open(vpath, "w", **vprof) as vd,
-        rasterio.open(spath, "w", **sprof) as sd,
-    ):
-        vd.update_tags(
-            transform=tname,
-            cap_km=str(cap_km_val),
-            res_m=str(res),
-            scale=str(scale),
-            units="percentile",
-            decode=f"percentile = DN/{scale:g}",
-        )
-        vd.scales = (1.0 / scale,)
-        sd.update_tags(decode="support_km = 2**(DN/8)")
-
-        # Write empty blocks as nodata
-        for bx, by in empty_blocks:
-            i0, j0 = bx * bsize, by * bsize
-            i1, j1 = min(i0 + bsize, nx), min(j0 + bsize, ny)
-            w = Window(i0, ny - j1, i1 - i0, j1 - j0)
-            blank = np.full((w.height, w.width), NODATA, np.int16)
-            vd.write(blank, 1, window=w)
-            sd.write(blank, 1, window=w)
-
-        # Process blocks with parallel workers
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_worker,
-            initargs=(cfg,),
-        ) as ex:
-            for bx, by, out in ex.map(_process_block, tasks, chunksize=1):
-                i0, j0 = bx * bsize, by * bsize
-                i1, j1 = min(i0 + bsize, nx), min(j0 + bsize, ny)
-                w = Window(i0, ny - j1, i1 - i0, j1 - j0)
-
-                if out is None:
-                    blank = np.full((w.height, w.width), NODATA, np.int16)
-                    vd.write(blank, 1, window=w)
-                    sd.write(blank, 1, window=w)
-                    continue
-
-                vq, rq = out
-                vd.write(vq.T[::-1, :], 1, window=w)
-                sd.write(rq.T[::-1, :], 1, window=w)
-
-    time.perf_counter() - t_start
-
-    # Cleanup memmap
-    pts_path.unlink()
-
-    # Reproject to output CRS if different from working CRS
-    if out_crs != work_crs:
-        tmp_v = Path(out_dir) / "_value_epsg3577.tif"
-        tmp_s = Path(out_dir) / "_support_epsg3577.tif"
-        vpath.rename(tmp_v)
-        spath.rename(tmp_s)
-
-        with rasterio.open(tmp_v) as src:
-            out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
-                src.crs, f"EPSG:{out_crs}", src.width, src.height, *src.bounds,
-            )
-            vprof_out = dict(
-                vprof,
-                width=out_width,
-                height=out_height,
-                transform=out_transform,
-                crs=f"EPSG:{out_crs}",
-            )
-            dst_v = np.empty((out_height, out_width), dtype=np.int16)
-            reproject(
-                rasterio.band(src, 1),
-                dst_v,
-                dst_transform=out_transform,
-                dst_crs=f"EPSG:{out_crs}",
-                resampling=Resampling.nearest,
-                nodata=NODATA,
-            )
-            with rasterio.open(vpath, "w", **vprof_out) as dst:
-                dst.write(dst_v, 1)
-                dst.update_tags(**src.tags())
-
-        with rasterio.open(tmp_s) as src:
-            out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
-                src.crs, f"EPSG:{out_crs}", src.width, src.height, *src.bounds,
-            )
-            sprof_out = dict(
-                sprof,
-                width=out_width,
-                height=out_height,
-                transform=out_transform,
-                crs=f"EPSG:{out_crs}",
-            )
-            dst_s = np.empty((out_height, out_width), dtype=np.int16)
-            reproject(
-                rasterio.band(src, 1),
-                dst_s,
-                dst_transform=out_transform,
-                dst_crs=f"EPSG:{out_crs}",
-                resampling=Resampling.nearest,
-                nodata=NODATA,
-            )
-            with rasterio.open(spath, "w", **sprof_out) as dst:
-                dst.write(dst_s, 1)
-                dst.update_tags(**src.tags())
-
-        tmp_v.unlink()
-        tmp_s.unlink()
-
-    return str(vpath), str(spath)
+    return p.run()
 
 
 def main() -> None:
-    """CLI entry point."""
+    """Parse CLI arguments and run the pipeline."""
     parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
     parser.add_argument("input", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="outputs/", help="Output directory")

@@ -1,4 +1,4 @@
-# idwgrid — Pull-Push Scattered-Data Interpolation
+# pullpush — Pull-Push Scattered-Data Interpolation
 
 Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a gapless, capped, multi-band GeoTIFF in minutes on a single machine. No GPU needed.
 

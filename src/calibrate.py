@@ -35,23 +35,23 @@ class Transform:
         inv: Callable[[np.ndarray], np.ndarray],
         valid: Callable[[np.ndarray], bool],
     ) -> None:
-        """Initialize a stateless transform."""
+        """Initialise a transform with forward, inverse, and validity functions."""
         self.name: str = name
         self._fwd: Callable[[np.ndarray], np.ndarray] = fwd
         self._inv: Callable[[np.ndarray], np.ndarray] = inv
         self.valid: Callable[[np.ndarray], bool] = valid
 
     def fit(self, _v: np.ndarray) -> Transform:
-        """Fit the transform to data. No-op for stateless transforms.
+        """No-op for stateless transforms.
 
         Returns:
-            Self, for chaining.
+            self.
 
         """
         return self
 
     def fwd(self, v: np.ndarray) -> np.ndarray:
-        """Apply forward transform.
+        """Transform values to the interpolation space.
 
         Returns:
             Transformed values.
@@ -60,7 +60,7 @@ class Transform:
         return self._fwd(v)
 
     def inv(self, v: np.ndarray) -> np.ndarray:
-        """Apply inverse transform.
+        """Map values back to the original scale.
 
         Returns:
             Inverse-transformed values.
@@ -69,10 +69,10 @@ class Transform:
         return self._inv(v)
 
     def state(self) -> dict[str, Any]:
-        """Return serialisable state.
+        """Serialise transform parameters.
 
         Returns:
-            Dict with transform name and parameters.
+            Dict with serialisable transform state.
 
         """
         return {"name": self.name}
@@ -84,7 +84,7 @@ class PercentileTransform(Transform):
     NQ = 1001
 
     def __init__(self, q: np.ndarray | None = None) -> None:
-        """Initialize with optional pre-fitted quantiles."""
+        """Initialise with optional pre-fitted quantiles."""
         self.name: str = "percentile"
         self.valid: Callable[[np.ndarray], bool] = lambda _v: True
         self.q: np.ndarray | None = None if q is None else np.asarray(q, np.float64)
@@ -93,7 +93,7 @@ class PercentileTransform(Transform):
         """Fit quantiles from data.
 
         Returns:
-            Self, for chaining.
+            self.
 
         """
         q = np.quantile(v.astype(np.float64), np.linspace(0, 1, self.NQ))
@@ -110,7 +110,7 @@ class PercentileTransform(Transform):
         """Map values to percentiles.
 
         Returns:
-            Percentile values in [0, 100].
+            Percentile values in range 0-100.
 
         """
         return np.interp(v, self.q, self._p)
@@ -128,7 +128,7 @@ class PercentileTransform(Transform):
         """Return serialisable state with quantiles.
 
         Returns:
-            Dict with transform name and quantile array.
+            Dict with name and quantiles.
 
         """
         return {"name": "percentile", "quantiles": self.q.tolist()}
@@ -138,7 +138,7 @@ def transforms() -> list[Transform]:
     """Fresh candidate instances. MUST be a factory, not a module-level list.
 
     Returns:
-        List of unfitted Transform instances.
+        List of unfitted transform candidates.
 
     """
     return [
@@ -153,7 +153,7 @@ def make_transform(state: dict[str, Any]) -> Transform:
     """Rebuild a fitted transform from its serialised state.
 
     Returns:
-        A Transform instance matching the state.
+        Reconstructed transform instance.
 
     """
     if state.get("name") == "percentile":
@@ -162,6 +162,12 @@ def make_transform(state: dict[str, Any]) -> Transform:
 
 
 def _cell_key(x: np.ndarray, y: np.ndarray, res: float) -> np.ndarray:
+    """Hash (x, y) coordinates to a unique integer per cell at the given resolution.
+
+    Returns:
+        Integer array of cell keys.
+
+    """
     ix = ((x - x.min()) // res).astype(np.int64)
     iy = ((y - y.min()) // res).astype(np.int64)
     return ix * (int(iy.max()) + 1) + iy
@@ -198,7 +204,7 @@ def choose_transform(
     """Pick the transform maximising mean ICC across coarse scales.
 
     Returns:
-        Tuple of (best_transform, all_results_sorted_by_score).
+        Tuple of best transform and all scored results.
 
     """
     results: list[tuple[Transform, float, dict[float, float]]] = []
@@ -223,6 +229,12 @@ def _fit_predict(
     res: float,
     levels: int,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Train on the given indices, predict at all (x, y) positions.
+
+    Returns:
+        Tuple of predicted values and support in km.
+
+    """
     x0, y0 = x.min(), y.min()
     ix = ((x - x0) // res).astype(np.int64)
     iy = ((y - y0) // res).astype(np.int64)
@@ -271,7 +283,7 @@ def blocked_cv_skill(
     bootstrap CI.
 
     Returns:
-        Tuple of (overall_skill, per_bin_details).
+        Tuple of overall skill score and per-bin CV details.
 
     """
     rng = np.random.default_rng(seed)
@@ -348,7 +360,7 @@ def calibrate_fill_cap(
     its block size is populated only by points near the block boundary.
 
     Returns:
-        Tuple of (cap_km, per_block_size_cv_curves).
+        Tuple of fill cap in km and per-block-size CV curves.
 
     """
     detail: dict[float, CVCurve] = {}

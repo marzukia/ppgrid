@@ -81,7 +81,7 @@ def box_count(counts: np.ndarray, radius: int) -> np.ndarray:
     depend on pyramid depth.
 
     Returns:
-        Per-cell count of points within radius r.
+        Box-count array with same shape as input.
 
     """
     n0, n1 = counts.shape
@@ -121,7 +121,7 @@ def pull_push(
             different coverage at different resolutions.
 
     Returns:
-        Tuple of (value, support_m) arrays.
+        Tuple of interpolated value grid and support grid in metres.
 
     """
     sums: list[np.ndarray] = [sum_grid]
@@ -159,7 +159,7 @@ def bin_points(
     """Scatter points into sum and count grids indexed [easting, northing].
 
     Returns:
-        Tuple of (sum_grid, count_grid) arrays.
+        Tuple of (sum_grid, count_grid) of shape (nx, ny).
 
     """
     key = ix.astype(np.int64) * ny + iy.astype(np.int64)
@@ -172,7 +172,7 @@ def pad_to_pyramid(n: int, levels: int) -> int:
     """Pad dimension to be divisible by 2**levels.
 
     Returns:
-        Padded dimension, a multiple of 2**levels.
+        Padded dimension.
 
     """
     step = 1 << levels

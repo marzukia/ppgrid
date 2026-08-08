@@ -1,1 +1,1 @@
-"""idwgrid — Pull-push scattered-data interpolation."""
+"""pullpush — Pull-push scattered-data interpolation."""

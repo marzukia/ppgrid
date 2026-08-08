@@ -1,5 +1,5 @@
 [project]
-name = "idwgrid"
+name = "pullpush"
 version = "0.1.0"
 description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes — no GPU required."
 readme = "README.md"
@@ -48,7 +48,7 @@ Repository = "https://github.com/andryo/idw"
 Issues = "https://github.com/andryo/idw/issues"
 
 [project.scripts]
-idwgrid = "src.idwgrid:main"
+pullpush = "src.idwgrid:main"
 
 [tool.ruff]
 target-version = "py311"
