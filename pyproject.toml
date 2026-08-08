@@ -15,7 +15,7 @@ keywords = [
     "mipmap",
     "spatial-analysis",
     "scattered-data",
-    "griidding",
+    "gridding",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -58,7 +58,9 @@ line-length = 120
 preview = true
 select = ["ALL"]
 ignore = [
+    "ANN401",   # Any allowed in **kwargs annotations
     "CPY001",   # no copyright headers needed
+    "PLW0717",  # too many statements in try (reproject block)
     "D203",     # conflicts with D211 (must pick one)
     "D213",     # conflicts with D212 (must pick one)
     "FURB189",  # dict subclassing for JSON serialization
@@ -78,7 +80,4 @@ packages = ["pullpush"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[dependency-groups]
-dev = [
-    "ruff>=0.16.2",
-]
+

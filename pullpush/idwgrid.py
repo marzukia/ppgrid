@@ -68,7 +68,6 @@ class _WorkerConfig:
     nx_padded: int
     ny_padded: int
     sat: float
-    baseline: bool
     scale: float
 
 
@@ -93,7 +92,6 @@ def _init_worker(cfg: _WorkerConfig) -> None:
         "nx_padded": cfg.nx_padded,
         "ny_padded": cfg.ny_padded,
         "sat": cfg.sat,
-        "baseline": cfg.baseline,
         "scale": cfg.scale,
     }
 
@@ -218,7 +216,6 @@ class Pipeline:
         workers: int = 4,
         calib_path: str | None = None,
         *,
-        baseline: bool = False,
         scale: float = 100.0,
         compress: str = "ZSTD",
         calib_max_points: int = 2_000_000,
@@ -240,7 +237,6 @@ class Pipeline:
         self.block_size = block_size
         self.workers = workers
         self.calib_path = calib_path
-        self.baseline = baseline
         self.scale = scale
         self.compress = compress
         self.calib_max_points = calib_max_points
@@ -289,9 +285,9 @@ class Pipeline:
         else:
             df = pd.read_csv(self.input_path, usecols=[self.value_col, self.lng_col, self.lat_col])
 
-        v = df[self.value_col].to_numpy(np.float64)
-        lon = df[self.lng_col].to_numpy(np.float64)
-        lat = df[self.lat_col].to_numpy(np.float64)
+        v = df[self.value_col].to_numpy(dtype=np.float64)
+        lon = df[self.lng_col].to_numpy(dtype=np.float64)
+        lat = df[self.lat_col].to_numpy(dtype=np.float64)
 
         good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
         v, lon, lat = v[good], lon[good], lat[good]
@@ -429,7 +425,6 @@ class Pipeline:
             nx_padded=self.nx_padded,
             ny_padded=self.ny_padded,
             sat=self.saturation,
-            baseline=self.baseline,
             scale=self.scale,
         )
 
@@ -510,74 +505,81 @@ class Pipeline:
                     vd.write(vq.T[::-1, :], 1, window=w)
                     sd.write(rq.T[::-1, :], 1, window=w)
 
-        # Cleanup memmap
-        self.pts_path.unlink()
+        try:
+            # Cleanup memmap
+            self.pts_path.unlink()
 
-        # Reproject to output CRS if different from working CRS
-        if self.out_crs != self.work_crs:
-            tmp_v = Path(self.out_dir) / "_value_epsg3577.tif"
-            tmp_s = Path(self.out_dir) / "_support_epsg3577.tif"
-            vpath.rename(tmp_v)
-            spath.rename(tmp_s)
+            # Reproject to output CRS if different from working CRS
+            if self.out_crs != self.work_crs:
+                tmp_v = Path(self.out_dir) / "_value_tmp.tif"
+                tmp_s = Path(self.out_dir) / "_support_tmp.tif"
+                vpath.rename(tmp_v)
+                spath.rename(tmp_s)
+                try:
+                    with rasterio.open(tmp_v) as src:
+                        out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
+                            src.crs,
+                            f"EPSG:{self.out_crs}",
+                            src.width,
+                            src.height,
+                            *src.bounds,
+                        )
+                        vprof_out = dict(
+                            vprof,
+                            width=out_width,
+                            height=out_height,
+                            transform=out_transform,
+                            crs=f"EPSG:{self.out_crs}",
+                        )
+                        dst_v = np.empty((out_height, out_width), dtype=np.int16)
+                        reproject(
+                            rasterio.band(src, 1),
+                            dst_v,
+                            dst_transform=out_transform,
+                            dst_crs=f"EPSG:{self.out_crs}",
+                            resampling=Resampling.nearest,
+                            nodata=NODATA,
+                        )
+                        with rasterio.open(vpath, "w", **vprof_out) as dst:
+                            dst.write(dst_v, 1)
+                            dst.update_tags(**src.tags())
 
-            with rasterio.open(tmp_v) as src:
-                out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
-                    src.crs,
-                    f"EPSG:{self.out_crs}",
-                    src.width,
-                    src.height,
-                    *src.bounds,
-                )
-                vprof_out = dict(
-                    vprof,
-                    width=out_width,
-                    height=out_height,
-                    transform=out_transform,
-                    crs=f"EPSG:{self.out_crs}",
-                )
-                dst_v = np.empty((out_height, out_width), dtype=np.int16)
-                reproject(
-                    rasterio.band(src, 1),
-                    dst_v,
-                    dst_transform=out_transform,
-                    dst_crs=f"EPSG:{self.out_crs}",
-                    resampling=Resampling.nearest,
-                    nodata=NODATA,
-                )
-                with rasterio.open(vpath, "w", **vprof_out) as dst:
-                    dst.write(dst_v, 1)
-                    dst.update_tags(**src.tags())
-
-            with rasterio.open(tmp_s) as src:
-                out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
-                    src.crs,
-                    f"EPSG:{self.out_crs}",
-                    src.width,
-                    src.height,
-                    *src.bounds,
-                )
-                sprof_out = dict(
-                    sprof,
-                    width=out_width,
-                    height=out_height,
-                    transform=out_transform,
-                    crs=f"EPSG:{self.out_crs}",
-                )
-                dst_s = np.empty((out_height, out_width), dtype=np.int16)
-                reproject(
-                    rasterio.band(src, 1),
-                    dst_s,
-                    dst_transform=out_transform,
-                    dst_crs=f"EPSG:{self.out_crs}",
-                    resampling=Resampling.nearest,
-                    nodata=NODATA,
-                )
-                with rasterio.open(spath, "w", **sprof_out) as dst:
-                    dst.write(dst_s, 1)
-                    dst.update_tags(**src.tags())
-
-            tmp_v.unlink()
-            tmp_s.unlink()
+                    with rasterio.open(tmp_s) as src:
+                        out_transform, out_width, out_height = rasterio.warp.calculate_default_transform(
+                            src.crs,
+                            f"EPSG:{self.out_crs}",
+                            src.width,
+                            src.height,
+                            *src.bounds,
+                        )
+                        sprof_out = dict(
+                            sprof,
+                            width=out_width,
+                            height=out_height,
+                            transform=out_transform,
+                            crs=f"EPSG:{self.out_crs}",
+                        )
+                        dst_s = np.empty((out_height, out_width), dtype=np.int16)
+                        reproject(
+                            rasterio.band(src, 1),
+                            dst_s,
+                            dst_transform=out_transform,
+                            dst_crs=f"EPSG:{self.out_crs}",
+                            resampling=Resampling.nearest,
+                            nodata=NODATA,
+                        )
+                        with rasterio.open(spath, "w", **sprof_out) as dst:
+                            dst.write(dst_s, 1)
+                            dst.update_tags(**src.tags())
+                except Exception:
+                    tmp_v.rename(vpath)
+                    tmp_s.rename(spath)
+                    raise
+                tmp_v.unlink()
+                tmp_s.unlink()
+        finally:
+            if self.pts_path.exists():
+                self.pts_path.unlink()
 
         return str(vpath), str(spath)
 
@@ -596,7 +598,6 @@ def run(
     workers: int = 4,
     calib_path: str | None = None,
     *,
-    baseline: bool = False,
     scale: float = 100.0,
     compress: str = "ZSTD",
     calib_max_points: int = 2_000_000,
@@ -624,7 +625,6 @@ def run(
         block_size=block_size,
         workers=workers,
         calib_path=calib_path,
-        baseline=baseline,
         scale=scale,
         compress=compress,
         calib_max_points=calib_max_points,
@@ -659,7 +659,6 @@ def main() -> None:
     )
     parser.add_argument("--block", type=int, default=8192, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers")
-    parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--scale", type=float, default=100.0, help="DN = percentile * scale")
     parser.add_argument("--compress", default="ZSTD")
     parser.add_argument("--calib-max-points", type=int, default=2_000_000)
@@ -684,7 +683,6 @@ def main() -> None:
         block_size=args.block,
         workers=args.workers,
         calib_path=args.calibration,
-        baseline=args.baseline,
         scale=args.scale,
         compress=args.compress,
         calib_max_points=args.calib_max_points,

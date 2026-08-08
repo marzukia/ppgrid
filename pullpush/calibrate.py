@@ -155,10 +155,18 @@ def make_transform(state: dict[str, Any]) -> Transform:
     Returns:
         Reconstructed transform instance.
 
+    Raises:
+        ValueError: If the transform name is not recognised.
+
     """
     if state.get("name") == "percentile":
         return PercentileTransform(state.get("quantiles"))
-    return next(t for t in transforms() if t.name == state.get("name"))
+    name = state.get("name")
+    for t in transforms():
+        if t.name == name:
+            return t
+    msg = f"Unknown transform: {name!r}"
+    raise ValueError(msg)
 
 
 def _cell_key(x: np.ndarray, y: np.ndarray, res: float) -> np.ndarray:
@@ -348,7 +356,7 @@ def calibrate_fill_cap(
     block_km: tuple[float, ...] = (50.0, 100.0, 200.0, 400.0),
     min_skill: float = 0.05,
     default_km: float = 25.0,
-    **kw: dict[str, Any],
+    **kw: Any,
 ) -> tuple[float, dict[float, CVCurve]]:
     """Derive the fill cap from blocked CV across several held-out block sizes.
 
