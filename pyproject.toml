@@ -43,9 +43,9 @@ dependencies = [
 dev = ["ruff>=0.1", "pytest>=8.0"]
 
 [project.urls]
-Homepage = "https://github.com/andryo/idw"
-Repository = "https://github.com/andryo/idw"
-Issues = "https://github.com/andryo/idw/issues"
+Homepage = "https://github.com/marzukia/pullpush"
+Repository = "https://github.com/marzukia/pullpush"
+Issues = "https://github.com/marzukia/pullpush/issues"
 
 [project.scripts]
 pullpush = "pullpush.idwgrid:main"
