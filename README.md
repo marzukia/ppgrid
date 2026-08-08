@@ -136,8 +136,7 @@ Melbourne Housing dataset (13,580 points) at various resolutions on a single mac
 | 250m | 0.6s | 159 KB |
 | 500m | 0.6s | 49 KB |
 
-![Wall Time vs Resolution](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/bench_time.png)
-![File Size vs Resolution](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/bench_size.png)
+![Benchmarks](https://raw.githubusercontent.com/marzukia/pullpush/main/examples/bench_combined.png)
 
 ## Example Outputs
 
