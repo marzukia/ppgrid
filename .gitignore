@@ -3,6 +3,6 @@
 .venv/
 __pycache__/
 .ruff_cache/
-outputs/
+examples/
 .vscode/
 .pytest_cache/

@@ -54,7 +54,7 @@ pullpush/
   pullpush.py    — mipmap kernels (downsample, upsample, pull_push, box_count)
   calibrate.py   — transform selection + blocked CV for fill cap
   idwgrid.py     — CLI driver with block parallel processing
-outputs/
+examples/
   test_run/
     value.tif       — interpolated value band (percentile)
     support_km.tif  — effective support scale
@@ -77,7 +77,7 @@ pip install numpy pandas pyproj rasterio
 
 ```bash
 # Interpolate Melbourne house prices
-pullpush data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-calibration -o outputs/melb/
+pullpush data/melb_houses.csv --value-col price --res 500 --cap-km 10 --skip-calibration -o examples/melb/
 ```
 
 ## Usage
@@ -93,7 +93,7 @@ python -m pullpush data.csv --value-col premium --res 100 --cap-km auto
 python -m pullpush data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8 --work-crs 3857 --out-crs 3857
 
 # Reuse existing calibration
-python -m pullpush data.csv --value-col premium --calibration outputs/previous/calibration.json
+python -m pullpush data.csv --value-col premium --calibration examples/previous/calibration.json
 ```
 
 ### CLI Options
@@ -101,7 +101,7 @@ python -m pullpush data.csv --value-col premium --calibration outputs/previous/c
 | Flag | Default | Description |
 |------|---------|-------------|
 | `input` | (required) | CSV or Parquet input path |
-| `-o, --out` | `outputs/` | Output directory |
+| `-o, --out` | `examples/` | Output directory |
 | `--value-col` | `value` | Value column name |
 | `--lng-col` | `longitude` | Longitude column name |
 | `--lat-col` | `latitude` | Latitude column name |
@@ -127,10 +127,10 @@ The value band stores percentiles, not raw values. To convert back to real units
 ```python
 import json, numpy as np, rasterio
 
-with open("outputs/test_run/calibration.json") as f:
+with open("examples/test_run/calibration.json") as f:
     quantiles = np.array(json.load(f)["percentile_quantiles"])
 
-with rasterio.open("outputs/test_run/value.tif") as r:
+with rasterio.open("examples/test_run/value.tif") as r:
     percentiles = np.array(r.read(1), copy=True) / 100.0
 
 real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quantiles)
