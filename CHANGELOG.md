@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added `--percentile-step` CLI flag: rounds output percentiles to the nearest step (e.g. `5` -> 90/95/100), clamped to 0-100. Recorded as a `percentile_step` tag on the value GeoTIFF.
 
 ## [0.2.0] - 2026-08-08
 - Added `__version__` to package.

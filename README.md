@@ -107,6 +107,7 @@ ppgrid data.csv --value-col premium --calibration calibration.json
 | `--block` | `2048` | Block size in cells |
 | `--workers` | `4` | Number of parallel workers |
 | `--scale` | `100.0` | DN = percentile * scale |
+| `--percentile-step` | (none) | Round output percentiles to the nearest step (e.g. `5` -> 90/95/100) |
 | `--compress` | `ZSTD` | GeoTIFF compression |
 | `--calibration` | (none) | Path to existing calibration.json |
 | `--calib-max-points` | `2000000` | Max points to use for calibration |

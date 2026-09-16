@@ -48,6 +48,57 @@ def test_halo_exceeds_block_error(tmp_path: Path) -> None:
         p.grid()
 
 
+def test_percentile_step_validation(tmp_path: Path) -> None:
+    """Pipeline rejects percentile_step outside (0, 100]."""
+    csv = tmp_path / "data.csv"
+    csv.write_text("value,longitude,latitude\n1.0,0.0,0.0\n")
+    for bad in (0.0, -5.0, 150.0):
+        with pytest.raises(ValueError, match="percentile_step"):
+            Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "out"), percentile_step=bad)
+    # boundary values are accepted
+    Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "out"), percentile_step=5.0)
+    Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "out"), percentile_step=100.0)
+
+
+def test_percentile_step_rounds_output(tmp_path: Path) -> None:
+    """End-to-end: --percentile-step 5 -> every output percentile is a multiple of 5."""
+    import numpy as np
+
+    data_csv = Path(__file__).resolve().parent.parent / "data" / "all_equakes.csv"
+    if not data_csv.exists():
+        pytest.skip(f"Data file not found: {data_csv}")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    p = Pipeline(
+        str(data_csv),
+        "mag",
+        "longitude",
+        "latitude",
+        str(out_dir),
+        res=5000.0,
+        cap_km=50.0,
+        block_size=2048,
+        workers=1,
+        skip_calibration=True,
+        percentile_step=5.0,
+    )
+    vpath, _ = p.run()
+
+    with rasterio.open(vpath) as ds:
+        arr = ds.read(1)
+        vals = arr[arr != ds.nodata].astype(np.float64) / 100.0
+        assert len(vals) > 0
+        rem = vals % 5.0
+        assert np.all(np.minimum(rem, 5.0 - rem) < 1e-6), (
+            f"off-step values: {vals[(rem > 1e-6) & (rem < 5 - 1e-6)][:5]}"
+        )
+        assert np.all((vals >= 0.0) & (vals <= 100.0))
+        tags = ds.tags()
+        assert tags.get("percentile_step") == "5.0"
+
+
 def test_pipeline_run_with_equakes(tmp_path: Path) -> None:
     """Run the full pipeline on data/all_equakes.csv and verify output GeoTIFFs."""
     data_csv = Path(__file__).resolve().parent.parent / "data" / "all_equakes.csv"
