@@ -156,12 +156,15 @@ def pull_push(
         np.float32(unresolved_m),
     ).astype(np.float32)
 
-    # Push: descend, blending local estimate against upsampled parent
+    # Push: descend, blending local estimate against upsampled parent.
+    # NaN-safe: saturated cells (a >= 1.0) take `local` directly, so a NaN
+    # parent multiplied by zero (0*NaN = NaN) cannot corrupt them.
     for k in range(levels - 1, -1, -1):
         c = counts[k]
         a = np.minimum(c / saturation, 1.0).astype(np.float32)
         local = sums[k] / np.maximum(c, 1e-9)
-        val = a * local + (1.0 - a) * upsample(val)
+        parent = upsample(val)
+        val = np.where(a >= 1.0, local, a * local + (1.0 - a) * parent)
         sup = a * np.float32(res * (1 << k)) + (1.0 - a) * upsample(sup)
 
     return val, sup
