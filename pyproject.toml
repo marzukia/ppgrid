@@ -60,6 +60,8 @@ line-length = 120
 preview = true
 select = ["ALL"]
 ignore = [
+    "COM812",     # missing-trailing-comma — conflicts with the ruff formatter (formatter adds it)
+    "rule-codes-in-selectors",   # RUF022 — pedantic; we use codes in select/ignore alongside ALL
     "any-type",   # Any allowed in **kwargs annotations
     "missing-copyright-notice",   # no copyright headers needed
     "too-many-statements-in-try-clause",  # too many statements in try (reproject block)
