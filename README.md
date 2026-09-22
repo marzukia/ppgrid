@@ -74,28 +74,28 @@ uv sync
 ## Quick Start
 
 ```bash
-ppgrid data.csv --value-col price --res 500 --cap-km 10 --skip-calibration
+ppgrid data.csv --value-col price --res 500 --cap-km 10 --skip-calibration -o out
 ```
 
-This reads `data.csv`, interpolates the `price` column at 500m resolution with a 10km fill cap, and writes `value.tif` + `support_km.tif` to `examples/`.
+This reads `data.csv`, interpolates the `price` column at 500m resolution with a 10km fill cap, and writes `value.tif` + `support_km.tif` to `out/`.
 
 ## Usage
 
 ```bash
 # Quick run (skip calibration)
-ppgrid data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration
+ppgrid data.csv --value-col premium --res 500 --cap-km 64 --skip-calibration -o out
 
 # Full run with calibration (saves calibration.json)
-ppgrid data.csv --value-col premium --res 100 --cap-km auto
+ppgrid data.csv --value-col premium --res 100 --cap-km auto -o out
 
 # Custom projection and params
-ppgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8
+ppgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --workers 8 -o out
 
 # Reuse existing calibration
-ppgrid data.csv --value-col premium --calibration calibration.json
+ppgrid data.csv --value-col premium --calibration calibration.json -o out
 
 # Round output percentiles to a step (e.g. 5 -> 90/95/100) for clean vectorisation
-ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
+ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5 -o out
 ```
 
 ### CLI Options
@@ -103,7 +103,7 @@ ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
 | Flag | Default | Description |
 |------|---------|-------------|
 | `input` | (required) | CSV or Parquet input path |
-| `-o, --out` | `examples/` | Output directory |
+| `-o, --out` | (required) | Output directory |
 | `--value-col` | `value` | Value column name |
 | `--lng-col` | `longitude` | Longitude column name |
 | `--lat-col` | `latitude` | Latitude column name |

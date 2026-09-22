@@ -10,13 +10,16 @@ minutes, no GPU. It is an **IDW approximation**: fast, visually clean, and
 deliberately *not* a spatially exact interpolator (the output is for visualisation,
 not downstream calculation).
 
-- Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.idwgrid:main`).
+- Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.idwgrid:main`, a shim that
+  re-exports `ppgrid.pipeline:main`).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
-- Tests: `uv run pytest` (23 tests). Lint/format: `ruff` (line-length 120).
+- Tests: `uv run pytest` (35 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
-- `ppgrid/idwgrid.py` — the Pipeline + CLI. All the logic lives here.
+- `ppgrid/pipeline.py` — the Pipeline + CLI. All the logic lives here.
+- `ppgrid/idwgrid.py` — back-compat shim re-exporting `ppgrid.pipeline` (kept so the
+  `ppgrid.idwgrid:main` entry point and old imports keep working).
 - `ppgrid/calibrate.py` — transform selection + spatially-blocked CV fill-cap.
 - `data/` — example inputs: `melb_houses.csv` (13,580 pts), `all_equakes.csv` (44,376 pts).
 - `examples/` — committed outputs + repro scripts + README images (see "Images" below).
@@ -48,7 +51,7 @@ not downstream calculation).
   (`mrzk.io` ppgrid post, `fig-bar-benchmark.json` / `fig-line-scaling.json`).
 
 ### The `--percentile-step` guard
-- `idwgrid.py` uses `if pct_step is not None:` (NOT `if pct_step:`). A step value of
+- `pipeline.py` uses `if pct_step is not None:` (NOT `if pct_step:`). A step value of
   `0` is invalid (validated to `(0, 100]`) but the `is not None` form is the correct
   guard and matches the docstring. Do not "simplify" it back to a truthiness check.
 

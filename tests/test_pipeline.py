@@ -1,4 +1,4 @@
-"""Tests for ppgrid.idwgrid."""
+"""Tests for ppgrid.pipeline."""
 
 import sys
 import warnings
@@ -10,7 +10,8 @@ import pandas as pd
 import pytest
 import rasterio
 
-from ppgrid.idwgrid import Pipeline
+from ppgrid.calibrate import PERCENTILE_MAX
+from ppgrid.pipeline import DEFAULT_SCALE, WORK_CRS, Pipeline
 
 
 def _write_neg_values_csv(tmp_path: Path, n: int = 20) -> str:
@@ -81,24 +82,28 @@ def test_percentile_step_validation(tmp_path: Path) -> None:
 
 def test_percentile_step_rounds_output(tmp_path: Path) -> None:
     """End-to-end: --percentile-step 5 -> every output percentile is a multiple of 5."""
-    import numpy as np
-
-    data_csv = Path(__file__).resolve().parent.parent / "data" / "all_equakes.csv"
-    if not data_csv.exists():
-        pytest.skip(f"Data file not found: {data_csv}")
+    data_csv = tmp_path / "pts.csv"
+    rng = np.random.default_rng(42)
+    pd.DataFrame(
+        {
+            "value": rng.uniform(1.0, 10.0, 120),
+            "longitude": 144.8 + rng.uniform(-0.3, 0.3, 120),
+            "latitude": -37.6 + rng.uniform(-0.3, 0.3, 120),
+        },
+    ).to_csv(data_csv, index=False)
 
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
     p = Pipeline(
         str(data_csv),
-        "mag",
+        "value",
         "longitude",
         "latitude",
         str(out_dir),
         res=5000.0,
         cap_km=50.0,
-        block_size=2048,
+        block_size=256,
         workers=1,
         skip_calibration=True,
         percentile_step=5.0,
@@ -107,13 +112,13 @@ def test_percentile_step_rounds_output(tmp_path: Path) -> None:
 
     with rasterio.open(vpath) as ds:
         arr = ds.read(1)
-        vals = arr[arr != ds.nodata].astype(np.float64) / 100.0
+        vals = arr[arr != ds.nodata].astype(np.float64) / DEFAULT_SCALE
         assert len(vals) > 0
         rem = vals % 5.0
         assert np.all(np.minimum(rem, 5.0 - rem) < 1e-6), (
             f"off-step values: {vals[(rem > 1e-6) & (rem < 5 - 1e-6)][:5]}"
         )
-        assert np.all((vals >= 0.0) & (vals <= 100.0))
+        assert np.all((vals >= 0.0) & (vals <= PERCENTILE_MAX))
         tags = ds.tags()
         assert tags.get("percentile_step") == "5.0"
 
@@ -202,7 +207,7 @@ def test_forced_transform_invalid_not_all_zero_surface(tmp_path: Path, bad_trans
         workers=1,
         skip_calibration=True,
         transform=bad_transform,
-        out_crs=6933,
+        out_crs=WORK_CRS,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -252,7 +257,7 @@ def test_run_creates_missing_out_dir(tmp_path: Path) -> None:
         cap_km=20.0,
         workers=1,
         skip_calibration=True,
-        out_crs=6933,
+        out_crs=WORK_CRS,
     )
     vpath, spath = p.run()
     assert Path(vpath).exists()
@@ -271,7 +276,7 @@ def test_saturation_zero_rejected(tmp_path: Path) -> None:
 
 def test_cli_saturation_zero_rejected(capsys: pytest.CaptureFixture[str]) -> None:
     """`--saturation 0` exits with a clear CLI error (issue #2)."""
-    from ppgrid.idwgrid import main
+    from ppgrid.pipeline import main
 
     old_argv = sys.argv
     sys.argv = ["ppgrid", "in.csv", "-o", "out", "--saturation", "0"]
@@ -286,7 +291,7 @@ def test_cli_saturation_zero_rejected(capsys: pytest.CaptureFixture[str]) -> Non
 
 def test_explicit_cap_skips_cv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An explicit cap_km must skip the blocked-CV fill-cap search (issue #2)."""
-    import ppgrid.idwgrid as ig
+    import ppgrid.pipeline as ig
 
     rng = np.random.default_rng(0)
     csv = tmp_path / "data.csv"
@@ -307,3 +312,36 @@ def test_explicit_cap_skips_cv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     p.ingest()
     p.calibrate()
     assert p.cap_km_val == 10.0
+
+
+def test_cli_rejects_bad_percentile_step(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`--percentile-step` outside (0, 100] exits with a clear CLI error."""
+    from ppgrid.pipeline import main
+
+    csv = tmp_path / "data.csv"
+    csv.write_text("value,longitude,latitude\n1.0,0.0,0.0\n")
+    for bad in ("0", "101", "-5"):
+        old_argv = sys.argv
+        sys.argv = ["ppgrid", str(csv), "-o", str(tmp_path / "out"), "--percentile-step", bad]
+        try:
+            with pytest.raises(SystemExit) as exc:
+                main()
+        finally:
+            sys.argv = old_argv
+        assert exc.value.code == 2
+        assert "percentile-step" in capsys.readouterr().err
+
+
+def test_cli_requires_out(capsys: pytest.CaptureFixture[str]) -> None:
+    """`-o/--out` is required: running without it exits with a clear CLI error."""
+    from ppgrid.pipeline import main
+
+    old_argv = sys.argv
+    sys.argv = ["ppgrid", "in.csv"]
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main()
+    finally:
+        sys.argv = old_argv
+    assert exc.value.code == 2
+    assert "-o/--out" in capsys.readouterr().err
