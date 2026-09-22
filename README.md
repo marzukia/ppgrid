@@ -5,6 +5,10 @@
 
 Fast, continent-scale raster interpolation for scattered point data. Turns tens of millions of geolocated points into a pair of GeoTIFFs in minutes on a single machine. No GPU needed.
 
+![ppgrid output at 10m / 50m / 100m / 250m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb_4panel.jpg)
+
+A single 100K-point dataset rendered at four resolutions. The adaptive mipmap pyramid fills sparse regions from coarser layers, so you get a continuous surface instead of patchy gaps.
+
 ## What it does
 
 You have `N` points with `(longitude, latitude, value)`. You want a raster where every cell within a specified distance of real data carries an interpolated value, and everything else is nodata.
@@ -62,8 +66,8 @@ pip install ppgrid[parquet]
 Or from source:
 
 ```bash
-git clone https://github.com/marzukia/pullpush.git
-cd pullpush
+git clone https://github.com/marzukia/ppgrid.git
+cd ppgrid
 uv sync
 ```
 
@@ -89,6 +93,9 @@ ppgrid data.csv --value-col premium --res 100 --cap-km 25 --transform log10 --wo
 
 # Reuse existing calibration
 ppgrid data.csv --value-col premium --calibration calibration.json
+
+# Round output percentiles to a step (e.g. 5 -> 90/95/100) for clean vectorisation
+ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
 ```
 
 ### CLI Options
@@ -107,6 +114,7 @@ ppgrid data.csv --value-col premium --calibration calibration.json
 | `--block` | `2048` | Block size in cells |
 | `--workers` | `4` | Number of parallel workers |
 | `--scale` | `100.0` | DN = percentile * scale |
+| `--percentile-step` | (none) | Round output percentiles to the nearest step (e.g. `5` -> 90/95/100) |
 | `--compress` | `ZSTD` | GeoTIFF compression |
 | `--calibration` | (none) | Path to existing calibration.json |
 | `--calib-max-points` | `2000000` | Max points to use for calibration |
@@ -133,7 +141,19 @@ real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quanti
 
 ## Benchmarks
 
-Melbourne Housing dataset (13,580 points) at various resolutions on a single machine (Apple M-series, 32GB RAM).
+Head-to-head on a 100K-point synthetic dataset (M4 MacBook Pro, 24GB) against the traditional GDAL path:
+
+![Wall time head-to-head at 100K points](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/bench_headtohead.png)
+
+`ppgrid` at 100m is ~17x faster than `gdal_grid` and ~3x faster than `gdal_rasterize` at the same resolution, and it can run 10x finer (10m) in under 13 seconds.
+
+The reason is the scaling behaviour. As the point count grows, `gdal_grid` climbs ~50x from 1K to 100K points (the `O(M*N)` kernel), while `ppgrid` stays flat near 1.6s because each point is binned once and the rest is linear over raster cells:
+
+![Wall time vs number of points](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/bench_scaling.png)
+
+### Resolution sweep
+
+Melbourne Housing dataset (13,580 points) at various resolutions on the same machine:
 
 | Resolution | Wall Time | File Size |
 |------------|-----------|-----------|
@@ -144,23 +164,19 @@ Melbourne Housing dataset (13,580 points) at various resolutions on a single mac
 | 250m | 0.6s | 159 KB |
 | 500m | 0.6s | 49 KB |
 
-![Benchmarks](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/bench_combined.png)
-
 ## Example Outputs
 
-Melbourne Housing dataset (13,580 points) interpolated at 10m resolution:
+`ppgrid` against `gdal_grid` + IDW and `gdal_rasterize` on the same data. Left is `ppgrid`, middle is `gdal_grid` with IDW, right is `gdal_rasterize`:
+
+![ppgrid vs gdal_grid (IDW) vs gdal_rasterize](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/side_by_side.jpg)
+
+Zoomed in. `ppgrid` stays continuous where the grid-based methods produce Voronoi-style polygons and patchy gaps:
+
+![zoomed comparison](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/zoom_side_by_side.jpg)
+
+Melbourne Housing interpolated at 10m, full extent:
 
 ![Melbourne Housing 10m Full](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/full_10m.png)
-
-Cropped to the CBD to show resolution differences:
-
-| 10m | 25m | 50m |
-|-----|-----|-----|
-| ![10m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/10m/value.png) | ![25m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/25m/value.png) | ![50m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/50m/value.png) |
-
-| 100m | 250m | 500m |
-|------|------|------|
-| ![100m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/100m/value.png) | ![250m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/250m/value.png) | ![500m](https://raw.githubusercontent.com/marzukia/ppgrid/main/examples/melb/500m/value.png) |
 
 ## Data
 
