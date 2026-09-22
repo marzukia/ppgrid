@@ -9,7 +9,7 @@ Usage:
 import argparse
 from pathlib import Path
 
-from ppgrid.idwgrid import Pipeline
+from ppgrid.pipeline import Pipeline
 
 
 def run(resolution: float, out_dir: Path) -> None:

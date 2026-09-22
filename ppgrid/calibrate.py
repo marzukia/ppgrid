@@ -22,6 +22,8 @@ import numpy as np
 
 from .pullpush import bin_points, pad_to_pyramid, pull_push
 
+PERCENTILE_MAX: float = 100.0  # percentile range is 0-100
+
 # ---------------------------------------------------------------- transforms
 
 
@@ -104,7 +106,7 @@ class PercentileTransform(Transform):
 
     @property
     def _p(self) -> np.ndarray:
-        return np.linspace(0.0, 100.0, self.NQ)
+        return np.linspace(0.0, PERCENTILE_MAX, self.NQ)
 
     def fwd(self, v: np.ndarray) -> np.ndarray:
         """Map values to percentiles.
