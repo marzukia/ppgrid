@@ -88,6 +88,10 @@ ignore = [
     "future-rewritable-type-annotation",     # missing from __future__ import annotations
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# examples/run_melb.py is a runnable repro script; its prints are the output.
+"examples/run_melb.py" = ["print"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
