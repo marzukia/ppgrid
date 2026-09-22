@@ -54,3 +54,41 @@ def test_transforms_factory() -> None:
     # Instances should be different objects
     assert list1 is not list2
     assert list1[0] is not list2[0]
+
+
+def test_blocked_cv_skill_clamps_grid_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Large extents must not bin into an unbounded 1 km grid (OOM, issue #2).
+
+    A ~40,000 km extent at res=1 km is a 40,960 x 40,960 cell grid. The clamp
+    keeps the grid at <= 4096 cells per axis, so the resolution used by the
+    CV binning must be >= extent / 4096.
+    """
+    import ppgrid.calibrate as cal
+
+    rng = np.random.default_rng(0)
+    n = 2000
+    x = rng.uniform(0.0, 4.0e7, n)
+    y = rng.uniform(0.0, 4.0e7, n)
+    tv = rng.normal(0.0, 1.0, n)
+
+    seen: list[float] = []
+    orig = cal._fit_predict  # ruff: ignore[private-member-access]
+
+    def spy(
+        xx: np.ndarray,
+        yy: np.ndarray,
+        t: np.ndarray,
+        train: np.ndarray,
+        res: float,
+        levels: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        seen.append(res)
+        return orig(xx, yy, t, train, res, levels)
+
+    monkeypatch.setattr(cal, "_fit_predict", spy)
+    cal.blocked_cv_skill(x, y, tv, res=1000.0, block_km=100.0)
+
+    assert seen, "CV did not run any folds"
+    expected = max(1000.0, max(float(np.ptp(x)), float(np.ptp(y))) / 4096.0)
+    np.testing.assert_allclose(seen, expected)
+    assert min(seen) > 1000.0, f"grid resolution not clamped: {seen[:3]}"
