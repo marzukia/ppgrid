@@ -2,8 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.1] - 2026-09-22
 - Added `--percentile-step` CLI flag: rounds output percentiles to the nearest step (e.g. `5` -> 90/95/100), clamped to 0-100. Recorded as a `percentile_step` tag on the value GeoTIFF.
+- Fixed `percentile_step` guard: `if pct_step:` -> `if pct_step is not None:` so a falsy step is handled correctly and the validation is consistent with the docstring.
+- README: added hero image (multi-resolution output), replaced the single wall-time-vs-resolution benchmark with a head-to-head vs `gdal_grid`/`gdal_rasterize` (100K points) and a wall-time-vs-point-count scaling chart (generated with `charted`), plus side-by-side comparison images. Fixed the source-clone URL (`pullpush` -> `ppgrid`).
 
 ## [0.2.0] - 2026-08-08
 - Added `__version__` to package.

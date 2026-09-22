@@ -147,7 +147,7 @@ def _process_block(
     scale = c["scale"]
     pv = c["pct"].fwd(c["tf"].inv(v_out))
     pct_step = c.get("pct_step")
-    if pct_step:
+    if pct_step is not None:
         # Round to the nearest step (e.g. 5 -> 90/95/100), clamp to 0-100.
         pv = np.clip(np.round(pv / pct_step) * pct_step, 0.0, 100.0)
     vq = np.where(near_out, np.round(pv * scale), NODATA).astype(np.int16)
@@ -207,6 +207,7 @@ class Pipeline:
 
         Raises:
             ValueError: If scale * 100 exceeds int16 max.
+            ValueError: If percentile_step is outside (0, 100].
 
         """
         self.input_path = input_path
