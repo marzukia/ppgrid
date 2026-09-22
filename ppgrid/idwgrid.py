@@ -497,6 +497,18 @@ class Pipeline:
         self.calibrate()
         self.grid()
 
+        return self._write_rasters()
+
+    def _write_rasters(self) -> tuple[str, str]:
+        """Interpolate all blocks and write the value/support GeoTIFFs.
+
+        Runs after grid(); the block loop is the hot phase, exposed
+        separately for benchmarking.
+
+        Returns:
+            Tuple of value and support GeoTIFF file paths.
+
+        """
         # Raster profile
         xform = from_origin(self.x0, self.y0 + self.ny * self.res, self.res, self.res)
         common = {
