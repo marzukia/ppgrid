@@ -23,6 +23,7 @@ from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 
+from . import __version__
 from .calibrate import (
     PercentileTransform,
     calibrate_fill_cap,
@@ -208,6 +209,7 @@ class Pipeline:
         Raises:
             ValueError: If scale * 100 exceeds int16 max.
             ValueError: If percentile_step is outside (0, 100].
+            ValueError: If saturation is not > 0.
 
         """
         self.input_path = input_path
@@ -227,6 +229,9 @@ class Pipeline:
         self.percentile_step = percentile_step
         if percentile_step is not None and not (0 < percentile_step <= 100):
             msg = f"percentile_step must be in (0, 100]: {percentile_step}"
+            raise ValueError(msg)
+        if saturation <= 0:
+            msg = f"saturation must be > 0: {saturation}"
             raise ValueError(msg)
         self.calib_max_points = calib_max_points
         self.src_crs = src_crs
@@ -308,7 +313,11 @@ class Pipeline:
         self.v = v
 
     def calibrate(self) -> None:
-        """Load or run calibration. Sets transform, percentile, cap."""
+        """Load or run calibration. Sets transform, percentile, cap.
+
+        If the requested transform is invalid for the data (e.g. log10 with
+        negative values), a warning is issued and identity is used instead.
+        """
         cal: dict[str, Any] | None = None
         cpath_obj = Path(self.calib_path) if self.calib_path else None
         if cpath_obj and cpath_obj.exists():
@@ -323,7 +332,12 @@ class Pipeline:
 
             tf, scores = choose_transform(cx, cy, cv)
             pct_fit = PercentileTransform().fit(cv)
-            cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv))
+            if self.cap_km != "auto":
+                # Explicit cap: skip the blocked-CV fill-cap search (it is
+                # discarded anyway, and it dominates run time / memory).
+                cap, detail = float(self.cap_km), {}
+            else:
+                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv))
 
             cal = {
                 "transform": tf.name,
@@ -353,6 +367,23 @@ class Pipeline:
             self.tf = make_transform(cal["transform_state"])
         else:
             self.tf = next(t for t in transforms() if t.name == self.tname).fit(self.v)
+
+        # Same valid() guard choose_transform applies: a forced transform can
+        # be invalid for this data (log10 on negatives -> NaN -> silent all-0
+        # surface). Reject the transform, fall back to identity with a warning.
+        if not self.tf.valid(self.v):
+            msg = (
+                f"transform {self.tname!r} is invalid for this data "
+                f"(min={np.min(self.v):.6g}); falling back to identity"
+            )
+            warnings.warn(msg, stacklevel=2)
+            self.tname = "identity"
+            self.tf = next(t for t in transforms() if t.name == "identity")
+
+        # Keep the worker-side transform in sync with the fitted transform
+        # (a forced transform can differ from the calibration's choice).
+        if cal is not None:
+            cal["transform_state"] = self.tf.state()
 
         self.pct_q = (
             PercentileTransform(cal["percentile_quantiles"])
@@ -461,6 +492,7 @@ class Pipeline:
             Tuple of value and support GeoTIFF file paths.
 
         """
+        Path(self.out_dir).mkdir(parents=True, exist_ok=True)
         self.ingest()
         self.calibrate()
         self.grid()
@@ -662,7 +694,7 @@ def run(
 def main() -> None:
     """Parse CLI arguments and run the pipeline."""
     parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
-    parser.add_argument("--version", action="version", version="ppgrid 0.2.0")
+    parser.add_argument("--version", action="version", version=f"ppgrid {__version__}")
     parser.add_argument("input", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="examples/", help="Output directory")
     parser.add_argument("--value-col", default="value", help="Value column name")
@@ -705,6 +737,8 @@ def main() -> None:
         parser.error("--workers must be at least 1")
     if args.scale <= 0:
         parser.error("--scale must be positive")
+    if args.saturation <= 0:
+        parser.error("--saturation must be positive")
     if args.percentile_step is not None and not (0 < args.percentile_step <= 100):
         parser.error("--percentile-step must be in (0, 100]")
     if args.block < 1:

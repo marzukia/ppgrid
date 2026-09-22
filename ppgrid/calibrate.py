@@ -296,6 +296,11 @@ def blocked_cv_skill(
     """
     rng = np.random.default_rng(seed)
     block_size_m = block_km * 1000.0
+    # Clamp grid resolution: full-bounding-box binning at 1 km OOMs on large
+    # extents (e.g. ~40,000 km global -> ~1.6B cells). Cap the grid at 4096
+    # cells per axis.
+    extent = max(float(np.ptp(x)), float(np.ptp(y)))
+    res = max(res, extent / 4096.0)
     bkey = _cell_key(x, y, block_size_m)
     blocks = np.unique(bkey)
     perm = rng.permutation(len(blocks))
