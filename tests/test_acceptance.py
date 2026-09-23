@@ -15,7 +15,8 @@ import rasterio
 from pyproj import Transformer
 from rasterio.transform import rowcol
 
-from ppgrid.idwgrid import NODATA, Pipeline
+from ppgrid.calibrate import PERCENTILE_MAX
+from ppgrid.pipeline import DEFAULT_SCALE, NODATA, OUT_CRS, SRC_CRS, Pipeline
 
 
 def _make_small_csv(tmp_path: Path, n_points: int = 500) -> str:
@@ -164,7 +165,7 @@ def test_single_point_georeferences(tmp_path: Path) -> None:
     with rasterio.open(vpath) as ds:
         transform = ds.transform
         # Output is in EPSG:3857 (Web Mercator), project the known coords
-        tr = Transformer.from_crs(4326, 3857, always_xy=True)
+        tr = Transformer.from_crs(SRC_CRS, OUT_CRS, always_xy=True)
         merc_x, merc_y = tr.transform(known_lon, known_lat)
         # Find the pixel closest to the known coordinate (rowcol takes xs, ys)
         row, col = rowcol(transform, merc_x, merc_y, offset="center")
@@ -206,10 +207,10 @@ def test_output_pixels_are_valid(tmp_path: Path) -> None:
         arr = ds.read(1)
         valid_mask = arr != NODATA
         valid_values = arr[valid_mask]
-        # Valid values should be in range [0, 100*scale] where scale=100
+        # Valid values should be in range [0, PERCENTILE_MAX*scale]
         if len(valid_values) > 0:
             assert valid_values.min() >= 0, f"Negative percentile: {valid_values.min()}"
-            assert valid_values.max() <= 10000, f"Percentile > 100*scale: {valid_values.max()}"
+            assert valid_values.max() <= PERCENTILE_MAX * DEFAULT_SCALE, f"Percentile > 100*scale: {valid_values.max()}"
 
     # Check support_km band
     with rasterio.open(spath) as ds:
