@@ -12,7 +12,7 @@ not downstream calculation).
 
 - Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.pipeline:main`; `ppgrid.idwgrid` is a back-compat shim).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
-- Tests: `uv run pytest` (23 tests). Lint/format: `ruff` (line-length 120).
+- Tests: `uv run pytest` (51 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
@@ -48,7 +48,7 @@ not downstream calculation).
   (`mrzk.io` ppgrid post, `fig-bar-benchmark.json` / `fig-line-scaling.json`).
 
 ### The `--percentile-step` guard
-- `idwgrid.py` uses `if pct_step is not None:` (NOT `if pct_step:`). A step value of
+- `pipeline.py` uses `if pct_step is not None:` (NOT `if pct_step:`). A step value of
   `0` is invalid (validated to `(0, 100]`) but the `is not None` form is the correct
   guard and matches the docstring. Do not "simplify" it back to a truthiness check.
 
@@ -79,8 +79,7 @@ not downstream calculation).
   PAT=$(cat ~/.config/marzukia-pat)
   git push "https://x-access-token:${PAT}@github.com/marzukia/ppgrid" <branch>
   ```
-- Branches go to a PR, not main, per the fleet merge gate. Current open PR: #1
-  (`feat/percentile-step`).
+- Branches go to a PR, not main, per the fleet merge gate.
 
 ## What changed recently (2026-09-22, the "polish" pass)
 
