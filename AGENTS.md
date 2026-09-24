@@ -10,13 +10,13 @@ minutes, no GPU. It is an **IDW approximation**: fast, visually clean, and
 deliberately *not* a spatially exact interpolator (the output is for visualisation,
 not downstream calculation).
 
-- Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.idwgrid:main`).
+- Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.pipeline:main`; `ppgrid.idwgrid` is a back-compat shim).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
 - Tests: `uv run pytest` (23 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
-- `ppgrid/idwgrid.py` — the Pipeline + CLI. All the logic lives here.
+- `ppgrid/pipeline.py` — the Pipeline + CLI. All the logic lives here. `ppgrid/idwgrid.py` is a thin back-compat shim (module alias to `ppgrid.pipeline`).
 - `ppgrid/calibrate.py` — transform selection + spatially-blocked CV fill-cap.
 - `data/` — example inputs: `melb_houses.csv` (13,580 pts), `all_equakes.csv` (44,376 pts).
 - `examples/` — committed outputs + repro scripts + README images (see "Images" below).
