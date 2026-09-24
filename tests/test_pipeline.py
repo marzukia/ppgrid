@@ -1,4 +1,4 @@
-"""Tests for ppgrid.idwgrid."""
+"""Tests for ppgrid.pipeline."""
 
 import json
 import sys
@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 import rasterio
 
-from ppgrid.idwgrid import Pipeline
+from ppgrid.pipeline import Pipeline
 
 
 def _write_neg_values_csv(tmp_path: Path, n: int = 20) -> str:
@@ -102,25 +102,28 @@ def test_percentile_step_validation(tmp_path: Path) -> None:
 
 
 def test_percentile_step_rounds_output(tmp_path: Path) -> None:
-    """End-to-end: --percentile-step 5 -> every output percentile is a multiple of 5."""
-    import numpy as np
-
-    data_csv = Path(__file__).resolve().parent.parent / "data" / "all_equakes.csv"
-    if not data_csv.exists():
-        pytest.skip(f"Data file not found: {data_csv}")
+    """End-to-end: percentile_step=5 -> every output percentile is a multiple of 5."""
+    rng = np.random.default_rng(0)
+    csv = tmp_path / "pts.csv"
+    pd.DataFrame(
+        {
+            "value": rng.uniform(1.0, 100.0, 100),
+            "longitude": 144.6 + rng.uniform(-0.2, 0.2, 100),
+            "latitude": -37.7 + rng.uniform(-0.2, 0.2, 100),
+        },
+    ).to_csv(csv, index=False)
 
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
     p = Pipeline(
-        str(data_csv),
-        "mag",
+        str(csv),
+        "value",
         "longitude",
         "latitude",
         str(out_dir),
-        res=5000.0,
-        cap_km=50.0,
-        block_size=2048,
+        res=500.0,
+        cap_km=2.0,
         workers=1,
         skip_calibration=True,
         percentile_step=5.0,
@@ -289,7 +292,7 @@ def test_auto_fallback_not_all_zero_surface(tmp_path: Path, bad_transform: str) 
 def test_cli_version_matches_package_version(capsys: pytest.CaptureFixture[str]) -> None:
     """`ppgrid --version` must report the real package version, not a hardcoded one (issue #2)."""
     from ppgrid import __version__
-    from ppgrid.idwgrid import main
+    from ppgrid.pipeline import main
 
     old_argv = sys.argv
     sys.argv = ["ppgrid", "--version"]
@@ -304,7 +307,7 @@ def test_cli_version_matches_package_version(capsys: pytest.CaptureFixture[str])
 
 def test_cli_explicit_invalid_transform_hard_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """CLI: explicit --transform log10 on negative data -> exit 2 + clear error (issue #5)."""
-    from ppgrid.idwgrid import main
+    from ppgrid.pipeline import main
 
     csv = _write_neg_values_csv(tmp_path)
     old_argv = sys.argv
@@ -359,24 +362,45 @@ def test_saturation_zero_rejected(tmp_path: Path) -> None:
     Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "out"), saturation=2.5)
 
 
-def test_cli_saturation_zero_rejected(capsys: pytest.CaptureFixture[str]) -> None:
-    """`--saturation 0` exits with a clear CLI error (issue #2)."""
-    from ppgrid.idwgrid import main
+@pytest.mark.parametrize(
+    ("extra_args", "expect"),
+    [
+        (["--res", "0"], "res"),
+        (["--res", "-4"], "res"),
+        (["--workers", "0"], "workers"),
+        (["--scale", "0"], "scale"),
+        (["--saturation", "0"], "saturation"),
+        (["--percentile-step", "0"], "percentile-step"),
+        (["--percentile-step", "150"], "percentile-step"),
+        (["--block", "0"], "block"),
+    ],
+)
+def test_cli_arg_validation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    extra_args: list[str],
+    expect: str,
+) -> None:
+    """argparse-level validation: each bad flag exits 2 with its name on stderr.
+
+    This is where the tier-1 #2 bugs hid (CLI validation gaps).
+    """
+    from ppgrid.pipeline import main
 
     old_argv = sys.argv
-    sys.argv = ["ppgrid", "in.csv", "-o", "out", "--saturation", "0"]
+    sys.argv = ["ppgrid", "in.csv", "-o", str(tmp_path / "out"), *extra_args]
     try:
         with pytest.raises(SystemExit) as exc:
             main()
     finally:
         sys.argv = old_argv
     assert exc.value.code == 2
-    assert "saturation" in capsys.readouterr().err
+    assert expect in capsys.readouterr().err
 
 
 def test_explicit_cap_skips_cv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An explicit cap_km must skip the blocked-CV fill-cap search (issue #2)."""
-    import ppgrid.idwgrid as ig
+    import ppgrid.pipeline as ig
 
     rng = np.random.default_rng(0)
     csv = tmp_path / "data.csv"

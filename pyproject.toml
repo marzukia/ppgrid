@@ -50,7 +50,7 @@ Repository = "https://github.com/marzukia/ppgrid"
 Issues = "https://github.com/marzukia/ppgrid/issues"
 
 [project.scripts]
-ppgrid = "ppgrid.idwgrid:main"
+ppgrid = "ppgrid.pipeline:main"
 
 [tool.ruff]
 target-version = "py311"
@@ -75,7 +75,6 @@ ignore = [
     "too-many-locals",  # too many local variables (pipeline functions)
     "too-many-statements",  # too many statements (pipeline function)
     "too-many-positional-arguments",  # too many positional arguments (numerical functions)
-    "global-statement",  # global required for ProcessPoolExecutor initializer
     "typing-only-standard-library-import",    # Callable used at runtime in function signatures
     "assert",      # assert usage in tests
     "magic-value-comparison",   # magic value comparison in tests
@@ -83,7 +82,7 @@ ignore = [
     "float-equality-comparison",   # float equality comparison in tests
     "literal-membership",     # literal membership (list vs set in tests)
     "pytest-raises-ambiguous-pattern",     # pytest raises ambiguous pattern
-    "import-outside-top-level",   # import outside top-level (lazy-loaded reprojection)
+    "import-outside-top-level",   # import outside top-level (optional pyarrow in Pipeline.ingest)
     "undocumented-public-package",    # undocumented public package (tests/__init__.py)
     "docstring-missing-returns",    # docstring missing returns (test helper functions)
     "import-private-name",    # import private name (test imports _smooth3)

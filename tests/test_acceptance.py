@@ -15,7 +15,8 @@ import rasterio
 from pyproj import Transformer
 from rasterio.transform import rowcol
 
-from ppgrid.idwgrid import NODATA, Pipeline
+from ppgrid.calibrate import PERCENTILE_MAX
+from ppgrid.pipeline import DEFAULT_SCALE, NODATA, Pipeline
 
 
 def _make_small_csv(tmp_path: Path, n_points: int = 500) -> str:
@@ -206,10 +207,11 @@ def test_output_pixels_are_valid(tmp_path: Path) -> None:
         arr = ds.read(1)
         valid_mask = arr != NODATA
         valid_values = arr[valid_mask]
-        # Valid values should be in range [0, 100*scale] where scale=100
+        # Valid values should be in [0, PERCENTILE_MAX * DEFAULT_SCALE] (default scale)
         if len(valid_values) > 0:
+            max_dn = int(PERCENTILE_MAX * DEFAULT_SCALE)
             assert valid_values.min() >= 0, f"Negative percentile: {valid_values.min()}"
-            assert valid_values.max() <= 10000, f"Percentile > 100*scale: {valid_values.max()}"
+            assert valid_values.max() <= max_dn, f"Percentile > PERCENTILE_MAX*DEFAULT_SCALE: {valid_values.max()}"
 
     # Check support_km band
     with rasterio.open(spath) as ds:
