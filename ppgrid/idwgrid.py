@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -371,8 +372,13 @@ class Pipeline:
     def calibrate(self) -> None:
         """Load or run calibration. Sets transform, percentile, cap.
 
-        If the requested transform is invalid for the data (e.g. log10 with
-        negative values), a warning is issued and identity is used instead.
+        If an explicitly forced transform is invalid for the data (e.g. log10
+        with negative values), a ValueError is raised. For the ``auto`` path,
+        an invalid transform is rejected with a warning and identity is used.
+
+        Raises:
+            ValueError: If an explicit --transform cannot be applied to the data.
+
         """
         cal: dict[str, Any] | None = None
         cpath_obj = Path(self.calib_path) if self.calib_path else None
@@ -424,10 +430,17 @@ class Pipeline:
         else:
             self.tf = next(t for t in transforms() if t.name == self.tname).fit(self.v)
 
-        # Same valid() guard choose_transform applies: a forced transform can
-        # be invalid for this data (log10 on negatives -> NaN -> silent all-0
-        # surface). Reject the transform, fall back to identity with a warning.
+        # Same valid() guard choose_transform applies: a transform can be
+        # invalid for this data (log10 on negatives -> NaN -> silent all-0
+        # surface). An explicitly forced --transform is a hard error (the user
+        # was deliberate); the auto path falls back to identity with a warning.
         if not self.tf.valid(self.v):
+            if self.transform != "auto":
+                msg = (
+                    f"--transform {self.tname} not valid for this data "
+                    f"(min={np.min(self.v):.6g}); use --transform auto or a different transform"
+                )
+                raise ValueError(msg)
             msg = (
                 f"transform {self.tname!r} is invalid for this data "
                 f"(min={np.min(self.v):.6g}); falling back to identity"
@@ -436,9 +449,12 @@ class Pipeline:
             self.tname = "identity"
             self.tf = next(t for t in transforms() if t.name == "identity")
 
-        # Keep the worker-side transform in sync with the fitted transform
-        # (a forced transform can differ from the calibration's choice).
+        # Keep the cal dict in sync with the fitted transform (a forced
+        # transform can differ from the calibration's choice): the transform
+        # name and its state must always agree, or a later auto run re-fits
+        # from a stale name.
         if cal is not None:
+            cal["transform"] = self.tname
             cal["transform_state"] = self.tf.state()
 
         self.pct_q = (
@@ -892,7 +908,12 @@ def run(
 
 
 def main() -> None:
-    """Parse CLI arguments and run the pipeline."""
+    """Parse CLI arguments and run the pipeline.
+
+    Raises:
+        SystemExit: On invalid arguments or a pipeline error (exit code 2).
+
+    """
     parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
     parser.add_argument("--version", action="version", version=f"ppgrid {__version__}")
     parser.add_argument("input", help="CSV or Parquet input path")
@@ -945,28 +966,32 @@ def main() -> None:
         parser.error("--block must be at least 1")
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
-    run(
-        args.input,
-        args.value_col,
-        args.lng_col,
-        args.lat_col,
-        args.out,
-        res=args.res,
-        cap_km=args.cap_km,
-        transform=args.transform,
-        saturation=args.saturation,
-        block_size=args.block,
-        workers=args.workers,
-        calib_path=args.calibration,
-        scale=args.scale,
-        percentile_step=args.percentile_step,
-        compress=args.compress,
-        calib_max_points=args.calib_max_points,
-        src_crs=args.src_crs,
-        work_crs=args.work_crs,
-        out_crs=args.out_crs,
-        skip_calibration=args.skip_calibration,
-    )
+    try:
+        run(
+            args.input,
+            args.value_col,
+            args.lng_col,
+            args.lat_col,
+            args.out,
+            res=args.res,
+            cap_km=args.cap_km,
+            transform=args.transform,
+            saturation=args.saturation,
+            block_size=args.block,
+            workers=args.workers,
+            calib_path=args.calibration,
+            scale=args.scale,
+            percentile_step=args.percentile_step,
+            compress=args.compress,
+            calib_max_points=args.calib_max_points,
+            src_crs=args.src_crs,
+            work_crs=args.work_crs,
+            out_crs=args.out_crs,
+            skip_calibration=args.skip_calibration,
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":
