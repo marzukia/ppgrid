@@ -181,6 +181,26 @@ def _cell_key(x: np.ndarray, y: np.ndarray, res: float) -> np.ndarray:
     return ix * (int(iy.max()) + 1) + iy
 
 
+def icc_from_inv(inv: np.ndarray, values: np.ndarray) -> float:
+    """ICC from a precomputed cell-key inverse mapping (see _cell_key + np.unique).
+
+    Args:
+        inv: Per-point index into the sorted unique cells.
+        values: Values to score.
+
+    Returns:
+        ICC value between 0 and 1.
+
+    """
+    n = int(inv.max()) + 1
+    csum = np.bincount(inv, weights=values, minlength=n)
+    ccnt = np.bincount(inv, minlength=n)
+    cmean = csum / np.maximum(ccnt, 1)
+    within = np.mean((values - cmean[inv]) ** 2)
+    total = values.var()
+    return float(1.0 - within / total) if total > 0 else 0.0
+
+
 def icc(values: np.ndarray, x: np.ndarray, y: np.ndarray, res: float) -> float:
     """Intraclass correlation at cell size `res`.
 
@@ -193,14 +213,7 @@ def icc(values: np.ndarray, x: np.ndarray, y: np.ndarray, res: float) -> float:
     """
     key = _cell_key(x, y, res)
     _, inv = np.unique(key, return_inverse=True)
-    inv = inv.ravel()
-    n = inv.max() + 1
-    csum = np.bincount(inv, weights=values, minlength=n)
-    ccnt = np.bincount(inv, minlength=n)
-    cmean = csum / np.maximum(ccnt, 1)
-    within = np.mean((values - cmean[inv]) ** 2)
-    total = values.var()
-    return float(1.0 - within / total) if total > 0 else 0.0
+    return icc_from_inv(inv.ravel(), values)
 
 
 def choose_transform(
@@ -211,10 +224,20 @@ def choose_transform(
 ) -> tuple[Transform, list[tuple[Transform, float, dict[float, float]]]]:
     """Pick the transform maximising mean ICC across coarse scales.
 
+    The per-scale cell key + np.unique depends only on x, y, res, so it is
+    computed once per scale and shared across candidate transforms (was
+    rebuilt on every icc call: ~12x for 4 transforms x 3 scales).
+
     Returns:
         Tuple of best transform and all scored results.
 
     """
+    inv_by_scale: dict[float, np.ndarray] = {}
+    for s in scales:
+        key = _cell_key(x, y, s)
+        _, inv = np.unique(key, return_inverse=True)
+        inv_by_scale[s] = inv.ravel()
+
     results: list[tuple[Transform, float, dict[float, float]]] = []
     for candidate in transforms():
         if not candidate.valid(values):
@@ -223,7 +246,7 @@ def choose_transform(
         tv = fitted.fwd(values)
         if not np.all(np.isfinite(tv)):
             continue
-        per_scale: dict[float, float] = {float(s): icc(tv, x, y, s) for s in scales}
+        per_scale: dict[float, float] = {float(s): icc_from_inv(inv_by_scale[s], tv) for s in scales}
         results.append((fitted, float(np.mean(list(per_scale.values()))), per_scale))
     results.sort(key=lambda r: -r[1])
     return results[0][0], results
