@@ -46,11 +46,15 @@ WORK_CRS: int = 6933  # Wagner VII — global equal-area, metres are true
 NODATA: int = -32768
 INT16_MAX: int = 32767
 
-# Shared full-grid field threshold: bin all points once, build the pyramid
-# once, run the descent once over the whole padded grid, and let every block
-# slice the result. Capped by memory (the finest s/c grids, the value/support
-# field and the near mask stay resident for the whole run).
-_SHARED_MAX_CELLS = int(2.5e9)
+# Shared full-field path: bin all points once, build the pyramid once, run
+# the descent once over the whole padded grid, and let every block slice
+# the result. Used only while the padded grid is small enough that one full
+# descent beats per-box descents. Measured on hydrogen (12.88 GB cgroup):
+# at ~2e9 cells the banded memmap descent is ~20x slower than the per-box
+# path (page-cache writeback throttling), so large grids fall back to
+# per-box. 2.5e8 covers the 1e8-2.5e8 band where the shared memmap path
+# still wins (wide1m: 32s vs 46s per-box).
+_SHARED_MAX_CELLS = int(2.5e8)
 
 # Below this many cells the full field fits in RAM comfortably; larger grids
 # write the finest descent level to memmap in row bands.
@@ -705,6 +709,7 @@ class Pipeline:
             # Process blocks with parallel workers
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
+                _CTX.clear()  # drop stale state from any previous run in this process
                 _CTX.update(
                     {
                         "pts": np.load(self.cfg.pts_path, mmap_mode="r"),
