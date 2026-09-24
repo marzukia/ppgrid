@@ -1,5 +1,6 @@
 """Tests for ppgrid.idwgrid."""
 
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -25,6 +26,27 @@ def _write_neg_values_csv(tmp_path: Path, n: int = 20) -> str:
         },
     ).to_csv(csv, index=False)
     return str(csv)
+
+
+def _write_pos_values_csv(tmp_path: Path, n: int = 20) -> str:
+    """Write n points with positive values spanning 1.0..9.0 (log/sqrt both valid)."""
+    rng = np.random.default_rng(1)
+    csv = tmp_path / "pos.csv"
+    pd.DataFrame(
+        {
+            "value": np.linspace(1.0, 9.0, n),
+            "longitude": 144.6 + rng.uniform(-0.2, 0.2, n),
+            "latitude": -37.7 + rng.uniform(-0.2, 0.2, n),
+        },
+    ).to_csv(csv, index=False)
+    return str(csv)
+
+
+def _write_cal_file(tmp_path: Path, name: str, cap_km: float = 20.0) -> str:
+    """Write a cal JSON as if a prior auto run had picked transform `name`."""
+    cal = tmp_path / "calibration.json"
+    cal.write_text(json.dumps({"transform": name, "transform_state": {"name": name}, "cap_km": cap_km}))
+    return str(cal)
 
 
 def test_empty_input_error(tmp_path: Path) -> None:
@@ -162,8 +184,8 @@ def test_pipeline_run_with_equakes(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("bad_transform", ["log10", "sqrt"])
-def test_forced_transform_invalid_falls_back(tmp_path: Path, bad_transform: str) -> None:
-    """Forced log10/sqrt on data with a negative value -> warning + identity, no NaN (issue #2)."""
+def test_forced_transform_invalid_hard_error(tmp_path: Path, bad_transform: str) -> None:
+    """Explicit --transform log10/sqrt on negative data -> ValueError, no silent fallback (issue #5)."""
     csv = _write_neg_values_csv(tmp_path)
     p = Pipeline(
         csv,
@@ -176,21 +198,70 @@ def test_forced_transform_invalid_falls_back(tmp_path: Path, bad_transform: str)
         transform=bad_transform,
     )
     p.ingest()
+    with pytest.raises(ValueError, match="not valid for this data"):
+        p.calibrate()
+
+
+@pytest.mark.parametrize("bad_transform", ["log10", "sqrt"])
+def test_auto_transform_invalid_falls_back(tmp_path: Path, bad_transform: str) -> None:
+    """Auto path + a cal file that picked log10/sqrt, on negative data -> warn + identity (issue #5)."""
+    csv = _write_neg_values_csv(tmp_path)
+    cal_path = _write_cal_file(tmp_path, bad_transform)
+    p = Pipeline(
+        csv,
+        "value",
+        "longitude",
+        "latitude",
+        str(tmp_path / "out"),
+        cap_km=20.0,
+        transform="auto",
+        calib_path=cal_path,
+    )
+    p.ingest()
     with pytest.warns(UserWarning, match="falling back to identity"):
         p.calibrate()
     assert p.tname == "identity"
     assert np.all(np.isfinite(p.tv))
+    assert p._cal["transform"] == "identity" == p._cal["transform_state"]["name"]  # ruff: ignore[private-member-access]
+
+
+def test_cal_transform_name_matches_state_after_forced_transform(tmp_path: Path) -> None:
+    """Cal dict: transform name must agree with transform_state.name (issue #5).
+
+    A cal file that picked log10 is reused with an explicit --transform sqrt:
+    after calibrate, the cal JSON must hold transform == transform_state.name
+    == "sqrt", not a stale "log10" beside the sqrt state.
+    """
+    csv = _write_pos_values_csv(tmp_path)
+    cal_path = _write_cal_file(tmp_path, "log10")
+    p = Pipeline(
+        csv,
+        "value",
+        "longitude",
+        "latitude",
+        str(tmp_path / "out"),
+        cap_km=20.0,
+        transform="sqrt",
+        calib_path=cal_path,
+    )
+    p.ingest()
+    p.calibrate()
+    assert p.tname == "sqrt"
+    assert p._cal["transform"] == "sqrt"  # ruff: ignore[private-member-access]
+    assert p._cal["transform"] == p._cal["transform_state"]["name"]  # ruff: ignore[private-member-access]
 
 
 @pytest.mark.parametrize("bad_transform", ["log10", "sqrt"])
-def test_forced_transform_invalid_not_all_zero_surface(tmp_path: Path, bad_transform: str) -> None:
-    """End-to-end: forced log10 on negative data must not yield an all-DN-0 surface (issue #2).
+def test_auto_fallback_not_all_zero_surface(tmp_path: Path, bad_transform: str) -> None:
+    """End-to-end: auto + a log10/sqrt cal file on negative data must not yield an all-DN-0 surface.
 
-    This is the regression test that would have caught the silent corruption:
-    before the fix, NaN in the transform space made the whole surface read
-    percentile 0 (DN 0) instead of real values.
+    This is the regression test that would have caught the silent corruption
+    (issue #2): before the fix, NaN in the transform space made the whole
+    surface read percentile 0 (DN 0) instead of real values. The auto path
+    rejects the invalid transform with a warning and falls back to identity.
     """
     csv = _write_neg_values_csv(tmp_path)
+    cal_path = _write_cal_file(tmp_path, bad_transform)
     p = Pipeline(
         csv,
         "value",
@@ -200,8 +271,8 @@ def test_forced_transform_invalid_not_all_zero_surface(tmp_path: Path, bad_trans
         res=5000.0,
         cap_km=20.0,
         workers=1,
-        skip_calibration=True,
-        transform=bad_transform,
+        transform="auto",
+        calib_path=cal_path,
         out_crs=6933,
     )
     with warnings.catch_warnings():
@@ -229,6 +300,25 @@ def test_cli_version_matches_package_version(capsys: pytest.CaptureFixture[str])
         sys.argv = old_argv
     assert exc.value.code == 0
     assert capsys.readouterr().out.strip() == f"ppgrid {__version__}"
+
+
+def test_cli_explicit_invalid_transform_hard_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """CLI: explicit --transform log10 on negative data -> exit 2 + clear error (issue #5)."""
+    from ppgrid.idwgrid import main
+
+    csv = _write_neg_values_csv(tmp_path)
+    old_argv = sys.argv
+    sys.argv = ["ppgrid", csv, "-o", str(tmp_path / "out"), "--transform", "log10", "--cap-km", "20"]
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main()
+    finally:
+        sys.argv = old_argv
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "log10" in err
+    assert "not valid" in err
 
 
 def test_run_creates_missing_out_dir(tmp_path: Path) -> None:
