@@ -65,6 +65,49 @@ def test_box_count() -> None:
     assert result[0, 0] == 0  # outside radius
 
 
+def test_box_count_float32_boundary() -> None:
+    """The float32 SAT guard flips at exactly 2**24 total points.
+
+    (1<<24)-1 total counts -> float32 fast path (returns float32).
+    1<<24 total counts    -> int64 fallback (returns int64).
+    Both must be bit-exact against the int64 SAT reference. The dtype
+    asserts pin the threshold: moving it either way fails CI here.
+    """
+    from ppgrid.pullpush import _box_count_int64, box_count_banded
+
+    rng = np.random.default_rng(7)
+    n0, n1, r = 64, 64, 5
+    c = rng.integers(0, 100, (n0, n1), dtype=np.int64)
+
+    c_below = c.copy()
+    c_below[0, 0] += (1 << 24) - 1 - c.sum()
+    assert c_below.sum() == (1 << 24) - 1
+
+    c_at = c_below.copy()
+    c_at[0, 0] += 1
+    assert c_at.sum() == 1 << 24
+
+    ref_below = _box_count_int64(c_below, r)
+    ref_at = _box_count_int64(c_at, r)
+    assert ref_below[0, 0] > 1_000_000  # non-trivial window structure
+
+    below = box_count(c_below, r)
+    at = box_count(c_at, r)
+    # Pins which path each total takes (threshold regression guard).
+    assert below.dtype == np.float32, "below 2**24 must take the float32 fast path"
+    assert at.dtype == np.int64, "at 2**24 must take the int64 fallback"
+    # The two paths give identical counts, and both match the reference.
+    np.testing.assert_array_equal(below, ref_below)
+    np.testing.assert_array_equal(at, ref_at)
+
+    # box_count_banded shares the threshold; value-check it at both sides.
+    out = np.empty((n0, n1), dtype=bool)
+    box_count_banded(c_below, r, out)
+    np.testing.assert_array_equal(out, ref_below > 0)
+    box_count_banded(c_at, r, out)
+    np.testing.assert_array_equal(out, ref_at > 0)
+
+
 def test_bin_points() -> None:
     """bin_points scatters points correctly into sum/count grids."""
     ix = np.array([0, 0, 1, 2], dtype=np.int64)
