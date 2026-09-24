@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import rasterio
 from rasterio.windows import Window
 
@@ -227,3 +228,58 @@ def test_melb10_anchor_bit_equal(tmp_path: Path) -> None:
             assert a.height == o.height
             assert a.nodata == o.nodata
             assert np.array_equal(a.read(1), o.read(1)), name
+
+
+def test_perbox_after_shared_no_stale_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A per-box run after a shared run in one process must not reuse stale _CTX."""
+    import ppgrid.idwgrid as ig
+
+    # Force the per-box fallback for grid B while grid A stays on the shared
+    # path, regardless of the production threshold.
+    monkeypatch.setattr(ig, "_SHARED_MAX_CELLS", 1_000_000)
+
+    def run(csv: Path, out: Path) -> np.ndarray:
+        p = Pipeline(
+            str(csv),
+            "val",
+            "lon",
+            "lat",
+            str(out),
+            res=10.0,
+            cap_km=10.0,
+            workers=2,
+            skip_calibration=True,
+            out_crs=6933,
+        )
+        p.run()
+        with rasterio.open(out / "value.tif") as v:
+            assert v.width * v.height > 0
+            return v.read(1)
+
+    rng = np.random.default_rng(11)
+    small = tmp_path / "small.csv"
+    pd.DataFrame(
+        {
+            "lon": 144.9 + rng.uniform(0, 0.02, 3000),
+            "lat": -37.6 + rng.uniform(0, 0.02, 3000),
+            "val": rng.uniform(1, 100, 3000),
+        }
+    ).to_csv(small, index=False)
+    run(small, tmp_path / "out_small")  # shared path (padded ~256^2 < 1e6)
+
+    big = tmp_path / "big.csv"
+    pd.DataFrame(
+        {
+            "lon": 144.9 + rng.uniform(0, 0.6, 20000),
+            "lat": -37.6 + rng.uniform(0, 0.46, 20000),
+            "val": rng.uniform(1, 100, 20000),
+        }
+    ).to_csv(big, index=False)
+    vb_after_small = run(big, tmp_path / "out_big1")  # per-box path
+    vb_alone = run(big, tmp_path / "out_big2")  # per-box path again
+
+    assert vb_after_small.shape == vb_alone.shape
+    # A stale shared field from the small run would shrink/shift the slices
+    # and corrupt this raster; per-box must be identical in both orders.
+    assert np.array_equal(vb_after_small, vb_alone)
+    assert (vb_alone != NODATA).sum() > 1000, "expected real content, got empty raster"
