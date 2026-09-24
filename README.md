@@ -54,6 +54,8 @@ Before interpolation, the tool can:
 
 ## Install
 
+Requires Python 3.11+ (older interpreters fail the pip resolver with a bare error).
+
 ```bash
 pip install ppgrid
 ```
