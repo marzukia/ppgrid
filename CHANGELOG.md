@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+- Code hygiene (no behavior change; output rasters remain byte-identical):
+  - Renamed `ppgrid/idwgrid.py` -> `ppgrid/pipeline.py`; `ppgrid/idwgrid` is now a thin backwards-compat shim, `ppgrid.Pipeline` is exported from the package root, and the `ppgrid` console script points at `ppgrid.pipeline:main`.
+  - Extracted the nested `_reproject_band` closure to a module-level function.
+  - Magic numbers in `pipeline.py`, `calibrate.py`, `pullpush.py` promoted to named constants (CRS defaults, int16 support-band encode/decode pair, tile size, memmap band indices, CLI defaults, float32 exact-integer limit, count epsilon, unresolved-support sentinel).
+  - Worker context: `_CTX` now holds the `_WorkerConfig` dataclass object (no per-field dict copy); adding a field is one edit.
+  - Deduplicated the 3x3-block neighbourhood / window / snapped-halo-box logic into shared helpers used by the per-block, shared-field, and test paths.
+  - Dropped the unused 4th point-memmap band.
+  - CLI: `--out` now defaults to `out/` (was `examples/`, which wrote build artifacts into the docs directory); argparse validation errors tested per flag.
+  - `ruff`: removed the `global-statement` ignore (no global statements left); COM812 remains ignored (pre-existing, conflicts with the formatter).
+
 ## [0.2.1] - 2026-09-22
 - Added `--percentile-step` CLI flag: rounds output percentiles to the nearest step (e.g. `5` -> 90/95/100), clamped to 0-100. Recorded as a `percentile_step` tag on the value GeoTIFF.
 - Fixed `percentile_step` guard: `if pct_step:` -> `if pct_step is not None:` so a falsy step is handled correctly and the validation is consistent with the docstring.

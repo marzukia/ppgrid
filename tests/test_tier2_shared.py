@@ -15,8 +15,7 @@ import pytest
 import rasterio
 from rasterio.windows import Window
 
-from ppgrid.calibrate import PercentileTransform, make_transform
-from ppgrid.idwgrid import NODATA, Pipeline, _block_points, _quantize
+from ppgrid.pipeline import M_PER_KM, NODATA, PTS_TV, PTS_X, PTS_Y, Pipeline, _block_points, _quantize
 from ppgrid.pullpush import (
     _descent_banded,
     _pull_push_descent,
@@ -132,29 +131,24 @@ def _perbox_reference(p: Pipeline, bx: int, by: int) -> tuple[np.ndarray, np.nda
     hi1 = min(p.cfg.nx_padded, -(-(i1 + halo) // step) * step)
     hj1 = min(p.cfg.ny_padded, -(-(j1 + halo) // step) * step)
 
-    sel = _block_points(bx, by)
+    sel = _block_points(p.cfg, bx, by)
     if sel.shape[1] == 0:
         return None
-    ix = ((sel[0] - p.cfg.x0) // res).astype(np.int64)
-    iy = ((sel[1] - p.cfg.y0) // res).astype(np.int64)
+    ix = ((sel[PTS_X] - p.cfg.x0) // res).astype(np.int64)
+    iy = ((sel[PTS_Y] - p.cfg.y0) // res).astype(np.int64)
     m = (ix >= hi0) & (ix < hi1) & (iy >= hj0) & (iy < hj1)
     if not m.any():
         return None
-    s, c_grid = bin_points(ix[m] - hi0, iy[m] - hj0, sel[2][m], hi1 - hi0, hj1 - hj0)
+    s, c_grid = bin_points(ix[m] - hi0, iy[m] - hj0, sel[PTS_TV][m], hi1 - hi0, hj1 - hj0)
     val, sup = pull_push(s, c_grid, res, p.cfg.levels, saturation=p.cfg.sat)
-    cap_cells = round(p.cfg.cap_km * 1000.0 / res)
+    cap_cells = round(p.cfg.cap_km * M_PER_KM / res)
     near = box_count(c_grid, cap_cells) > 0
     a0, b0 = i0 - hi0, j0 - hj0
     sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
     return _quantize(
-        {
-            "scale": p.cfg.scale,
-            "pct": PercentileTransform(p.cfg.pct_quantiles),
-            "tf": make_transform(p.cfg.transform_state),
-            "pct_step": p.cfg.pct_step,
-        },
+        p.cfg,
         val[sl],
-        sup[sl] / 1000.0,
+        sup[sl] / M_PER_KM,
         near[sl],
     )
 
@@ -232,7 +226,7 @@ def test_melb10_anchor_bit_equal(tmp_path: Path) -> None:
 
 def test_perbox_after_shared_no_stale_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A per-box run after a shared run in one process must not reuse stale _CTX."""
-    import ppgrid.idwgrid as ig
+    import ppgrid.pipeline as ig
 
     # Force the per-box fallback for grid B while grid A stays on the shared
     # path, regardless of the production threshold.
