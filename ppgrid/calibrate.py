@@ -22,6 +22,14 @@ import numpy as np
 
 from .pullpush import bin_points, pad_to_pyramid, pull_push
 
+# Shared numeric constants (imported by the pipeline).
+PERCENTILE_MAX: float = 100.0  # largest output percentile (value band DN = percentile * scale)
+M_PER_KM: float = 1000.0
+# Fill cap returned by calibrate_fill_cap when no bin clears the skill bar.
+# (The pipeline's FILL_FALLBACK_CAP_KM is a different fallback: it applies
+# when there is no calibrated cap at all.)
+FILL_CAP_DEFAULT_KM: float = 25.0
+
 # ---------------------------------------------------------------- transforms
 
 
@@ -104,7 +112,7 @@ class PercentileTransform(Transform):
 
     @property
     def _p(self) -> np.ndarray:
-        return np.linspace(0.0, 100.0, self.NQ)
+        return np.linspace(0.0, PERCENTILE_MAX, self.NQ)
 
     def fwd(self, v: np.ndarray) -> np.ndarray:
         """Map values to percentiles.
@@ -273,7 +281,7 @@ def _fit_predict(
     ny = pad_to_pyramid(int(iy.max()) + 1, levels)
     s, c = bin_points(ix[train], iy[train], tv[train], nx, ny)
     val, sup = pull_push(s, c, res, levels)
-    return val[ix, iy], sup[ix, iy] / 1000.0
+    return val[ix, iy], sup[ix, iy] / M_PER_KM
 
 
 class CVDetail(dict):
@@ -318,7 +326,7 @@ def blocked_cv_skill(
 
     """
     rng = np.random.default_rng(seed)
-    block_size_m = block_km * 1000.0
+    block_size_m = block_km * M_PER_KM
     # Clamp grid resolution: full-bounding-box binning at 1 km OOMs on large
     # extents (e.g. ~40,000 km global -> ~1.6B cells). Cap the grid at 4096
     # cells per axis.
@@ -380,7 +388,7 @@ def calibrate_fill_cap(
     tv: np.ndarray,
     block_km: tuple[float, ...] = (50.0, 100.0, 200.0, 400.0),
     min_skill: float = 0.05,
-    default_km: float = 25.0,
+    default_km: float = FILL_CAP_DEFAULT_KM,
     **kw: Any,
 ) -> tuple[float, dict[float, CVCurve]]:
     """Derive the fill cap from blocked CV across several held-out block sizes.

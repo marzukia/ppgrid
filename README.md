@@ -77,7 +77,7 @@ uv sync
 ppgrid data.csv --value-col price --res 500 --cap-km 10 --skip-calibration
 ```
 
-This reads `data.csv`, interpolates the `price` column at 500m resolution with a 10km fill cap, and writes `value.tif` + `support_km.tif` to `examples/`.
+This reads `data.csv`, interpolates the `price` column at 500m resolution with a 10km fill cap, and writes `value.tif` + `support_km.tif` to `out/`.
 
 ## Usage
 
@@ -103,7 +103,7 @@ ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
 | Flag | Default | Description |
 |------|---------|-------------|
 | `input` | (required) | CSV or Parquet input path |
-| `-o, --out` | `examples/` | Output directory |
+| `-o, --out` | `out/` | Output directory |
 | `--value-col` | `value` | Value column name |
 | `--lng-col` | `longitude` | Longitude column name |
 | `--lat-col` | `latitude` | Latitude column name |
