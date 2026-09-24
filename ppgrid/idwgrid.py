@@ -32,14 +32,29 @@ from .calibrate import (
     transforms,
 )
 from .pullpush import (
+    _descent_banded,
+    _pull_push_descent,
     bin_points,
+    bin_points_banded,
     box_count,
+    box_count_banded,
+    downsample_sum,
     pull_push,
 )
 
 WORK_CRS: int = 6933  # Wagner VII — global equal-area, metres are true
 NODATA: int = -32768
 INT16_MAX: int = 32767
+
+# Shared full-grid field threshold: bin all points once, build the pyramid
+# once, run the descent once over the whole padded grid, and let every block
+# slice the result. Capped by memory (the finest s/c grids, the value/support
+# field and the near mask stay resident for the whole run).
+_SHARED_MAX_CELLS = int(2.5e9)
+
+# Below this many cells the full field fits in RAM comfortably; larger grids
+# write the finest descent level to memmap in row bands.
+_SHARED_MEMMAP_CELLS = int(1e8)
 
 # Per-worker context (module-level so it's local to each process)
 _CTX: dict[str, Any] = {}
@@ -74,6 +89,8 @@ class _WorkerConfig:
 def _block_points(bx: int, by: int) -> np.ndarray:
     """Gather points from the 3x3 block neighbourhood.
 
+    Returns views of the memmap; np.concatenate below copies once.
+
     Returns:
         Stacked point array of shape (4, n_points).
 
@@ -85,8 +102,59 @@ def _block_points(bx: int, by: int) -> np.ndarray:
             lo = c["starts"][jx * c["nby"] + jy]
             hi = c["starts"][jx * c["nby"] + jy + 1]
             if hi > lo:
-                out.append(np.asarray(c["pts"][:, lo:hi].copy()))
+                out.append(c["pts"][:, lo:hi])
     return np.concatenate(out, axis=1) if out else np.empty((4, 0))
+
+
+def _quantize(
+    c: dict[str, Any],
+    v_out: np.ndarray,
+    r_out: np.ndarray,
+    near_out: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Transform interpolated (value, support) to int16 percentile DN grids.
+
+    Shared by the per-block and shared-field paths so the rounding is
+    structurally identical.
+
+    Returns:
+        Tuple of (value, support) int16 arrays with NODATA where not near data.
+
+    """
+    # Transform: interpolate space -> raw -> percentile
+    scale = c["scale"]
+    pv = c["pct"].fwd(c["tf"].inv(v_out))
+    pct_step = c.get("pct_step")
+    if pct_step is not None:
+        # Round to the nearest step (e.g. 5 -> 90/95/100), clamp to 0-100.
+        pv = np.clip(np.round(pv / pct_step) * pct_step, 0.0, 100.0)
+    vq = np.where(near_out, np.round(pv * scale), NODATA).astype(np.int16)
+    rq = np.where(
+        near_out,
+        np.clip(np.round(np.log2(np.maximum(r_out, 1e-3)) * 8), -32000, 32000),
+        NODATA,
+    ).astype(np.int16)
+    return vq, rq
+
+
+def _block_shared(c: dict[str, Any], bx: int, by: int) -> tuple[np.ndarray, np.ndarray]:
+    """Shared-field block core: slice the prebuilt full-grid field.
+
+    Bit-identical to the per-block path: the full-grid descent differs from a
+    per-box descent only within one pyramid step of each box edge (tent-filter
+    edge rules), and the halo is a full step, so the block region is clean.
+    The 3x3 point gather is exactly the set of points inside the box
+    (enforced by Pipeline._prepare_shared).
+
+    Returns:
+        Tuple of (value, support) int16 DN grids.
+
+    """
+    bsize = c["bsize"]
+    i0, j0 = bx * bsize, by * bsize
+    i1, j1 = min(i0 + bsize, c["nx"]), min(j0 + bsize, c["ny"])
+    sl = (slice(i0, i1), slice(j0, j1))
+    return _quantize(c, c["val_full"][sl], c["sup_full"][sl] / 1000.0, c["near_full"][sl])
 
 
 def _process_block(
@@ -100,6 +168,8 @@ def _process_block(
     """
     bx, by = args
     c = _CTX
+    if c.get("shared"):
+        return bx, by, _block_shared(c, bx, by)
     res = c["res"]
     halo = c["halo"]
     bsize = c["bsize"]
@@ -140,25 +210,7 @@ def _process_block(
     a0 = i0 - hi0
     b0 = j0 - hj0
     sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
-    v_out = val[sl]
-    r_out = sup[sl] / 1000.0
-    near_out = near[sl]
-
-    # Transform: interpolate space -> raw -> percentile
-    scale = c["scale"]
-    pv = c["pct"].fwd(c["tf"].inv(v_out))
-    pct_step = c.get("pct_step")
-    if pct_step is not None:
-        # Round to the nearest step (e.g. 5 -> 90/95/100), clamp to 0-100.
-        pv = np.clip(np.round(pv / pct_step) * pct_step, 0.0, 100.0)
-    vq = np.where(near_out, np.round(pv * scale), NODATA).astype(np.int16)
-    rq = np.where(
-        near_out,
-        np.clip(np.round(np.log2(np.maximum(r_out, 1e-3)) * 8), -32000, 32000),
-        NODATA,
-    ).astype(np.int16)
-
-    return bx, by, (vq, rq)
+    return bx, by, _quantize(c, val[sl], sup[sl] / 1000.0, near[sl])
 
 
 def _block_neighbourhood_nonempty(
@@ -496,7 +548,113 @@ class Pipeline:
         self.ingest()
         self.calibrate()
         self.grid()
+        return self._write_rasters()
 
+    def _prepare_shared(self) -> bool:
+        """Prebuild the full-grid pull-push field shared by all blocks (bit-exact).
+
+        Bins every point once into the padded grid, builds the pyramid once,
+        and runs the descent once over the whole grid; each block then slices
+        the result. Bit-identical to the per-block path: the full-grid descent
+        differs from a per-box descent only within one pyramid step of each
+        box edge (tent-filter edge rules propagate 2**levels - 2 rows inward),
+        and the halo margin is a full step, so block regions are clean. The 3x3
+        point gather is exactly the set of points inside each box (checked
+        below), so the binned grids match the per-box grids exactly. The near
+        window (cap cells) is always inside the halo, so the global box count
+        matches the per-box one in block regions.
+
+        Returns False (per-block path) when the geometry or size check fails.
+
+        """
+        if self.nx_padded * self.ny_padded > _SHARED_MAX_CELLS:
+            return False
+        step = self.step
+        bsize = self.bsize
+        halo = self.halo
+        for bx in range(self.nbx):
+            for by in range(self.nby):
+                i0, j0 = bx * bsize, by * bsize
+                i1, j1 = min(i0 + bsize, self.nx), min(j0 + bsize, self.ny)
+                hi0 = max(0, ((i0 - halo) // step) * step)
+                hj0 = max(0, ((j0 - halo) // step) * step)
+                hi1 = min(self.nx_padded, -(-(i1 + halo) // step) * step)
+                hj1 = min(self.ny_padded, -(-(j1 + halo) // step) * step)
+                # Box must stay within the cells _block_points gathers (3x3).
+                if hi0 < max(0, (bx - 1) * bsize) or hi1 > min(self.nx_padded, (bx + 2) * bsize):
+                    return False
+                if hj0 < max(0, (by - 1) * bsize) or hj1 > min(self.ny_padded, (by + 2) * bsize):
+                    return False
+
+        pts = np.load(self.pts_path, mmap_mode="r")
+        ix = ((pts[0][:] - self.x0) // self.res).astype(np.int64)
+        iy = ((pts[1][:] - self.y0) // self.res).astype(np.int64)
+        cap_cells = round(self.cap_km_val * 1000.0 / self.res)
+        out_dir = Path(self.out_dir)
+        if self.nx_padded * self.ny_padded > _SHARED_MEMMAP_CELLS:
+            # Keep the finest grids off the RAM budget: memmap + row banded
+            # bin/near (bit-identical to the in-RAM pass, see pullpush).
+            shape = (self.nx_padded, self.ny_padded)
+            s0 = np.lib.format.open_memmap(out_dir / "_s0.npy", mode="w+", dtype=np.float32, shape=shape)
+            c0 = np.lib.format.open_memmap(out_dir / "_c0.npy", mode="w+", dtype=np.float32, shape=shape)
+            bin_points_banded(s0, c0, ix, iy, pts[2][:], self.ny_padded)
+            near_full = np.lib.format.open_memmap(out_dir / "_near.npy", mode="w+", dtype=bool, shape=shape)
+            box_count_banded(c0, cap_cells, near_full)
+        else:
+            s0, c0 = bin_points(ix, iy, pts[2][:], self.nx_padded, self.ny_padded)
+            near_full = box_count(c0, cap_cells) > 0
+
+        sums: list[np.ndarray] = [s0]
+        for _ in range(self.levels):
+            sums.append(downsample_sum(sums[-1]))
+        counts: list[np.ndarray] = [c0]
+        for _ in range(self.levels):
+            counts.append(downsample_sum(counts[-1]))
+
+        if self.nx_padded * self.ny_padded <= _SHARED_MEMMAP_CELLS:
+            val_full, sup_full = _pull_push_descent(sums, counts, self.res, self.levels, saturation=self.cfg.sat)
+        else:
+            # Full descent to level 2 (small arrays), then band levels 2 -> 1
+            # -> 0 through memmap to bound RAM on multi-billion-cell grids.
+            val2, sup2 = _pull_push_descent(
+                sums, counts, self.res, self.levels, saturation=self.cfg.sat, stop_level=2, free_levels=True
+            )
+            val_full = np.lib.format.open_memmap(
+                Path(self.out_dir) / "_val_full.npy", mode="w+", dtype=np.float32, shape=s0.shape
+            )
+            sup_full = np.lib.format.open_memmap(
+                Path(self.out_dir) / "_sup_full.npy", mode="w+", dtype=np.float32, shape=s0.shape
+            )
+            _descent_banded(
+                sums,
+                counts,
+                self.res,
+                self.cfg.sat,
+                start_level=2,
+                val_in=val2,
+                sup_in=sup2,
+                out_val=val_full,
+                out_sup=sup_full,
+                level_dir=Path(self.out_dir),
+            )
+            for k in (0, 1, 2):
+                sums[k] = None  # type: ignore[assignment]
+                counts[k] = None  # type: ignore[assignment]
+            val2 = sup2 = None  # type: ignore[assignment]
+            s0 = c0 = None  # type: ignore[assignment]
+
+        _CTX["val_full"] = val_full
+        _CTX["sup_full"] = sup_full
+        _CTX["near_full"] = near_full
+        return True
+
+    def _write_rasters(self) -> tuple[str, str]:
+        """Write block outputs to GeoTIFFs (post-ingest/calibrate/grid).
+
+        Returns:
+            Tuple of value and support GeoTIFF file paths.
+
+        """
         # Raster profile
         xform = from_origin(self.x0, self.y0 + self.ny * self.res, self.res, self.res)
         common = {
@@ -571,6 +729,8 @@ class Pipeline:
                         "pct_step": self.cfg.pct_step,
                     },
                 )
+                if self._prepare_shared():
+                    _CTX["shared"] = True
                 with ThreadPoolExecutor(max_workers=self.workers) as ex:
                     for bx, by, out in ex.map(_process_block, self.tasks):
                         i0, j0 = bx * self.bsize, by * self.bsize
@@ -589,6 +749,16 @@ class Pipeline:
 
         try:
             self.pts_path.unlink()
+            for fname in (
+                "_val_full.npy",
+                "_sup_full.npy",
+                "_val_lvl1.npy",
+                "_sup_lvl1.npy",
+                "_s0.npy",
+                "_c0.npy",
+                "_near.npy",
+            ):
+                (Path(self.out_dir) / fname).unlink(missing_ok=True)
 
             if self.out_crs != self.work_crs:
                 tmp_v = Path(self.out_dir) / "_value_tmp.tif"

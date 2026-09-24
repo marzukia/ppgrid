@@ -93,6 +93,19 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
+# bench/*.py are local perf/repro harnesses (not shipped); relax style rules.
+"bench/*.py" = [
+    "INP001",     # implicit namespace package (script dir)
+    "D",          # docstring rules (harness scripts)
+    "ANN",        # type annotations (monkey-patched signatures)
+    "T201",       # print (harness output)
+    "SLF001",     # private member access (harness wraps internals)
+    "PLW0127",    # unnecessary assign
+    "PLW0603",    # global statement
+    "C408",       # unnecessary collection call
+    "ERA001",     # commented-out code
+    "RUF100",     # unused noqa
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
