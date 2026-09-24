@@ -21,6 +21,14 @@ from pathlib import Path
 
 import numpy as np
 
+# float32 is exact for integers up to 2**24; beyond that, box counts can no
+# longer be represented and the float32 fast path must fall back to int64.
+_FLOAT32_EXACT_LIMIT = 1 << 24
+# Float tolerance for "count > 0" comparisons (a mass below this is noise).
+_COUNT_EPS = 1e-9
+# Sentinel support (metres) for "no data anywhere in the pyramid ancestry".
+_UNRESOLVED_M = 1e9
+
 
 def downsample_sum(a: np.ndarray) -> np.ndarray:
     """2x2 block sum. Sums (not means) so s and c stay consistent.
@@ -118,7 +126,7 @@ def box_count(counts: np.ndarray, radius: int) -> np.ndarray:
     """
     if radius == 0:
         return counts.astype(np.int64)
-    if counts.sum() < (1 << 24):
+    if counts.sum() < _FLOAT32_EXACT_LIMIT:
         n0, n1 = counts.shape
         c = counts.astype(np.float32, copy=False)
         # Exclusive row prefix: p[i, j] = sum(c[i, :j]), one cumsum + one copy
@@ -156,7 +164,7 @@ def box_count_banded(counts: np.ndarray, radius: int, out: np.ndarray, band_rows
     if radius == 0:
         out[:] = counts > 0
         return
-    if counts.sum() >= (1 << 24):
+    if counts.sum() >= _FLOAT32_EXACT_LIMIT:
         out[:] = _box_count_int64(counts, radius) > 0
         return
     small_cols = n1 <= 2 * radius
@@ -201,7 +209,7 @@ def _pull_push_descent(
     levels: int,
     upsample: Callable[[np.ndarray], np.ndarray] = upsample_bilinear,
     saturation: float = 1.0,
-    unresolved_m: float = 1e9,
+    unresolved_m: float = _UNRESOLVED_M,
     stop_level: int = 0,
     *,
     free_levels: bool = False,
@@ -229,7 +237,7 @@ def _pull_push_descent(
 
     """
     # Seed at the coarsest level
-    val = sums[-1] / np.maximum(counts[-1], 1e-9)
+    val = sums[-1] / np.maximum(counts[-1], _COUNT_EPS)
     sup = np.where(
         counts[-1] > 0,
         np.float32(res * (1 << levels)),
@@ -242,7 +250,7 @@ def _pull_push_descent(
     for k in range(levels - 1, stop_level - 1, -1):
         c = counts[k]
         a = np.minimum(c / saturation, 1.0).astype(np.float32)
-        local = sums[k] / np.maximum(c, 1e-9)
+        local = sums[k] / np.maximum(c, _COUNT_EPS)
         parent = upsample(val)
         val = np.where(a >= 1.0, local, a * local + (1.0 - a) * parent)
         sup = a * np.float32(res * (1 << k)) + (1.0 - a) * upsample(sup)
@@ -297,7 +305,7 @@ def _descent_banded(
             e1 = min(val.shape[0], r1 // 2 + 1)
             p0 = 2 * e0
             a = np.minimum(counts[k][r0:r1] / saturation, 1.0).astype(np.float32)
-            local = sums[k][r0:r1] / np.maximum(counts[k][r0:r1], 1e-9)
+            local = sums[k][r0:r1] / np.maximum(counts[k][r0:r1], _COUNT_EPS)
             pv = upsample_bilinear(val[e0:e1])[r0 - p0 : r1 - p0]
             ps = upsample_bilinear(sup[e0:e1])[r0 - p0 : r1 - p0]
             out[r0:r1] = np.where(a >= 1.0, local, a * local + (1.0 - a) * pv)
@@ -313,7 +321,7 @@ def pull_push(
     levels: int,
     upsample: Callable[[np.ndarray], np.ndarray] = upsample_bilinear,
     saturation: float = 1.0,
-    unresolved_m: float = 1e9,
+    unresolved_m: float = _UNRESOLVED_M,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pull-push mipmap interpolation.
 
