@@ -92,11 +92,23 @@ class PercentileTransform(Transform):
     def fit(self, v: np.ndarray) -> PercentileTransform:
         """Fit quantiles from data.
 
+        Flat input (all values equal, or a single point) is degenerate: the
+        usual staircase has q[0] == the constant, so fwd left-clamps the
+        constant to percentile 0 (issue #24). Map the constant to the 50th
+        percentile instead, on a staircase wide enough that float32
+        interpolation noise around the constant still decodes to ~50.
+
         Returns:
             self.
 
         """
-        q = np.quantile(v.astype(np.float64), np.linspace(0, 1, self.NQ))
+        v = v.astype(np.float64)
+        if v.size > 0 and float(v.max() - v.min()) == 0.0:
+            c = float(v[0])
+            sp = max(np.spacing(abs(c) + 1.0), abs(c) * 1e-5)
+            self.q = c + (np.arange(self.NQ) - self.NQ // 2) * sp
+            return self
+        q = np.quantile(v, np.linspace(0, 1, self.NQ))
         self.q = np.maximum.accumulate(q)
         eps = np.arange(self.NQ) * np.spacing(np.abs(self.q).max() + 1.0)
         self.q += eps
@@ -341,6 +353,15 @@ def blocked_cv_skill(
 
     ok = np.isfinite(preds) & np.isfinite(sups)
     pred, act, sup = preds[ok], tv[ok], sups[ok]
+    if act.size == 0:
+        # No valid predictions (e.g. the data extent is smaller than one CV
+        # block, so every fold is empty): skill is undefined. Report 0
+        # rather than NaN and the "Mean of empty slice" warnings (issue #14).
+        return 0.0, []
+    if float(act.max() - act.min()) == 0.0:
+        # Zero-variance target (constant values): 1 - RMSE/RMSE_baseline
+        # divides by zero. Report 0 rather than -inf/NaN (issue #14).
+        return 0.0, []
     base = float(np.mean(act))
 
     rows: list[CVDetail] = []

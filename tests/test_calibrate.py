@@ -1,10 +1,13 @@
 """Tests for ppgrid.calibrate."""
 
+import warnings
+
 import numpy as np
 import pytest
 
 from ppgrid.calibrate import (
     PercentileTransform,
+    blocked_cv_skill,
     choose_transform,
     make_transform,
     transforms,
@@ -92,3 +95,42 @@ def test_blocked_cv_skill_clamps_grid_resolution(monkeypatch: pytest.MonkeyPatch
     expected = max(1000.0, max(float(np.ptp(x)), float(np.ptp(y))) / 4096.0)
     np.testing.assert_allclose(seen, expected)
     assert min(seen) > 1000.0, f"grid resolution not clamped: {seen[:3]}"
+
+
+def test_percentile_transform_flat_input_maps_to_50() -> None:
+    """#24: flat input must not map to percentile 0; decodes back to the constant."""
+    for v in (np.full(100, 42.0), np.array([7.5]), np.full(3, 0.0)):
+        t = PercentileTransform().fit(v)
+        assert np.all(np.diff(t.q) > 0), "quantile staircase must be strictly increasing"
+        p = t.fwd(v)
+        assert not np.all(p == 0.0), "flat input maps to 0 everywhere"
+        np.testing.assert_allclose(p, 50.0, atol=1e-6)
+        np.testing.assert_allclose(t.inv(p), v, rtol=1e-12, atol=1e-9)
+
+
+def test_blocked_cv_skill_empty_folds_returns_zero() -> None:
+    """#14: extent < CV block size -> empty folds -> (0.0, []) without warnings."""
+    rng = np.random.default_rng(0)
+    n = 50
+    x = rng.uniform(0.0, 1000.0, n)
+    y = rng.uniform(0.0, 1000.0, n)
+    tv = rng.normal(0.0, 1.0, n)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        overall, rows = blocked_cv_skill(x, y, tv, block_km=100.0)
+    assert overall == 0.0
+    assert rows == []
+
+
+def test_blocked_cv_skill_zero_variance_returns_zero() -> None:
+    """#14: constant target -> skill undefined -> (0.0, []) without divide-by-zero."""
+    rng = np.random.default_rng(0)
+    n = 200
+    x = rng.uniform(0.0, 2.0e5, n)
+    y = rng.uniform(0.0, 2.0e5, n)
+    tv = np.full(n, 3.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        overall, rows = blocked_cv_skill(x, y, tv, block_km=100.0)
+    assert overall == 0.0
+    assert rows == []

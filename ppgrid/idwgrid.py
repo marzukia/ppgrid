@@ -9,16 +9,19 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import numpy as np
 import pandas as pd
 import rasterio
 from pyproj import Transformer
+from pyproj.exceptions import CRSError
 from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
@@ -62,6 +65,87 @@ _SHARED_MEMMAP_CELLS = int(1e8)
 
 # Per-worker context (module-level so it's local to each process)
 _CTX: dict[str, Any] = {}
+
+# Temp files created in the output dir by a run; all removed on success
+# and on the failure path (issue #15).
+_RUN_TEMP_FILES = (
+    "_points.npy",
+    "_s0.npy",
+    "_c0.npy",
+    "_near.npy",
+    "_val_full.npy",
+    "_sup_full.npy",
+    "_val_lvl1.npy",
+    "_sup_lvl1.npy",
+)
+
+
+def _open_fresh_memmap(path: Path, dtype: type | np.dtype[Any], shape: tuple[int, ...]) -> np.memmap:
+    """Create `path` as a fresh 0600 regular file and open it for memmap write.
+
+    unlink-then-O_CREAT|O_EXCL: a pre-planted symlink at `path` is replaced,
+    never followed (its target is not overwritten). Mode 0600: the temps
+    hold raw coordinates + values, so they should not be world-readable.
+    """
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+
+
+def _die(msg: str) -> NoReturn:
+    """Print a clean CLI error (no traceback) and exit 1.
+
+    Raises:
+        SystemExit: Always, with exit code 1.
+
+    """
+    print(f"error: {msg}", file=sys.stderr)  # ruff: ignore[print]
+    raise SystemExit(1)
+
+
+def _pos_float(text: str) -> float:
+    """Argparse type: a finite, strictly positive float (issue #13).
+
+    Rejects nan/inf/negative/zero/non-numeric at parse time so the
+    Pipeline's float64 math and int16 DN range can never see them.
+
+    Args:
+        text: Raw CLI argument string.
+
+    Returns:
+        The parsed value, strictly > 0 and finite.
+
+    Raises:
+        argparse.ArgumentTypeError: If text is not a finite positive number.
+
+    """
+    try:
+        v = float(text)
+    except ValueError as exc:
+        msg = f"invalid number: {text!r}"
+        raise argparse.ArgumentTypeError(msg) from exc
+    if not math.isfinite(v) or v <= 0:
+        msg = f"must be a finite positive number: {text!r}"
+        raise argparse.ArgumentTypeError(msg)
+    return v
+
+
+def _cap_km_arg(text: str) -> float | str:
+    """Argparse type: 'auto' or a finite positive float in km (issue #13).
+
+    Delegates to _pos_float for the numeric case.
+
+    Args:
+        text: Raw CLI argument string.
+
+    Returns:
+        'auto' unchanged, else the parsed positive cap.
+
+    """
+    if text == "auto":
+        return "auto"
+    return _pos_float(text)
 
 
 @dataclass
@@ -373,9 +457,20 @@ class Pipeline:
 
         If the requested transform is invalid for the data (e.g. log10 with
         negative values), a warning is issued and identity is used instead.
+
+        Raises:
+            ValueError: If calib_path is set but the file does not exist.
+
         """
         cal: dict[str, Any] | None = None
+        cal_fresh = False
         cpath_obj = Path(self.calib_path) if self.calib_path else None
+        if cpath_obj and not cpath_obj.exists():
+            # A named cal file is a request to reuse it. A missing path is a
+            # user error (issue #21), not a chance to silently recalibrate
+            # and create the file.
+            msg = f"--calibration file not found: {cpath_obj} (run without --calibration to create one)"
+            raise ValueError(msg)
         if cpath_obj and cpath_obj.exists():
             with cpath_obj.open(encoding="utf-8") as f:
                 cal = json.load(f)
@@ -406,10 +501,9 @@ class Pipeline:
                     str(k): {"overall_skill": d["overall_skill"], "cap_km": d.get("cap_km")} for k, d in detail.items()
                 },
             }
-            Path(self.out_dir).mkdir(parents=True, exist_ok=True)
-            cal_path = cpath_obj or Path(self.out_dir) / "calibration.json"
-            with cal_path.open("w", encoding="utf-8") as f:
-                json.dump(cal, f, indent=2)
+            # The file is written below, after the forced-transform override
+            # is final (issues #23, #14).
+            cal_fresh = True
         else:
             cal = {
                 "transform": "identity",
@@ -440,6 +534,19 @@ class Pipeline:
         # (a forced transform can differ from the calibration's choice).
         if cal is not None:
             cal["transform_state"] = self.tf.state()
+
+        # Write the cal file only after the transform above is final
+        # (issue #23): the file must record the transform actually used,
+        # else reloading it with --transform auto silently changes output.
+        # allow_nan=False: a NaN that slips through is a loud error, not
+        # silent non-strict JSON (issue #14).
+        if cal_fresh:
+            assert cal is not None  # set in the fresh branch above
+            cal["transform"] = self.tname
+            Path(self.out_dir).mkdir(parents=True, exist_ok=True)
+            cal_path = cpath_obj or Path(self.out_dir) / "calibration.json"
+            with cal_path.open("w", encoding="utf-8") as f:
+                json.dump(cal, f, indent=2, allow_nan=False)
 
         self.pct_q = (
             PercentileTransform(cal["percentile_quantiles"])
@@ -492,7 +599,7 @@ class Pipeline:
 
         # Memmap for workers
         self.pts_path = Path(self.out_dir) / "_points.npy"
-        pts = np.lib.format.open_memmap(self.pts_path, mode="w+", dtype=np.float64, shape=(4, self.n))
+        pts = _open_fresh_memmap(self.pts_path, np.float64, (4, self.n))
         pts[0] = self.x[order]
         pts[1] = self.y[order]
         pts[2] = self.tv[order]
@@ -599,10 +706,10 @@ class Pipeline:
             # Keep the finest grids off the RAM budget: memmap + row banded
             # bin/near (bit-identical to the in-RAM pass, see pullpush).
             shape = (self.nx_padded, self.ny_padded)
-            s0 = np.lib.format.open_memmap(out_dir / "_s0.npy", mode="w+", dtype=np.float32, shape=shape)
-            c0 = np.lib.format.open_memmap(out_dir / "_c0.npy", mode="w+", dtype=np.float32, shape=shape)
+            s0 = _open_fresh_memmap(out_dir / "_s0.npy", np.float32, shape)
+            c0 = _open_fresh_memmap(out_dir / "_c0.npy", np.float32, shape)
             bin_points_banded(s0, c0, ix, iy, pts[2][:], self.ny_padded)
-            near_full = np.lib.format.open_memmap(out_dir / "_near.npy", mode="w+", dtype=bool, shape=shape)
+            near_full = _open_fresh_memmap(out_dir / "_near.npy", np.bool_, shape)
             box_count_banded(c0, cap_cells, near_full)
         else:
             s0, c0 = bin_points(ix, iy, pts[2][:], self.nx_padded, self.ny_padded)
@@ -627,12 +734,8 @@ class Pipeline:
             val2, sup2 = _pull_push_descent(
                 sums, counts, self.res, self.levels, saturation=self.cfg.sat, stop_level=lvl2, free_levels=True
             )
-            val_full = np.lib.format.open_memmap(
-                Path(self.out_dir) / "_val_full.npy", mode="w+", dtype=np.float32, shape=s0.shape
-            )
-            sup_full = np.lib.format.open_memmap(
-                Path(self.out_dir) / "_sup_full.npy", mode="w+", dtype=np.float32, shape=s0.shape
-            )
+            val_full = _open_fresh_memmap(Path(self.out_dir) / "_val_full.npy", np.float32, s0.shape)
+            sup_full = _open_fresh_memmap(Path(self.out_dir) / "_sup_full.npy", np.float32, s0.shape)
             _descent_banded(
                 sums,
                 counts,
@@ -655,6 +758,11 @@ class Pipeline:
         _CTX["sup_full"] = sup_full
         _CTX["near_full"] = near_full
         return True
+
+    def _remove_run_temps(self) -> None:
+        """Remove every temp file this run created in out_dir (best effort)."""
+        for fname in _RUN_TEMP_FILES:
+            (Path(self.out_dir) / fname).unlink(missing_ok=True)
 
     def _write_rasters(self) -> tuple[str, str]:
         """Write block outputs to GeoTIFFs (post-ingest/calibrate/grid).
@@ -684,163 +792,158 @@ class Pipeline:
         vpath = Path(self.out_dir) / "value.tif"
         spath = Path(self.out_dir) / "support_km.tif"
 
-        with (
-            rasterio.open(vpath, "w", **vprof) as vd,
-            rasterio.open(spath, "w", **sprof) as sd,
-        ):
-            vd.update_tags(
-                transform=self.tname,
-                cap_km=str(self.cap_km_val),
-                res_m=str(self.res),
-                scale=str(self.scale),
-                units="percentile",
-                decode=f"percentile = DN/{self.scale:g}",
-            )
-            if self.percentile_step is not None:
-                vd.update_tags(percentile_step=str(self.percentile_step))
-            vd.scales = (1.0 / self.scale,)
-            sd.update_tags(decode="support_km = 2**(DN/8)")
-
-            # Write empty blocks as nodata
-            for bx, by in self.empty_blocks:
-                i0, j0 = bx * self.bsize, by * self.bsize
-                i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
-                w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
-                blank = np.full((w.height, w.width), NODATA, np.int16)
-                vd.write(blank, 1, window=w)
-                sd.write(blank, 1, window=w)
-
-            # Process blocks with parallel workers
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
-                _CTX.clear()  # drop stale state from any previous run in this process
-                _CTX.update(
-                    {
-                        "pts": np.load(self.cfg.pts_path, mmap_mode="r"),
-                        "tf": make_transform(self.cfg.transform_state),
-                        "pct": PercentileTransform(self.cfg.pct_quantiles),
-                        "starts": self.cfg.starts,
-                        "nbx": self.cfg.nbx,
-                        "nby": self.cfg.nby,
-                        "bsize": self.cfg.bsize,
-                        "halo": self.cfg.halo,
-                        "res": self.cfg.res,
-                        "levels": self.cfg.levels,
-                        "cap_km": self.cfg.cap_km,
-                        "x0": self.cfg.x0,
-                        "y0": self.cfg.y0,
-                        "nx": self.cfg.nx,
-                        "ny": self.cfg.ny,
-                        "nx_padded": self.cfg.nx_padded,
-                        "ny_padded": self.cfg.ny_padded,
-                        "sat": self.cfg.sat,
-                        "scale": self.cfg.scale,
-                        "pct_step": self.cfg.pct_step,
-                    },
-                )
-                if self._prepare_shared():
-                    _CTX["shared"] = True
-                with ThreadPoolExecutor(max_workers=self.workers) as ex:
-                    for bx, by, out in ex.map(_process_block, self.tasks):
-                        i0, j0 = bx * self.bsize, by * self.bsize
-                        i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
-                        w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
-
-                        if out is None:
-                            blank = np.full((w.height, w.width), NODATA, np.int16)
-                            vd.write(blank, 1, window=w)
-                            sd.write(blank, 1, window=w)
-                            continue
-
-                        vq, rq = out
-                        vd.write(vq.T[::-1, :], 1, window=w)
-                        sd.write(rq.T[::-1, :], 1, window=w)
-
         try:
-            self.pts_path.unlink()
-            for fname in (
-                "_val_full.npy",
-                "_sup_full.npy",
-                "_val_lvl1.npy",
-                "_sup_lvl1.npy",
-                "_s0.npy",
-                "_c0.npy",
-                "_near.npy",
+            with (
+                rasterio.open(vpath, "w", **vprof) as vd,
+                rasterio.open(spath, "w", **sprof) as sd,
             ):
-                (Path(self.out_dir) / fname).unlink(missing_ok=True)
+                vd.update_tags(
+                    transform=self.tname,
+                    cap_km=str(self.cap_km_val),
+                    res_m=str(self.res),
+                    scale=str(self.scale),
+                    units="percentile",
+                    decode=f"percentile = DN/{self.scale:g}",
+                )
+                if self.percentile_step is not None:
+                    vd.update_tags(percentile_step=str(self.percentile_step))
+                vd.scales = (1.0 / self.scale,)
+                sd.update_tags(decode="support_km = 2**(DN/8)")
 
-            if self.out_crs != self.work_crs:
-                tmp_v = Path(self.out_dir) / "_value_tmp.tif"
-                tmp_s = Path(self.out_dir) / "_support_tmp.tif"
-                vpath.rename(tmp_v)
-                spath.rename(tmp_s)
-                try:
+                # Write empty blocks as nodata
+                for bx, by in self.empty_blocks:
+                    i0, j0 = bx * self.bsize, by * self.bsize
+                    i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
+                    w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
+                    blank = np.full((w.height, w.width), NODATA, np.int16)
+                    vd.write(blank, 1, window=w)
+                    sd.write(blank, 1, window=w)
 
-                    def _reproject_band(
-                        src_path: str,
-                        dst_path: str,
-                        profile: dict[str, Any],
-                        dst_crs: str,
-                    ) -> None:
-                        with rasterio.open(src_path) as src:
-                            dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
-                                src.crs,
-                                dst_crs,
-                                src.width,
-                                src.height,
-                                *src.bounds,
-                            )
-                            dst_profile = dict(
-                                profile,
-                                width=dst_width,
-                                height=dst_height,
-                                transform=dst_transform,
-                                crs=dst_crs,
-                            )
-                            with rasterio.open(dst_path, "w", **dst_profile) as dst:
-                                dst.update_tags(**src.tags())
-                                if hasattr(src, "scales") and src.scales:
-                                    dst.scales = src.scales
-                                if hasattr(src, "offsets") and src.offsets:
-                                    dst.offsets = src.offsets
-                                from rasterio.transform import from_bounds
+                # Process blocks with parallel workers
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
+                    _CTX.clear()  # drop stale state from any previous run in this process
+                    _CTX.update(
+                        {
+                            "pts": np.load(self.cfg.pts_path, mmap_mode="r"),
+                            "tf": make_transform(self.cfg.transform_state),
+                            "pct": PercentileTransform(self.cfg.pct_quantiles),
+                            "starts": self.cfg.starts,
+                            "nbx": self.cfg.nbx,
+                            "nby": self.cfg.nby,
+                            "bsize": self.cfg.bsize,
+                            "halo": self.cfg.halo,
+                            "res": self.cfg.res,
+                            "levels": self.cfg.levels,
+                            "cap_km": self.cfg.cap_km,
+                            "x0": self.cfg.x0,
+                            "y0": self.cfg.y0,
+                            "nx": self.cfg.nx,
+                            "ny": self.cfg.ny,
+                            "nx_padded": self.cfg.nx_padded,
+                            "ny_padded": self.cfg.ny_padded,
+                            "sat": self.cfg.sat,
+                            "scale": self.cfg.scale,
+                            "pct_step": self.cfg.pct_step,
+                        },
+                    )
+                    if self._prepare_shared():
+                        _CTX["shared"] = True
+                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                        for bx, by, out in ex.map(_process_block, self.tasks):
+                            i0, j0 = bx * self.bsize, by * self.bsize
+                            i1, j1 = min(i0 + self.bsize, self.nx), min(j0 + self.bsize, self.ny)
+                            w = Window(i0, self.ny - j1, i1 - i0, j1 - j0)
 
-                                tile = 512
-                                for j in range(0, dst_height, tile):
-                                    for i in range(0, dst_width, tile):
-                                        w_h = min(tile, dst_height - j)
-                                        w_w = min(tile, dst_width - i)
-                                        dst_w = rasterio.windows.Window(i, j, w_w, w_h)
-                                        # Compute local transform for this window
-                                        w_bounds = rasterio.windows.bounds(dst_w, dst_transform)
-                                        local_dst_transform = from_bounds(*w_bounds, w_w, w_h)
-                                        dst_arr = np.zeros((w_h, w_w), dtype=np.int16)
-                                        reproject(
-                                            rasterio.band(src, 1),
-                                            dst_arr,
-                                            src_transform=src.transform,
-                                            dst_transform=local_dst_transform,
-                                            dst_crs=dst_crs,
-                                            resampling=Resampling.nearest,
-                                            nodata=NODATA,
-                                        )
-                                        dst.write(dst_arr, 1, window=dst_w)
+                            if out is None:
+                                blank = np.full((w.height, w.width), NODATA, np.int16)
+                                vd.write(blank, 1, window=w)
+                                sd.write(blank, 1, window=w)
+                                continue
 
-                    _reproject_band(str(tmp_v), str(vpath), vprof, f"EPSG:{self.out_crs}")
-                    _reproject_band(str(tmp_s), str(spath), sprof, f"EPSG:{self.out_crs}")
-                except Exception:
-                    if tmp_v.exists():
-                        tmp_v.rename(vpath)
-                    if tmp_s.exists():
-                        tmp_s.rename(spath)
-                    raise
-                if tmp_v.exists():
-                    tmp_v.unlink()
-                if tmp_s.exists():
-                    tmp_s.unlink()
+                            vq, rq = out
+                            vd.write(vq.T[::-1, :], 1, window=w)
+                            sd.write(rq.T[::-1, :], 1, window=w)
+        except BaseException:
+            # Mid-run failure (worker error, OOM, disk full): the rasters on
+            # disk are partial. Warn so nobody consumes them (issue #15).
+            print(  # ruff: ignore[print]
+                f"warning: run failed; output rasters are partial: {vpath}, {spath}",
+                file=sys.stderr,
+            )
+            raise
         finally:
-            if self.pts_path.exists():
-                self.pts_path.unlink()
+            self._remove_run_temps()
+
+        if self.out_crs != self.work_crs:
+            tmp_v = Path(self.out_dir) / "_value_tmp.tif"
+            tmp_s = Path(self.out_dir) / "_support_tmp.tif"
+            vpath.rename(tmp_v)
+            spath.rename(tmp_s)
+            try:
+
+                def _reproject_band(
+                    src_path: str,
+                    dst_path: str,
+                    profile: dict[str, Any],
+                    dst_crs: str,
+                ) -> None:
+                    with rasterio.open(src_path) as src:
+                        dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
+                            src.crs,
+                            dst_crs,
+                            src.width,
+                            src.height,
+                            *src.bounds,
+                        )
+                        dst_profile = dict(
+                            profile,
+                            width=dst_width,
+                            height=dst_height,
+                            transform=dst_transform,
+                            crs=dst_crs,
+                        )
+                        with rasterio.open(dst_path, "w", **dst_profile) as dst:
+                            dst.update_tags(**src.tags())
+                            if hasattr(src, "scales") and src.scales:
+                                dst.scales = src.scales
+                            if hasattr(src, "offsets") and src.offsets:
+                                dst.offsets = src.offsets
+                            from rasterio.transform import from_bounds
+
+                            tile = 512
+                            for j in range(0, dst_height, tile):
+                                for i in range(0, dst_width, tile):
+                                    w_h = min(tile, dst_height - j)
+                                    w_w = min(tile, dst_width - i)
+                                    dst_w = rasterio.windows.Window(i, j, w_w, w_h)
+                                    # Compute local transform for this window
+                                    w_bounds = rasterio.windows.bounds(dst_w, dst_transform)
+                                    local_dst_transform = from_bounds(*w_bounds, w_w, w_h)
+                                    dst_arr = np.zeros((w_h, w_w), dtype=np.int16)
+                                    reproject(
+                                        rasterio.band(src, 1),
+                                        dst_arr,
+                                        src_transform=src.transform,
+                                        dst_transform=local_dst_transform,
+                                        dst_crs=dst_crs,
+                                        resampling=Resampling.nearest,
+                                        nodata=NODATA,
+                                    )
+                                    dst.write(dst_arr, 1, window=dst_w)
+
+                _reproject_band(str(tmp_v), str(vpath), vprof, f"EPSG:{self.out_crs}")
+                _reproject_band(str(tmp_s), str(spath), sprof, f"EPSG:{self.out_crs}")
+            except Exception:
+                if tmp_v.exists():
+                    tmp_v.rename(vpath)
+                if tmp_s.exists():
+                    tmp_s.rename(spath)
+                raise
+            if tmp_v.exists():
+                tmp_v.unlink()
+            if tmp_s.exists():
+                tmp_s.unlink()
 
         return str(vpath), str(spath)
 
@@ -879,8 +982,8 @@ def main() -> None:
     parser.add_argument("--value-col", default="value", help="Value column name")
     parser.add_argument("--lng-col", default="longitude", help="Longitude column name")
     parser.add_argument("--lat-col", default="latitude", help="Latitude column name")
-    parser.add_argument("--res", type=float, default=500.0, help="Cell size in metres")
-    parser.add_argument("--cap-km", default="auto", help="Fill cap km, or 'auto'")
+    parser.add_argument("--res", type=_pos_float, default=500.0, help="Cell size in metres")
+    parser.add_argument("--cap-km", type=_cap_km_arg, default="auto", help="Fill cap km, or 'auto'")
     parser.add_argument(
         "--transform",
         default="auto",
@@ -888,16 +991,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--saturation",
-        type=float,
+        type=_pos_float,
         default=1.0,
         help="Counts for a cell to fully self-trust",
     )
     parser.add_argument("--block", type=int, default=2048, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers")
-    parser.add_argument("--scale", type=float, default=100.0, help="DN = percentile * scale")
+    parser.add_argument("--scale", type=_pos_float, default=100.0, help="DN = percentile * scale")
     parser.add_argument(
         "--percentile-step",
-        type=float,
+        type=_pos_float,
         default=None,
         help="Round output percentiles to the nearest step (e.g. 5 -> 90/95/100). Default: no rounding",
     )
@@ -922,30 +1025,57 @@ def main() -> None:
         parser.error("--percentile-step must be in (0, 100]")
     if args.block < 1:
         parser.error("--block must be at least 1")
+    if args.calib_max_points < 1:
+        parser.error("--calib-max-points must be at least 1")
+    for flag, val in ("--src-crs", args.src_crs), ("--work-crs", args.work_crs), ("--out-crs", args.out_crs):
+        if val <= 0:
+            parser.error(f"{flag} must be a positive EPSG code")
 
-    Path(args.out).mkdir(parents=True, exist_ok=True)
-    run(
-        args.input,
-        args.value_col,
-        args.lng_col,
-        args.lat_col,
-        args.out,
-        res=args.res,
-        cap_km=args.cap_km,
-        transform=args.transform,
-        saturation=args.saturation,
-        block_size=args.block,
-        workers=args.workers,
-        calib_path=args.calibration,
-        scale=args.scale,
-        percentile_step=args.percentile_step,
-        compress=args.compress,
-        calib_max_points=args.calib_max_points,
-        src_crs=args.src_crs,
-        work_crs=args.work_crs,
-        out_crs=args.out_crs,
-        skip_calibration=args.skip_calibration,
-    )
+    out = Path(args.out)
+    if out.exists() and not out.is_dir():
+        _die(f"output path is a file, expected a directory: {args.out}")
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError) as e:
+        _die(f"cannot create output directory {args.out}: {e}")
+
+    try:
+        run(
+            args.input,
+            args.value_col,
+            args.lng_col,
+            args.lat_col,
+            args.out,
+            res=args.res,
+            cap_km=args.cap_km,
+            transform=args.transform,
+            saturation=args.saturation,
+            block_size=args.block,
+            workers=args.workers,
+            calib_path=args.calibration,
+            scale=args.scale,
+            percentile_step=args.percentile_step,
+            compress=args.compress,
+            calib_max_points=args.calib_max_points,
+            src_crs=args.src_crs,
+            work_crs=args.work_crs,
+            out_crs=args.out_crs,
+            skip_calibration=args.skip_calibration,
+        )
+    except ImportError as e:
+        _die(str(e))
+    except FileNotFoundError as e:
+        _die(f"input file not found: {e.filename or args.input}")
+    except (KeyError, ValueError) as e:
+        if isinstance(e, KeyError) and e.args:
+            _die(str(e.args[0]))
+        _die(str(e))
+    except CRSError as e:
+        _die(str(e))
+    except NotADirectoryError as e:
+        _die(str(e))
+    except pd.errors.ParserError as e:
+        _die(f"malformed input file: {e}")
 
 
 if __name__ == "__main__":
