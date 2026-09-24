@@ -12,7 +12,7 @@ not downstream calculation).
 
 - Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.pipeline:main`; `ppgrid.idwgrid` is a back-compat shim).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
-- Tests: `uv run pytest` (51 tests). Lint/format: `ruff` (line-length 120).
+- Tests: `uv run pytest` (53 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
