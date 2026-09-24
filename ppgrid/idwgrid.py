@@ -620,8 +620,12 @@ class Pipeline:
         else:
             # Full descent to level 2 (small arrays), then band levels 2 -> 1
             # -> 0 through memmap to bound RAM on multi-billion-cell grids.
+            # levels == 1 (cap_km*1000/res <= 2) has no level 2: stop/start the
+            # descent at level 1 instead, else the banded k=1 step blends a
+            # level-1 local with a level-2 upsample and broadcast-crashes.
+            lvl2 = min(2, self.levels)
             val2, sup2 = _pull_push_descent(
-                sums, counts, self.res, self.levels, saturation=self.cfg.sat, stop_level=2, free_levels=True
+                sums, counts, self.res, self.levels, saturation=self.cfg.sat, stop_level=lvl2, free_levels=True
             )
             val_full = np.lib.format.open_memmap(
                 Path(self.out_dir) / "_val_full.npy", mode="w+", dtype=np.float32, shape=s0.shape
@@ -634,14 +638,14 @@ class Pipeline:
                 counts,
                 self.res,
                 self.cfg.sat,
-                start_level=2,
+                start_level=lvl2,
                 val_in=val2,
                 sup_in=sup2,
                 out_val=val_full,
                 out_sup=sup_full,
                 level_dir=Path(self.out_dir),
             )
-            for k in (0, 1, 2):
+            for k in range(min(3, self.levels + 1)):
                 sums[k] = None  # type: ignore[assignment]
                 counts[k] = None  # type: ignore[assignment]
             val2 = sup2 = None  # type: ignore[assignment]
