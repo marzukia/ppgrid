@@ -1,6 +1,6 @@
 [project]
 name = "ppgrid"
-version = "0.2.1"
+version = "0.2.2"
 description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes. No GPU required."
 readme = "README.md"
 license = "MIT"
@@ -108,6 +108,19 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.hatch.build]
+# Keep the sdist slim: generated rasters/images are committed for GitHub
+# (the README references them via absolute raw URLs) but do not ship in the
+# package. Regenerate locally with examples/run_melb.py. data/all_equakes.csv
+# (8.3 MB, public-domain sample) is excluded; data/melb_houses.csv (384 KB) ships.
+exclude = [
+    "data/all_equakes.csv",
+    "examples/*.jpg",
+    "examples/*.png",
+    "examples/equakes/**",
+    "examples/melb/**",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["ppgrid"]
