@@ -120,6 +120,7 @@ exclude = [
     "examples/*.png",
     "examples/equakes/**",
     "examples/melb/**",
+    "tests/fixtures/**",
 ]
 
 [tool.hatch.build.targets.wheel]
