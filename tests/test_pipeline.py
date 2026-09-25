@@ -1,6 +1,7 @@
 """Tests for ppgrid.pipeline."""
 
 import json
+import math
 import sys
 import warnings
 from pathlib import Path
@@ -11,7 +12,8 @@ import pandas as pd
 import pytest
 import rasterio
 
-from ppgrid.pipeline import Pipeline
+from ppgrid.calibrate import PercentileTransform
+from ppgrid.pipeline import NODATA, WORK_CRS, Pipeline
 
 
 def _write_neg_values_csv(tmp_path: Path, n: int = 20) -> str:
@@ -367,12 +369,26 @@ def test_saturation_zero_rejected(tmp_path: Path) -> None:
     [
         (["--res", "0"], "res"),
         (["--res", "-4"], "res"),
+        (["--res", "nan"], "res"),
+        (["--res", "inf"], "res"),
         (["--workers", "0"], "workers"),
         (["--scale", "0"], "scale"),
+        (["--scale", "nan"], "scale"),
+        (["--scale", "inf"], "scale"),
         (["--saturation", "0"], "saturation"),
+        (["--saturation", "nan"], "saturation"),
+        (["--cap-km", "-5"], "cap-km"),
+        (["--cap-km", "nan"], "cap-km"),
+        (["--cap-km", "inf"], "cap-km"),
         (["--percentile-step", "0"], "percentile-step"),
         (["--percentile-step", "150"], "percentile-step"),
+        (["--percentile-step", "nan"], "percentile-step"),
         (["--block", "0"], "block"),
+        (["--calib-max-points", "0"], "calib-max-points"),
+        (["--calib-max-points", "-1"], "calib-max-points"),
+        (["--src-crs", "0"], "src-crs"),
+        (["--work-crs", "-1"], "work-crs"),
+        (["--out-crs", "0"], "out-crs"),
     ],
 )
 def test_cli_arg_validation(
@@ -384,6 +400,11 @@ def test_cli_arg_validation(
     """argparse-level validation: each bad flag exits 2 with its name on stderr.
 
     This is where the tier-1 #2 bugs hid (CLI validation gaps).
+
+    #13 adds the numeric float guards: nan/inf/zero/negative must be rejected
+    at parse time, not produce a silently wrong raster (all-0 from
+    --scale nan, inverted SAT window from --cap-km -5, OverflowError from
+    --cap-km inf, all-NODATA from --calib-max-points 0).
     """
     from ppgrid.pipeline import main
 
@@ -421,3 +442,442 @@ def test_explicit_cap_skips_cv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     p.ingest()
     p.calibrate()
     assert p.cap_km_val == 10.0
+
+
+# ---------------------------------------------------------------------------
+# Issue #13: numeric flags reject nan/inf at parse time
+# ---------------------------------------------------------------------------
+
+
+def test_scale_nan_does_not_exit_zero(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#13: --scale nan must not run to exit 0 and emit an all-zero raster."""
+    from ppgrid.pipeline import main
+
+    csv = _write_pos_values_csv(tmp_path)
+    old_argv = sys.argv
+    sys.argv = ["ppgrid", str(csv), "-o", str(tmp_path / "out"), "--scale", "nan"]
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main()
+    finally:
+        sys.argv = old_argv
+    assert exc.value.code == 2
+    assert "scale" in capsys.readouterr().err
+    assert not (tmp_path / "out" / "value.tif").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #14: strict RFC-8259 calibration.json on degenerate data
+# ---------------------------------------------------------------------------
+
+
+def _strict_json(text: str) -> Any:
+    """json.loads that fails on NaN/Infinity (non-strict RFC-8259)."""
+
+    def boom(name: str) -> Any:
+        msg = f"non-strict JSON constant in calibration.json: {name}"
+        raise AssertionError(msg)
+
+    return json.loads(text, parse_constant=boom)
+
+
+def _write_constant_csv(tmp_path: Path, n: int, spread_deg: float, value: float = 42.0) -> Path:
+    """Constant-value CSV over a controlled extent (degrees around Melbourne)."""
+    rng = np.random.default_rng(11)
+    df = pd.DataFrame(
+        {
+            "value": np.full(n, value),
+            "longitude": 144.96 + rng.uniform(-spread_deg / 2, spread_deg / 2, n),
+            "latitude": -37.81 + rng.uniform(-spread_deg / 2, spread_deg / 2, n),
+        }
+    )
+    p = tmp_path / "const.csv"
+    df.to_csv(p, index=False)
+    return p
+
+
+@pytest.mark.parametrize(
+    ("spread_deg", "case_id"),
+    [(0.6, "zero-variance-predictions"), (0.002, "empty-folds")],
+)
+def test_constant_value_cal_file_is_strict_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], spread_deg: float, case_id: str
+) -> None:
+    """#14: constant values (zero variance) must not produce -inf/NaN in calibration.json.
+
+    No 'Mean of empty slice' warnings, whether or not the CV folds yield any
+    predictions (extent vs 50km CV block).
+    """
+    del case_id
+    csv = _write_constant_csv(tmp_path, n=200, spread_deg=spread_deg)
+    out = tmp_path / "out"
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out),
+        res=1000.0,
+        cap_km="auto",
+        workers=2,
+        out_crs=WORK_CRS,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        p.run()
+    cal_path = out / "calibration.json"
+    assert cal_path.exists()
+    cal = _strict_json(cal_path.read_text(encoding="utf-8"))
+    for entry in cal["cv"].values():
+        assert math.isfinite(entry["overall_skill"])
+    assert "Mean of empty slice" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Issue #15: temp cleanup on mid-run failure + 0600 + no symlink follow
+# ---------------------------------------------------------------------------
+
+
+def test_midrun_worker_failure_cleans_temps_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#15: a mid-run worker error must warn about partial rasters.
+
+    Every temp file is removed (the write loop is wrapped in try/finally).
+    """
+    import ppgrid.pipeline as ig
+
+    csv = _write_pos_values_csv(tmp_path)
+    out = tmp_path / "out"
+    observed: dict[str, int] = {}
+
+    def boom(_task: tuple[int, int]) -> None:
+        pts = out / "_points.npy"
+        if pts.exists():
+            observed["mode"] = pts.stat().st_mode & 0o777
+        msg = "simulated worker OOM"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(ig, "_process_block", boom)
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out),
+        res=500.0,
+        cap_km=2.0,
+        workers=2,
+        skip_calibration=True,
+        out_crs=WORK_CRS,
+    )
+    with pytest.raises(RuntimeError, match="simulated worker OOM"):
+        p.run()
+    err = capsys.readouterr().err
+    assert "partial" in err
+    for fname in ig._RUN_TEMP_FILES:  # ruff: ignore[private-member-access]
+        assert not (out / fname).exists(), f"temp left behind: {fname}"
+    assert (out / "value.tif").exists()  # partial rasters are left, with a warning
+    assert (out / "support_km.tif").exists()
+    assert observed.get("mode") == 0o600, f"temp was {oct(observed.get('mode'))}, expected 0600"
+
+
+def test_preplanted_symlink_not_followed(tmp_path: Path) -> None:
+    """#15: a pre-planted _points.npy symlink is replaced, never followed.
+
+    The symlink target must not be overwritten.
+    """
+    csv = _write_pos_values_csv(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    victim = tmp_path / "victim.dat"
+    victim.write_text("precious")
+    (out / "_points.npy").symlink_to(victim)
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out),
+        res=500.0,
+        cap_km=2.0,
+        workers=1,
+        skip_calibration=True,
+        out_crs=WORK_CRS,
+    )
+    p.run()
+    assert victim.read_text() == "precious"
+    assert not (out / "_points.npy").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #16: clean 'error: <msg>' + non-zero exit, no traceback
+# ---------------------------------------------------------------------------
+
+
+def _run_cli(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str]:
+    """Run ppgrid main() with sys.argv; return (exit code, stderr)."""
+    from ppgrid.pipeline import main
+
+    old_argv = sys.argv
+    sys.argv = ["ppgrid", *args]
+    try:
+        try:
+            main()
+            code = 0
+        except SystemExit as e:
+            code = int(e.code) if e.code is not None else 1
+    finally:
+        sys.argv = old_argv
+    return code, capsys.readouterr().err
+
+
+def _assert_clean_error(code: int, err: str, needle: str) -> None:
+    assert code in (1, 2), f"exit code {code}, expected non-zero"
+    assert err.startswith("error: "), f"stderr must start with 'error: ', got: {err!r}"
+    assert needle in err
+    assert "Traceback" not in err
+
+
+def test_cli_missing_file_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16: a missing input file is a clean error, not a traceback."""
+    code, err = _run_cli(capsys, str(tmp_path / "nope.csv"), "-o", str(tmp_path / "out"))
+    _assert_clean_error(code, err, "nope.csv")
+
+
+def test_cli_missing_column_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16: a missing column is a clean error."""
+    csv = tmp_path / "nocol.csv"
+    csv.write_text("value,longitude\n1.0,144.0\n2.0,145.0\n")
+    code, err = _run_cli(capsys, str(csv), "-o", str(tmp_path / "out"))
+    _assert_clean_error(code, err, "latitude")
+
+
+def test_cli_bad_crs_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16: an invalid --src-crs is a clean error."""
+    csv = _write_pos_values_csv(tmp_path)
+    code, err = _run_cli(capsys, str(csv), "-o", str(tmp_path / "out"), "--src-crs", "999999")
+    _assert_clean_error(code, err, "999999")
+
+
+def test_cli_o_is_file_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16: -o pointing at a file is a clean error."""
+    csv = _write_pos_values_csv(tmp_path)
+    f = tmp_path / "notadir"
+    f.write_text("x")
+    code, err = _run_cli(capsys, str(csv), "-o", str(f))
+    _assert_clean_error(code, err, "notadir")
+
+
+def test_cli_non_numeric_cell_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16: a non-numeric cell is a clean error."""
+    csv = tmp_path / "badcell.csv"
+    csv.write_text("value,longitude,latitude\n1.0,144.0,-37.0\nabc,145.0,-38.0\n")
+    code, err = _run_cli(capsys, str(csv), "-o", str(tmp_path / "out"))
+    _assert_clean_error(code, err, "abc")
+
+
+def test_cli_malformed_csv_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16: a malformed CSV is a clean error."""
+    csv = tmp_path / "ragged.csv"
+    csv.write_text('value,longitude,latitude\n"1.0,144.0",145.0,-38.0\n"unterminated,145.0,-38.0\n')
+    code, err = _run_cli(capsys, str(csv), "-o", str(tmp_path / "out"))
+    _assert_clean_error(code, err, "malformed input file")
+
+
+# ---------------------------------------------------------------------------
+# Issue #21: --calibration <missing> is a user error, not a fresh create
+# ---------------------------------------------------------------------------
+
+
+def test_calibration_missing_file_errors_creates_nothing(tmp_path: Path) -> None:
+    """#21: an absent --calibration path is a clean error; nothing is created."""
+    csv = _write_pos_values_csv(tmp_path)
+    missing = tmp_path / "nope.json"
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(tmp_path / "out"),
+        res=500.0,
+        cap_km=2.0,
+        workers=1,
+        calib_path=str(missing),
+        out_crs=WORK_CRS,
+    )
+    p.ingest()
+    with pytest.raises(ValueError, match="--calibration file not found"):
+        p.calibrate()
+    assert not missing.exists()
+    assert not (tmp_path / "out" / "calibration.json").exists()
+
+
+def test_cli_calibration_missing_file_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#21: an absent --calibration path via CLI is a clean error."""
+    csv = _write_pos_values_csv(tmp_path)
+    code, err = _run_cli(capsys, str(csv), "-o", str(tmp_path / "out"), "--calibration", str(tmp_path / "nope.json"))
+    _assert_clean_error(code, err, "--calibration file not found")
+    assert not (tmp_path / "nope.json").exists()
+    assert not (tmp_path / "out" / "calibration.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #23: forced transform recorded in cal file; auto path byte-identical
+# ---------------------------------------------------------------------------
+
+ANCHOR = Path(__file__).parent / "fixtures" / "auto_anchor"
+
+
+def test_auto_path_byte_identical_to_af13522_anchor(tmp_path: Path) -> None:
+    """#23: the auto (non-forced) path must stay byte-identical to af13522.
+
+    The cal file write moved after transform resolution; its content must not
+    have changed. Anchor was generated with the af13522 code.
+    """
+    out = tmp_path / "out"
+    p = Pipeline(str(ANCHOR / "input.csv"), "val", "lon", "lat", str(out), res=500.0, workers=1)
+    p.run()
+    for name in ("value.tif", "support_km.tif", "calibration.json"):
+        assert (out / name).read_bytes() == (ANCHOR / name).read_bytes(), f"{name} differs from af13522 anchor"
+
+
+def _skewed_csv(path: Path, n: int = 500) -> Path:
+    """Deterministic right-skewed dataset (same distribution as the anchor)."""
+    rng = np.random.default_rng(7)
+    df = pd.DataFrame(
+        {
+            "value": 10.0 + rng.lognormal(0.0, 1.5, n),
+            "longitude": 144.6 + rng.uniform(-0.25, 0.25, n),
+            "latitude": -37.7 + rng.uniform(-0.25, 0.25, n),
+        }
+    )
+    df.to_csv(path, index=False)
+    return path
+
+
+def test_forced_transform_recorded_in_cal_file_and_reload_stable(tmp_path: Path) -> None:
+    """#23: a forced --transform must be what calibration.json records.
+
+    Not the auto choice; a later --transform auto run reloading that file must
+    reproduce the forced output bit-identically.
+    """
+    csv = _skewed_csv(tmp_path / "in.csv")
+    out_forced = tmp_path / "forced"
+    p1 = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out_forced),
+        res=500.0,
+        cap_km=5.0,
+        workers=1,
+        transform="percentile",
+        out_crs=WORK_CRS,
+    )
+    p1.run()
+    cal = json.loads((out_forced / "calibration.json").read_text(encoding="utf-8"))
+    # Auto picked a different transform on this data, so the file content
+    # proves the forced override is what got recorded.
+    top_auto = max(cal["transform_scores"], key=cal["transform_scores"].get)
+    assert top_auto != "percentile", "test data must make auto != percentile"
+    assert cal["transform"] == "percentile"
+    assert cal["transform_state"]["name"] == "percentile"
+
+    out_reload = tmp_path / "reload"
+    p2 = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out_reload),
+        res=500.0,
+        cap_km=5.0,
+        workers=1,
+        transform="auto",
+        calib_path=str(out_forced / "calibration.json"),
+        out_crs=WORK_CRS,
+    )
+    p2.run()
+    for name in ("value.tif", "support_km.tif"):
+        assert (out_reload / name).read_bytes() == (out_forced / name).read_bytes(), f"{name} differs after cal reload"
+
+
+# ---------------------------------------------------------------------------
+# Issue #24: constant data must not quantize to 0
+# ---------------------------------------------------------------------------
+
+
+def _decode(pct: PercentileTransform, dn: np.ndarray) -> np.ndarray:
+    """Decode int16 percentile DNs (default scale 100) back to raw values."""
+    pv = dn.astype(np.float64) / 100.0
+    return np.interp(pv, pct._p, pct.q)  # ruff: ignore[private-member-access]
+
+
+def test_constant_csv_single_percentile_dn(tmp_path: Path) -> None:
+    """#24: a constant value column must not collapse the value surface to 0.
+
+    The pull-push mipmap blends empty cells toward its coarse (zero) ancestors,
+    so the interpolated value field on constant input is 42*w with 0<w<=1
+    (point cells: w=1). The flat percentile staircase must be centred on the
+    constant: data cells sit at exactly the 50th percentile (DN 5000), and
+    decoding the surface back through the cal LUT lands in (0, 42].
+    """
+    csv = _write_constant_csv(tmp_path, n=40, spread_deg=0.4, value=42.0)
+    out = tmp_path / "out"
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out),
+        res=1000.0,
+        cap_km=5.0,
+        workers=1,
+        skip_calibration=True,
+        out_crs=WORK_CRS,
+    )
+    vpath, _ = p.run()
+    with rasterio.open(vpath) as ds:
+        arr = ds.read(1).astype(np.int32)
+        valid = arr[arr != NODATA]
+    assert len(valid) > 0
+    assert valid.max() == 5000, f"data cells must sit at exactly DN 5000, got max {valid.max()}"
+    assert valid.min() > 0, f"surface collapsed toward percentile 0: min DN {valid.min()}"
+    dec = _decode(p.pct_q, valid)
+    assert np.isfinite(dec).all()
+    assert dec.min() > 0.0
+    assert abs(dec.max() - 42.0) < 0.5, f"data cells must decode to the constant, got {dec.max()}"
+
+
+def test_constant_csv_negative_value(tmp_path: Path) -> None:
+    """#24: same for a negative constant.
+
+    The auto transform falls back to identity; the surface must still be
+    centred on the 50th percentile, never zero-quantized.
+    """
+    csv = _write_constant_csv(tmp_path, n=40, spread_deg=0.4, value=-3.5)
+    out = tmp_path / "out"
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out),
+        res=1000.0,
+        cap_km=5.0,
+        workers=1,
+        out_crs=WORK_CRS,
+    )
+    vpath, _ = p.run()
+    with rasterio.open(vpath) as ds:
+        arr = ds.read(1).astype(np.int32)
+        valid = arr[arr != NODATA]
+    assert len(valid) > 0
+    assert valid.min() == 5000, f"data cells must sit at exactly DN 5000, got min {valid.min()}"
+    assert (valid >= 5000).all()
+    dec = _decode(p.pct_q, valid)
+    assert np.isfinite(dec).all()
+    assert dec.max() < 0.0, f"negative constant must decode negative, got max {dec.max()}"
+    assert abs(dec.min() + 3.5) < 0.5, f"data cells must decode to the constant, got {dec.min()}"
