@@ -1,10 +1,13 @@
 """Tests for ppgrid.calibrate."""
 
+import warnings
+
 import numpy as np
 import pytest
 
 from ppgrid.calibrate import (
     PercentileTransform,
+    blocked_cv_skill,
     choose_transform,
     make_transform,
     transforms,
@@ -92,3 +95,44 @@ def test_blocked_cv_skill_clamps_grid_resolution(monkeypatch: pytest.MonkeyPatch
     expected = max(1000.0, max(float(np.ptp(x)), float(np.ptp(y))) / 4096.0)
     np.testing.assert_allclose(seen, expected)
     assert min(seen) > 1000.0, f"grid resolution not clamped: {seen[:3]}"
+
+
+def test_percentile_flat_input_maps_to_50th_percentile() -> None:
+    """#24: a constant column is degenerate for the staircase (q[0] == c, so fwd left-clamps to 0).
+
+    It must map to the 50th percentile and round-trip.
+    """
+    for c in (42.0, 0.0, -3.5, 1e9):
+        t = PercentileTransform().fit(np.full(100, c))
+        p = t.fwd(np.array([c]))
+        np.testing.assert_allclose(p, [50.0], atol=1e-9)
+        v = t.inv(p)
+        np.testing.assert_allclose(v, [c], rtol=1e-12, atol=1e-9)
+
+
+def test_percentile_single_point_maps_to_50th_percentile() -> None:
+    """#24: a one-point dataset is flat too."""
+    t = PercentileTransform().fit(np.array([7.0]))
+    p = t.fwd(np.array([7.0]))
+    np.testing.assert_allclose(p, [50.0], atol=1e-9)
+    np.testing.assert_allclose(t.inv(p), [7.0], rtol=1e-12, atol=1e-9)
+
+
+def test_blocked_cv_skill_degenerate_targets() -> None:
+    """#14: empty folds and zero-variance targets report 0, not NaN/-inf.
+
+    No RuntimeWarnings are emitted.
+    """
+    y = np.zeros(6)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        # Zero-variance target with valid predictions (multi-block extent).
+        x = np.array([0.0, 10000.0, 20000.0, 60000.0, 70000.0, 80000.0])
+        skill, rows = blocked_cv_skill(x, y, np.full(6, 42.0), block_km=50.0, res=1000.0)
+        assert skill == 0.0
+        assert rows == []
+        # Extent smaller than one CV block: every fold is skipped -> empty act.
+        x2 = np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0])
+        skill2, rows2 = blocked_cv_skill(x2, y, np.full(6, 42.0), block_km=50.0, res=1000.0)
+        assert skill2 == 0.0
+        assert rows2 == []
