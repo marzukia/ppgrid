@@ -9,17 +9,19 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import numpy as np
 import pandas as pd
 import rasterio
 from pyproj import Transformer
+from pyproj.exceptions import CRSError
 from rasterio.transform import from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
@@ -103,6 +105,20 @@ _SHARED_MAX_CELLS = int(2.5e8)
 # write the finest descent level to memmap in row bands.
 _SHARED_MEMMAP_CELLS = int(1e8)
 
+# Temp files created in the output dir by a run; all removed on success and
+# on the failure path (issue #15). _val_lvl*.npy / _sup_lvl*.npy are written
+# by pullpush._descent_banded on the banded path.
+_RUN_TEMP_FILES = (
+    "_points.npy",
+    "_s0.npy",
+    "_c0.npy",
+    "_near.npy",
+    "_val_full.npy",
+    "_sup_full.npy",
+    "_val_lvl1.npy",
+    "_sup_lvl1.npy",
+)
+
 
 @dataclass
 class _WorkerConfig:
@@ -150,6 +166,90 @@ class _WorkerConfig:
 # ThreadPoolExecutor, one object — not local to each process). Holds the
 # _WorkerConfig as-is under "cfg"; workers read attributes off it.
 _CTX: dict[str, Any] = {}
+
+
+def _die(msg: str) -> NoReturn:
+    """Print a clean CLI error (no traceback) and exit 1.
+
+    Args:
+        msg: Error message, printed as 'error: <msg>'.
+
+    Raises:
+        SystemExit: Always, with status code 1.
+
+    """
+    print(f"error: {msg}", file=sys.stderr)  # ruff: ignore[print]
+    raise SystemExit(1)
+
+
+def _pos_float(text: str) -> float:
+    """Argparse type: a finite, strictly positive float (issue #13).
+
+    Rejects nan/inf/negative/zero/non-numeric at parse time so the
+    float64 pipeline math and the int16 DN range can never see them
+    (silent all-0 rasters, inverted SAT windows, deep OverflowErrors).
+
+    Args:
+        text: Raw CLI argument string.
+
+    Returns:
+        The parsed value, finite and > 0.
+
+    Raises:
+        argparse.ArgumentTypeError: If text is not a finite positive number.
+
+    """
+    try:
+        v = float(text)
+    except ValueError as exc:
+        msg = f"invalid number: {text!r}"
+        raise argparse.ArgumentTypeError(msg) from exc
+    if not math.isfinite(v) or v <= 0:
+        msg = f"must be a finite positive number: {text!r}"
+        raise argparse.ArgumentTypeError(msg) from None
+    return v
+
+
+def _cap_km_arg(text: str) -> float | str:
+    """Argparse type: 'auto' or a finite positive fill cap in km (issue #13).
+
+    Args:
+        text: Raw CLI argument string.
+
+    Returns:
+        'auto' unchanged, else the parsed finite positive cap.
+
+    """
+    if text == "auto":
+        return "auto"
+    return _pos_float(text)
+
+
+def _open_fresh_memmap(
+    path: Path,
+    dtype: type | np.dtype[Any],
+    shape: tuple[int, ...],
+) -> np.memmap:
+    """Create `path` as a fresh 0600 regular file, then open it for memmap write.
+
+    The path is unlinked first so a pre-planted symlink is replaced, never
+    followed (its target must not be overwritten); O_EXCL guards the race
+    (issue #15). Mode 0600: temps hold raw coordinates + values and should
+    not be world-readable (the default 0644 leaked them).
+
+    Args:
+        path: Destination path in the output dir.
+        dtype: Memmap element type.
+        shape: Memmap shape.
+
+    Returns:
+        Writable memmap over the fresh file.
+
+    """
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
 
 
 def _neighbour_block_ids(bx: int, by: int, nbx: int, nby: int) -> list[int]:
@@ -535,11 +635,19 @@ class Pipeline:
 
         Raises:
             ValueError: If an explicit --transform cannot be applied to the data.
+            ValueError: If calib_path is set but the file does not exist.
 
         """
         cal: dict[str, Any] | None = None
+        cal_fresh = False
         cpath_obj = Path(self.calib_path) if self.calib_path else None
-        if cpath_obj and cpath_obj.exists():
+        if cpath_obj is not None and not cpath_obj.exists():
+            # A named cal file is a request to reuse it. A missing path is a
+            # user error (issue #21), not a chance to silently recalibrate
+            # and create the file.
+            msg = f"--calibration file not found: {cpath_obj} (run without --calibration to create one)"
+            raise ValueError(msg)
+        if cpath_obj is not None:
             with cpath_obj.open(encoding="utf-8") as f:
                 cal = json.load(f)
         elif not self.skip_calibration:
@@ -569,10 +677,9 @@ class Pipeline:
                     str(k): {"overall_skill": d["overall_skill"], "cap_km": d.get("cap_km")} for k, d in detail.items()
                 },
             }
-            Path(self.out_dir).mkdir(parents=True, exist_ok=True)
-            cal_path = cpath_obj or Path(self.out_dir) / "calibration.json"
-            with cal_path.open("w", encoding="utf-8") as f:
-                json.dump(cal, f, indent=2)
+            # The file is written below, after the forced-transform override
+            # is final (issue #23).
+            cal_fresh = True
         else:
             cal = {
                 "transform": "identity",
@@ -614,6 +721,17 @@ class Pipeline:
             cal["transform"] = self.tname
             cal["transform_state"] = self.tf.state()
 
+        # Write the cal file only after the transform above is final
+        # (issue #23): the file must record the transform actually used, else
+        # a later --transform auto run reloading it would silently change the
+        # output. allow_nan=False: a NaN that slips through is a loud error,
+        # not silent non-strict JSON (issue #14).
+        if cal_fresh and cal is not None:
+            Path(self.out_dir).mkdir(parents=True, exist_ok=True)
+            cal_path = cpath_obj or Path(self.out_dir) / "calibration.json"
+            with cal_path.open("w", encoding="utf-8") as f:
+                json.dump(cal, f, indent=2, allow_nan=False)
+
         self.pct_q = (
             PercentileTransform(cal["percentile_quantiles"])
             if cal and "percentile_quantiles" in cal
@@ -641,9 +759,13 @@ class Pipeline:
         self.nx = int((self.x.max() - self.x0) // self.res) + 1
         self.ny = int((self.y.max() - self.y0) // self.res) + 1
 
-        self.levels = max(1, math.ceil(math.log2(max(self.cap_km_val * M_PER_KM / self.res, 2.0))))
+        cap_cells = self.cap_km_val * M_PER_KM / self.res
+        if not math.isfinite(cap_cells):
+            msg = f"cap_km/res is not finite (cap_km={self.cap_km_val} km, res={self.res} m)"
+            raise ValueError(msg)
+        self.levels = max(1, math.ceil(math.log2(max(cap_cells, 2.0))))
         self.step = 1 << self.levels
-        self.halo = max(math.ceil(self.cap_km_val * M_PER_KM / self.res) + 2, self.step)
+        self.halo = max(math.ceil(cap_cells) + 2, self.step)
         self.nx_padded = -(-self.nx // self.step) * self.step
         self.ny_padded = -(-self.ny // self.step) * self.step
         self.bsize = max(self.block_size, self.step)
@@ -665,9 +787,10 @@ class Pipeline:
         order = np.argsort(bid, kind="stable")
         self.starts = np.searchsorted(bid[order], np.arange(self.nbx * self.nby + 1))
 
-        # Memmap for workers (bands PTS_X/PTS_Y/PTS_TV — see constants above)
+        # Memmap for workers (bands PTS_X/PTS_Y/PTS_TV — see constants above).
+        # Fresh 0600 file, never follows a pre-planted symlink (issue #15).
         self.pts_path = Path(self.out_dir) / "_points.npy"
-        pts = np.lib.format.open_memmap(self.pts_path, mode="w+", dtype=np.float64, shape=(PTS_NBANDS, self.n))
+        pts = _open_fresh_memmap(self.pts_path, np.float64, (PTS_NBANDS, self.n))
         pts[PTS_X] = self.x[order]
         pts[PTS_Y] = self.y[order]
         pts[PTS_TV] = self.tv[order]
@@ -724,8 +847,19 @@ class Pipeline:
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
         self.ingest()
         self.calibrate()
-        self.grid()
-        return self._write_rasters()
+        try:
+            self.grid()
+            return self._write_rasters()
+        finally:
+            # Temp cleanup on every path: grid failure, mid-run worker error,
+            # OOM, disk full — _points.npy + partial TIFF temps are removed
+            # (issue #15).
+            self._remove_run_temps()
+
+    def _remove_run_temps(self) -> None:
+        """Remove every run temp file in out_dir (idempotent, best effort)."""
+        for fname in _RUN_TEMP_FILES:
+            (Path(self.out_dir) / fname).unlink(missing_ok=True)
 
     def _prepare_shared(self) -> bool:
         """Prebuild the full-grid pull-push field shared by all blocks (bit-exact).
@@ -768,10 +902,10 @@ class Pipeline:
             # Keep the finest grids off the RAM budget: memmap + row banded
             # bin/near (bit-identical to the in-RAM pass, see pullpush).
             shape = (self.nx_padded, self.ny_padded)
-            s0 = np.lib.format.open_memmap(out_dir / "_s0.npy", mode="w+", dtype=np.float32, shape=shape)
-            c0 = np.lib.format.open_memmap(out_dir / "_c0.npy", mode="w+", dtype=np.float32, shape=shape)
+            s0 = _open_fresh_memmap(out_dir / "_s0.npy", np.float32, shape)
+            c0 = _open_fresh_memmap(out_dir / "_c0.npy", np.float32, shape)
             bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
-            near_full = np.lib.format.open_memmap(out_dir / "_near.npy", mode="w+", dtype=bool, shape=shape)
+            near_full = _open_fresh_memmap(out_dir / "_near.npy", bool, shape)
             box_count_banded(c0, cap_cells, near_full)
         else:
             s0, c0 = bin_points(ix, iy, pts[PTS_TV][:], self.nx_padded, self.ny_padded)
@@ -796,12 +930,8 @@ class Pipeline:
             val2, sup2 = _pull_push_descent(
                 sums, counts, self.res, self.levels, saturation=self.cfg.sat, stop_level=lvl2, free_levels=True
             )
-            val_full = np.lib.format.open_memmap(
-                Path(self.out_dir) / "_val_full.npy", mode="w+", dtype=np.float32, shape=s0.shape
-            )
-            sup_full = np.lib.format.open_memmap(
-                Path(self.out_dir) / "_sup_full.npy", mode="w+", dtype=np.float32, shape=s0.shape
-            )
+            val_full = _open_fresh_memmap(Path(self.out_dir) / "_val_full.npy", np.float32, s0.shape)
+            sup_full = _open_fresh_memmap(Path(self.out_dir) / "_sup_full.npy", np.float32, s0.shape)
             _descent_banded(
                 sums,
                 counts,
@@ -853,105 +983,105 @@ class Pipeline:
         vpath = Path(self.out_dir) / "value.tif"
         spath = Path(self.out_dir) / "support_km.tif"
 
-        with (
-            rasterio.open(vpath, "w", **vprof) as vd,
-            rasterio.open(spath, "w", **sprof) as sd,
-        ):
-            vd.update_tags(
-                transform=self.tname,
-                cap_km=str(self.cap_km_val),
-                res_m=str(self.res),
-                scale=str(self.scale),
-                units="percentile",
-                decode=f"percentile = DN/{self.scale:g}",
-            )
-            if self.percentile_step is not None:
-                vd.update_tags(percentile_step=str(self.percentile_step))
-            vd.scales = (1.0 / self.scale,)
-            sd.update_tags(decode=f"support_km = 2**(DN/{SUPPORT_LOG2_SCALE})")
-
-            # Write empty blocks as nodata
-            for bx, by in self.empty_blocks:
-                w = _block_window(bx, by, self.cfg)
-                blank = np.full((w.height, w.width), NODATA, np.int16)
-                vd.write(blank, 1, window=w)
-                sd.write(blank, 1, window=w)
-
-            # Process blocks with parallel workers
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
-                # One shared config object for all worker threads (no
-                # per-field dict copy). Rebuilt fresh each run: stale state
-                # from a previous run in this process is dropped.
-                _CTX.clear()
-                cfg = self.cfg
-                cfg.pts = np.load(cfg.pts_path, mmap_mode="r")
-                cfg.tf = make_transform(cfg.transform_state)
-                cfg.pct = PercentileTransform(cfg.pct_quantiles)
-                _CTX["cfg"] = cfg
-                if self._prepare_shared():
-                    cfg.shared = True
-                with ThreadPoolExecutor(max_workers=self.workers) as ex:
-                    for bx, by, out in ex.map(_process_block, self.tasks):
-                        w = _block_window(bx, by, self.cfg)
-
-                        if out is None:
-                            blank = np.full((w.height, w.width), NODATA, np.int16)
-                            vd.write(blank, 1, window=w)
-                            sd.write(blank, 1, window=w)
-                            continue
-
-                        vq, rq = out
-                        vd.write(vq.T[::-1, :], 1, window=w)
-                        sd.write(rq.T[::-1, :], 1, window=w)
-
+        partial = False
         try:
-            self.pts_path.unlink()
-            for fname in (
-                "_val_full.npy",
-                "_sup_full.npy",
-                "_val_lvl1.npy",
-                "_sup_lvl1.npy",
-                "_s0.npy",
-                "_c0.npy",
-                "_near.npy",
+            with (
+                rasterio.open(vpath, "w", **vprof) as vd,
+                rasterio.open(spath, "w", **sprof) as sd,
             ):
-                (Path(self.out_dir) / fname).unlink(missing_ok=True)
+                vd.update_tags(
+                    transform=self.tname,
+                    cap_km=str(self.cap_km_val),
+                    res_m=str(self.res),
+                    scale=str(self.scale),
+                    units="percentile",
+                    decode=f"percentile = DN/{self.scale:g}",
+                )
+                if self.percentile_step is not None:
+                    vd.update_tags(percentile_step=str(self.percentile_step))
+                vd.scales = (1.0 / self.scale,)
+                sd.update_tags(decode=f"support_km = 2**(DN/{SUPPORT_LOG2_SCALE})")
 
-            if self.out_crs != self.work_crs:
-                tmp_v = Path(self.out_dir) / "_value_tmp.tif"
-                tmp_s = Path(self.out_dir) / "_support_tmp.tif"
-                vpath.rename(tmp_v)
-                spath.rename(tmp_s)
-                try:
-                    # Both bands share the same work-CRS source grid (identical
-                    # bounds/size), so the output grid is identical too: compute
-                    # the default transform once instead of per band.
-                    with rasterio.open(tmp_v) as grid_src:
-                        dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
-                            grid_src.crs,
-                            f"EPSG:{self.out_crs}",
-                            grid_src.width,
-                            grid_src.height,
-                            *grid_src.bounds,
-                        )
+                # Write empty blocks as nodata
+                for bx, by in self.empty_blocks:
+                    w = _block_window(bx, by, self.cfg)
+                    blank = np.full((w.height, w.width), NODATA, np.int16)
+                    vd.write(blank, 1, window=w)
+                    sd.write(blank, 1, window=w)
 
-                    out_crs = f"EPSG:{self.out_crs}"
-                    _reproject_band(str(tmp_v), str(vpath), vprof, out_crs, dst_transform, dst_width, dst_height)
-                    _reproject_band(str(tmp_s), str(spath), sprof, out_crs, dst_transform, dst_width, dst_height)
-                except Exception:
-                    if tmp_v.exists():
-                        tmp_v.rename(vpath)
-                    if tmp_s.exists():
-                        tmp_s.rename(spath)
-                    raise
-                if tmp_v.exists():
-                    tmp_v.unlink()
-                if tmp_s.exists():
-                    tmp_s.unlink()
+                # Process blocks with parallel workers
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
+                    # One shared config object for all worker threads (no
+                    # per-field dict copy). Rebuilt fresh each run: stale state
+                    # from a previous run in this process is dropped.
+                    _CTX.clear()
+                    cfg = self.cfg
+                    cfg.pts = np.load(cfg.pts_path, mmap_mode="r")
+                    cfg.tf = make_transform(cfg.transform_state)
+                    cfg.pct = PercentileTransform(cfg.pct_quantiles)
+                    _CTX["cfg"] = cfg
+                    if self._prepare_shared():
+                        cfg.shared = True
+                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                        for bx, by, out in ex.map(_process_block, self.tasks):
+                            w = _block_window(bx, by, self.cfg)
+
+                            if out is None:
+                                blank = np.full((w.height, w.width), NODATA, np.int16)
+                                vd.write(blank, 1, window=w)
+                                sd.write(blank, 1, window=w)
+                                continue
+
+                            vq, rq = out
+                            vd.write(vq.T[::-1, :], 1, window=w)
+                            sd.write(rq.T[::-1, :], 1, window=w)
+        except BaseException:
+            # Mid-run failure (worker error, OOM, disk full): the rasters on
+            # disk are partial. Warn so nobody consumes them (issue #15).
+            partial = True
+            raise
         finally:
-            if self.pts_path.exists():
-                self.pts_path.unlink()
+            self._remove_run_temps()
+            if partial:
+                print(  # ruff: ignore[print]
+                    f"warning: run failed; output rasters are partial: {vpath}, {spath}",
+                    file=sys.stderr,
+                )
+
+        if self.out_crs != self.work_crs:
+            tmp_v = Path(self.out_dir) / "_value_tmp.tif"
+            tmp_s = Path(self.out_dir) / "_support_tmp.tif"
+            tmp_v.unlink(missing_ok=True)  # never follow a pre-planted symlink (issue #15)
+            tmp_s.unlink(missing_ok=True)
+            vpath.rename(tmp_v)
+            spath.rename(tmp_s)
+            try:
+                # Both bands share the same work-CRS source grid (identical
+                # bounds/size), so the output grid is identical too: compute
+                # the default transform once instead of per band.
+                with rasterio.open(tmp_v) as grid_src:
+                    dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
+                        grid_src.crs,
+                        f"EPSG:{self.out_crs}",
+                        grid_src.width,
+                        grid_src.height,
+                        *grid_src.bounds,
+                    )
+
+                out_crs = f"EPSG:{self.out_crs}"
+                _reproject_band(str(tmp_v), str(vpath), vprof, out_crs, dst_transform, dst_width, dst_height)
+                _reproject_band(str(tmp_s), str(spath), sprof, out_crs, dst_transform, dst_width, dst_height)
+            except Exception:
+                if tmp_v.exists():
+                    tmp_v.rename(vpath)
+                if tmp_s.exists():
+                    tmp_s.rename(spath)
+                raise
+            if tmp_v.exists():
+                tmp_v.unlink()
+            if tmp_s.exists():
+                tmp_s.unlink()
 
         return str(vpath), str(spath)
 
@@ -995,8 +1125,8 @@ def main() -> None:
     parser.add_argument("--value-col", default="value", help="Value column name")
     parser.add_argument("--lng-col", default="longitude", help="Longitude column name")
     parser.add_argument("--lat-col", default="latitude", help="Latitude column name")
-    parser.add_argument("--res", type=float, default=DEFAULT_RES, help="Cell size in metres")
-    parser.add_argument("--cap-km", default="auto", help="Fill cap km, or 'auto'")
+    parser.add_argument("--res", type=_pos_float, default=DEFAULT_RES, help="Cell size in metres")
+    parser.add_argument("--cap-km", type=_cap_km_arg, default="auto", help="Fill cap km, or 'auto'")
     parser.add_argument(
         "--transform",
         default="auto",
@@ -1004,16 +1134,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--saturation",
-        type=float,
+        type=_pos_float,
         default=DEFAULT_SATURATION,
         help="Counts for a cell to fully self-trust",
     )
     parser.add_argument("--block", type=int, default=DEFAULT_BLOCK, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of workers")
-    parser.add_argument("--scale", type=float, default=DEFAULT_SCALE, help="DN = percentile * scale")
+    parser.add_argument("--scale", type=_pos_float, default=DEFAULT_SCALE, help="DN = percentile * scale")
     parser.add_argument(
         "--percentile-step",
-        type=float,
+        type=_pos_float,
         default=None,
         help="Round output percentiles to the nearest step (e.g. 5 -> 90/95/100). Default: no rounding",
     )
@@ -1031,20 +1161,25 @@ def main() -> None:
     parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
     args = parser.parse_args()
 
-    if args.res <= 0:
-        parser.error("--res must be positive")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
-    if args.scale <= 0:
-        parser.error("--scale must be positive")
-    if args.saturation <= 0:
-        parser.error("--saturation must be positive")
     if args.percentile_step is not None and not (0 < args.percentile_step <= PERCENTILE_MAX):
         parser.error(f"--percentile-step must be in (0, {PERCENTILE_MAX:g}]")
     if args.block < 1:
         parser.error("--block must be at least 1")
+    if args.calib_max_points < 1:
+        parser.error("--calib-max-points must be at least 1")
+    for flag, val in (("--src-crs", args.src_crs), ("--work-crs", args.work_crs), ("--out-crs", args.out_crs)):
+        if val <= 0:
+            parser.error(f"{flag} must be a positive EPSG code")
 
-    Path(args.out).mkdir(parents=True, exist_ok=True)
+    out = Path(args.out)
+    if out.exists() and not out.is_dir():
+        _die(f"output path is a file, not a directory: {args.out}")
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _die(f"cannot create output directory {args.out}: {e}")
     try:
         run(
             args.input,
@@ -1068,9 +1203,22 @@ def main() -> None:
             out_crs=args.out_crs,
             skip_calibration=args.skip_calibration,
         )
-    except ValueError as e:
+    except CRSError as e:
+        # Invalid --src-crs / --work-crs / --out-crs (proj_create failure).
+        _die(str(e))
+    except ImportError as e:
+        # e.g. parquet input without the optional pyarrow extra.
+        _die(str(e))
+    except FileNotFoundError as e:
+        _die(f"input file not found: {e.filename or args.input}")
+    except pd.errors.ParserError as e:
+        _die(f"malformed input file: {e}")
+    except (KeyError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
         raise SystemExit(2) from None
+    except OSError as e:
+        # NotADirectoryError, disk full, etc.
+        _die(str(e))
 
 
 if __name__ == "__main__":
