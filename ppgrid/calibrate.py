@@ -100,11 +100,28 @@ class PercentileTransform(Transform):
     def fit(self, v: np.ndarray) -> PercentileTransform:
         """Fit quantiles from data.
 
+        Flat input (all values equal, or a single point) is degenerate for the
+        usual staircase: q[0] stays the constant, so fwd left-clamps the
+        constant to percentile 0 — a constant column quantized to 0 instead
+        of its true position (issue #24). Map the constant to the 50th
+        percentile on a staircase wide enough that float32 interpolation
+        noise around the constant still decodes to 50 (and a constant DN,
+        at the default scale). Decode round-trips: inv(fwd(c)) == c.
+
+        Args:
+            v: 1-D values.
+
         Returns:
             self.
 
         """
-        q = np.quantile(v.astype(np.float64), np.linspace(0, 1, self.NQ))
+        v = v.astype(np.float64)
+        if v.size > 0 and np.ptp(v) == 0.0:
+            c = float(v[0])
+            sp = max(np.spacing(abs(c) + 1.0), abs(c) * 2e-2)
+            self.q = c + (np.arange(self.NQ) - self.NQ // 2) * sp
+            return self
+        q = np.quantile(v, np.linspace(0, 1, self.NQ))
         self.q = np.maximum.accumulate(q)
         eps = np.arange(self.NQ) * np.spacing(np.abs(self.q).max() + 1.0)
         self.q += eps
@@ -349,6 +366,15 @@ def blocked_cv_skill(
 
     ok = np.isfinite(preds) & np.isfinite(sups)
     pred, act, sup = preds[ok], tv[ok], sups[ok]
+    if act.size == 0:
+        # No valid predictions (e.g. the data extent is smaller than one CV
+        # block, so every fold is skipped). Skill is undefined: report 0
+        # rather than NaN + 'Mean of empty slice' warnings (issue #14).
+        return 0.0, []
+    if np.ptp(act) == 0.0:
+        # Zero-variance target (constant values): 1 - RMSE/RMSE_baseline
+        # divides by zero. Report 0 rather than -inf/NaN (issue #14).
+        return 0.0, []
     base = float(np.mean(act))
 
     rows: list[CVDetail] = []
@@ -358,7 +384,10 @@ def blocked_cv_skill(
         if n < min_n:
             continue
         e_m, e_b = act[m] - pred[m], act[m] - base
-        skill = 1 - np.sqrt(np.mean(e_m**2)) / np.sqrt(np.mean(e_b**2))
+        base_rms2 = float(np.mean(e_b**2))
+        if base_rms2 == 0.0:
+            continue  # baseline constant in this bin: skill undefined
+        skill = 1 - np.sqrt(np.mean(e_m**2)) / np.sqrt(base_rms2)
         nb = min(n, boot_max_n)
         if nb < n:
             sub = rng.choice(n, nb, replace=False)

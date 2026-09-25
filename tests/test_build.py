@@ -21,6 +21,7 @@ def test_sdist_excludes_generated_examples() -> None:
     assert "examples/*.png" in excluded
     assert "examples/*.jpg" in excluded
     assert "data/all_equakes.csv" in excluded
+    assert "tests/fixtures/**" in excluded
 
 
 def test_sdist_keeps_source_data() -> None:
