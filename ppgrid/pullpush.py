@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -261,6 +263,28 @@ def _pull_push_descent(
     return val, sup
 
 
+def _mem_available_bytes() -> int | None:
+    """Return available system RAM from /proc/meminfo in bytes, or None if unknown."""
+    try:
+        with Path("/proc/meminfo").open(encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _peak_rss_bytes() -> int:
+    """Return the current peak RSS of this process in bytes, 0 if unavailable."""
+    try:
+        import resource
+
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+    except (ImportError, OSError, ValueError):
+        return 0
+
+
 def _descent_banded(
     sums: list[np.ndarray],
     counts: list[np.ndarray],
@@ -273,6 +297,7 @@ def _descent_banded(
     out_sup: np.ndarray,
     level_dir: Path,
     band_rows: int = 1024,
+    nworkers: int = 8,
 ) -> None:
     """Compute the descent from level start_level down to level 0, row-banded.
 
@@ -283,6 +308,20 @@ def _descent_banded(
     (start_level-1 .. 1) are written to memmap files in level_dir; level 0
     goes to out_val / out_sup (memmaps or arrays).
 
+    The levels are sequential (level k-1 reads level k) but the row-bands
+    within a level are independent: each band reads only level-(k+1) rows
+    [e0:e1] and writes only level-k rows [r0:r1], so they run concurrently
+    on a ThreadPoolExecutor when nworkers > 1. Every band performs exactly
+    the same per-band ops as the sequential loop, on the same inputs, and
+    the memmap writes target disjoint row ranges, so the output is
+    bit-identical to the nworkers=1 run.
+
+    nworkers is clamped per level to min(nworkers, nbands, 8) and gated on
+    available RAM: each concurrent band holds its own intermediate buffers
+    (a, local, pv, ps), so when /proc/meminfo reports less available memory
+    than the current peak RSS plus two bands' worth of float32 buffers, the
+    level runs single-threaded and peak RSS cannot exceed the sequential
+    path.
     """
     val = val_in
     sup = sup_in
@@ -297,21 +336,69 @@ def _descent_banded(
         else:
             out, outs = out_val, out_sup
         n0 = sums[k].shape[0]
-        for r0 in range(0, n0, band_rows):
-            r1 = min(n0, r0 + band_rows)
-            # Coarser window: level-k rows [r0, r1) read upsample taps at
-            # repeated rows [r0-1, r1] -> level-(k+1) rows [r0//2-1, r1//2].
-            e0 = max(0, r0 // 2 - 1)
-            e1 = min(val.shape[0], r1 // 2 + 1)
-            p0 = 2 * e0
-            a = np.minimum(counts[k][r0:r1] / saturation, 1.0).astype(np.float32)
-            local = sums[k][r0:r1] / np.maximum(counts[k][r0:r1], _COUNT_EPS)
-            pv = upsample_bilinear(val[e0:e1])[r0 - p0 : r1 - p0]
-            ps = upsample_bilinear(sup[e0:e1])[r0 - p0 : r1 - p0]
-            out[r0:r1] = np.where(a >= 1.0, local, a * local + (1.0 - a) * pv)
-            outs[r0:r1] = a * np.float32(res * (1 << k)) + (1.0 - a) * ps
+        r0s = list(range(0, n0, band_rows))
+        nw = max(1, min(nworkers, len(r0s), 8))
+        if nw > 1:
+            avail = _mem_available_bytes()
+            need = _peak_rss_bytes() + 2 * band_rows * n0 * 4 * 2
+            if avail is not None and avail < need:
+                nw = 1
+
+        band = partial(
+            _descent_band,
+            sums[k],
+            counts[k],
+            val,
+            sup,
+            out,
+            outs,
+            n0=n0,
+            res=res,
+            k=k,
+            saturation=saturation,
+            band_rows=band_rows,
+        )
+        if nw == 1:
+            for r0 in r0s:
+                band(r0)
+        else:
+            with ThreadPoolExecutor(max_workers=nw) as ex:
+                list(ex.map(band, r0s))
         if k > 0:
             val, sup = out, outs
+
+
+def _descent_band(
+    sums_k: np.ndarray,
+    counts_k: np.ndarray,
+    val: np.ndarray,
+    sup: np.ndarray,
+    out: np.ndarray,
+    outs: np.ndarray,
+    r0: int,
+    n0: int,
+    res: float,
+    k: int,
+    saturation: float,
+    band_rows: int,
+) -> None:
+    """Compute one row band [r0 : r0+band_rows) of descent level k.
+
+    This is exactly the body of the sequential _descent_banded loop, so a
+    band computed here is bit-identical to the single-threaded result.
+    """
+    r1 = min(n0, r0 + band_rows)
+    # Coarser window: level-k rows [r0, r1) read upsample taps at
+    # repeated rows [r0-1, r1] -> level-(k+1) rows [r0//2-1, r1//2].
+    e0 = max(0, r0 // 2 - 1)
+    e1 = min(val.shape[0], r1 // 2 + 1)
+    p0 = 2 * e0
+    a = np.minimum(counts_k[r0:r1] / saturation, 1.0).astype(np.float32)
+    local = sums_k[r0:r1] / np.maximum(counts_k[r0:r1], _COUNT_EPS)
+    pv = upsample_bilinear(val[e0:e1])[r0 - p0 : r1 - p0]
+    ps = upsample_bilinear(sup[e0:e1])[r0 - p0 : r1 - p0]
+    out[r0:r1] = np.where(a >= 1.0, local, a * local + (1.0 - a) * pv)
+    outs[r0:r1] = a * np.float32(res * (1 << k)) + (1.0 - a) * ps
 
 
 def pull_push(
