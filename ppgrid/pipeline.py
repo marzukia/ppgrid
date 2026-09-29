@@ -324,6 +324,49 @@ def _block_neighbourhood_nonempty(
     return any(starts[bid + 1] > starts[bid] for bid in _neighbour_block_ids(bx, by, nbx, nby))
 
 
+def _footprint_has_task(
+    w_bounds: tuple[float, float, float, float],
+    dst_crs: Any,
+    src_crs: Any,
+    g_left: float,
+    g_bottom: float,
+    g_res_x: float,
+    g_res_y: float,
+    g_width: int,
+    g_height: int,
+    bsize: int,
+    nby: int,
+    task_bids: set[int],
+) -> bool:
+    """Return True when the source footprint of a dst window intersects any task block.
+
+    The footprint is the dst window bounds transformed into source (work-CRS)
+    georeferenced space via `transform_bounds` on a densified boundary, then
+    converted to work-grid cell ranges rounded OUT (one extra cell of pad on
+    every side). Raster row 0 is at the top edge (g_top), so row indices are
+    derived from the top edge. Against those ranges the task-block cell ranges
+    are tested exactly, so a false "has data" costs one warp, but a false
+    "empty" is not possible: the task blocks are the superset of every
+    non-NoData cell.
+    """
+    sb = rasterio.warp.transform_bounds(dst_crs, src_crs, *w_bounds, densify_pts=257)
+    pad = max(g_res_x, g_res_y)
+    xmin, ymin, xmax, ymax = sb[0] - pad, sb[1] - pad, sb[2] + pad, sb[3] + pad
+    i0 = max(0, math.floor((xmin - g_left) / g_res_x))
+    i1 = min(g_width, math.ceil((xmax - g_left) / g_res_x))
+    g_top = g_bottom + g_height * g_res_y
+    j0 = max(0, math.floor((g_top - ymax) / g_res_y))
+    j1 = min(g_height, math.floor((g_top - ymin) / g_res_y) + 1)
+    if i1 <= i0 or j1 <= j0:
+        return False
+    for bx in range(i0 // bsize, (i1 - 1) // bsize + 1):
+        base = bx * nby
+        for by in range(j0 // bsize, (j1 - 1) // bsize + 1):
+            if base + by in task_bids:
+                return True
+    return False
+
+
 def _reproject_band(
     src_path: str,
     dst_path: str,
@@ -332,6 +375,7 @@ def _reproject_band(
     dst_transform: Any,
     dst_width: int,
     dst_height: int,
+    task_info: dict[str, Any] | None = None,
 ) -> None:
     """Nearest-neighbour reproject one band into a fresh output-CRS GeoTIFF.
 
@@ -342,6 +386,15 @@ def _reproject_band(
     calls -> ~15% faster) but flush TILE_PX blocks in raster-scan order,
     exactly as the 512px baseline does. The result is byte-identical to the
     baseline.
+
+    NoData-tile skip: when `task_info` is provided (work-grid block
+    geometry + the populated-block superset from grid()), a coarse dst tile
+    whose source footprint intersects no task block cannot contain data
+    (empty blocks are written NoData, and data cells exist only inside task
+    blocks). Its warp is skipped and a plain NoData buffer is written to the
+    tile instead. The footprint is conservatively rounded out, so the skip
+    is safe: at worst one tile that is all-NoData gets warped anyway. When
+    no tile is skippable the output is identical to the unskipped path.
     """
     with rasterio.open(src_path) as src:
         dst_profile = dict(
@@ -358,6 +411,16 @@ def _reproject_band(
             if hasattr(src, "offsets") and src.offsets:
                 dst.offsets = src.offsets
             warp_tile = 2048
+            skip = task_info is not None
+            n_skipped = 0
+            n_tiles = 0
+            if skip:
+                bsize = task_info["bsize"]
+                nby = task_info["nby"]
+                task_bids: set[int] = task_info["task_bids"]
+                g_left, g_bottom, g_right, g_top = src.bounds
+                g_res_x = (g_right - g_left) / src.width
+                g_res_y = (g_top - g_bottom) / src.height
             for j0 in range(0, dst_height, warp_tile):
                 band_h = min(warp_tile, dst_height - j0)
                 # Warp the coarse tiles across this row band.
@@ -366,6 +429,25 @@ def _reproject_band(
                     band_w = min(warp_tile, dst_width - i0)
                     w = Window(i0, j0, band_w, band_h)
                     w_bounds = rasterio.windows.bounds(w, dst_transform)
+                    n_tiles += 1
+                    if skip and not _footprint_has_task(
+                        w_bounds,
+                        dst_crs,
+                        src.crs,
+                        g_left,
+                        g_bottom,
+                        g_res_x,
+                        g_res_y,
+                        src.width,
+                        src.height,
+                        bsize,
+                        nby,
+                        task_bids,
+                    ):
+                        # All-NoData tile: no warp, plain NoData buffer.
+                        n_skipped += 1
+                        coarse[i0] = np.full((band_h, band_w), NODATA, np.int16)
+                        continue
                     local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
                     buf = np.zeros((band_h, band_w), dtype=np.int16)
                     reproject(
@@ -386,6 +468,8 @@ def _reproject_band(
                         i0 = (i // warp_tile) * warp_tile
                         sub = coarse[i0][j - j0 : j - j0 + w_h, i - i0 : i - i0 + w_w]
                         dst.write(sub, 1, window=Window(i, j, w_w, w_h))
+        if skip:
+            print(f"[reproj] skipped {n_skipped}/{n_tiles} all-NoData tiles")  # ruff: ignore[print]
 
 
 class Pipeline:
@@ -414,6 +498,7 @@ class Pipeline:
         work_crs: int = WORK_CRS,
         out_crs: int = OUT_CRS,
         skip_calibration: bool = False,
+        max_band_parallel: int | None = None,
     ) -> None:
         """Initialise the interpolation pipeline.
 
@@ -421,6 +506,7 @@ class Pipeline:
             ValueError: If scale * PERCENTILE_MAX exceeds int16 max.
             ValueError: If percentile_step is outside (0, PERCENTILE_MAX].
             ValueError: If saturation is not > 0.
+            ValueError: If max_band_parallel is not >= 1.
 
         """
         self.input_path = input_path
@@ -449,6 +535,10 @@ class Pipeline:
         self.work_crs = work_crs
         self.out_crs = out_crs
         self.skip_calibration = skip_calibration
+        if max_band_parallel is not None and max_band_parallel < 1:
+            msg = f"max_band_parallel must be >= 1: {max_band_parallel}"
+            raise ValueError(msg)
+        self.max_band_parallel = max_band_parallel
 
         if self.scale * PERCENTILE_MAX > INT16_MAX:
             msg = (
@@ -813,6 +903,7 @@ class Pipeline:
                 out_val=val_full,
                 out_sup=sup_full,
                 level_dir=Path(self.out_dir),
+                nworkers=self.max_band_parallel if self.max_band_parallel is not None else self.workers,
             )
             for k in range(min(3, self.levels + 1)):
                 sums[k] = None  # type: ignore[assignment]
@@ -937,8 +1028,23 @@ class Pipeline:
                         )
 
                     out_crs = f"EPSG:{self.out_crs}"
-                    _reproject_band(str(tmp_v), str(vpath), vprof, out_crs, dst_transform, dst_width, dst_height)
-                    _reproject_band(str(tmp_s), str(spath), sprof, out_crs, dst_transform, dst_width, dst_height)
+                    # NoData-tile skip (C(ii)): the task blocks are the
+                    # superset of all non-NoData cells in the work rasters,
+                    # so a dst tile whose source footprint touches no task
+                    # block can be written as plain NoData without warping.
+                    task_info = None
+                    if self.tasks:
+                        task_info = {
+                            "bsize": self.bsize,
+                            "nby": self.nby,
+                            "task_bids": {bx * self.nby + by for bx, by in self.tasks},
+                        }
+                    _reproject_band(
+                        str(tmp_v), str(vpath), vprof, out_crs, dst_transform, dst_width, dst_height, task_info
+                    )
+                    _reproject_band(
+                        str(tmp_s), str(spath), sprof, out_crs, dst_transform, dst_width, dst_height, task_info
+                    )
                 except Exception:
                     if tmp_v.exists():
                         tmp_v.rename(vpath)
@@ -1010,6 +1116,14 @@ def main() -> None:
     )
     parser.add_argument("--block", type=int, default=DEFAULT_BLOCK, help="Block size in cells")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of workers")
+    parser.add_argument(
+        "--max-band-parallel",
+        type=int,
+        default=None,
+        help=(
+            "Max threads for the banded memmap descent row-bands (default: --workers, capped at 8, RAM-gated per level)"
+        ),
+    )
     parser.add_argument("--scale", type=float, default=DEFAULT_SCALE, help="DN = percentile * scale")
     parser.add_argument(
         "--percentile-step",
@@ -1035,6 +1149,8 @@ def main() -> None:
         parser.error("--res must be positive")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.max_band_parallel is not None and args.max_band_parallel < 1:
+        parser.error("--max-band-parallel must be at least 1")
     if args.scale <= 0:
         parser.error("--scale must be positive")
     if args.saturation <= 0:
@@ -1067,6 +1183,7 @@ def main() -> None:
             work_crs=args.work_crs,
             out_crs=args.out_crs,
             skip_calibration=args.skip_calibration,
+            max_band_parallel=args.max_band_parallel,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
