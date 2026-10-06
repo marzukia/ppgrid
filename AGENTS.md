@@ -12,7 +12,7 @@ not downstream calculation).
 
 - Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.pipeline:main`; `ppgrid.idwgrid` is a back-compat shim).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
-- Tests: `uv run pytest` (53 tests). Lint/format: `ruff` (line-length 120).
+- Tests: `uv run pytest` (93 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
@@ -80,6 +80,15 @@ not downstream calculation).
   git push "https://x-access-token:${PAT}@github.com/marzukia/ppgrid" <branch>
   ```
 - Branches go to a PR, not main, per the fleet merge gate.
+
+## What changed recently (2026-10-06, turbo read-side MT, 0.3.0)
+
+- New `Pipeline(n_threads=...)` kwarg (default `1`, serial path unchanged, byte-identical output). NOT a CLI flag.
+  - `_reproject_band`: 2048px warp tiles per row band run on a `ThreadPoolExecutor` via the module-level `_warp_dst_tile` helper (per-tile source open: GDAL handles are not thread-safe). The 512px flush loop STAYS serial raster-scan (file bytes depend on tile order). Do not "parallelise" the flush.
+  - `ingest`: CSVs >= 100k rows per chunk split into complete-record byte ranges (`_csv_chunk_tasks`, newline scan + quote-parity guards, `None` on any doubt -> serial parse) and parsed in a `ProcessPoolExecutor` (`_read_csv_chunk`, explicit float64 dtypes + per-chunk dtype assert). Chunks concat in original row order (`bin_points` is order-sensitive); row-count mismatch re-runs the serial parse.
+  - rasterio's benign `NotGeoreferencedWarning` is ignored at import (CPython warning filters are process-global, not thread-safe; the library's nested suppression leaks under concurrent warps). A matching `filterwarnings` entry in `[tool.pytest.ini_options]` restates it for pytest.
+  - Tests: `tests/test_turbo.py` (6, sha256/bit-identity + fallbacks). Bench: `bench/turbo_bench.py`, `bench/turbo_decomp.py`.
+  - Design doc in-repo: `docs/turbo-design.md` (accepted criteria A4-A8).
 
 ## What changed recently (2026-09-22, the "polish" pass)
 
