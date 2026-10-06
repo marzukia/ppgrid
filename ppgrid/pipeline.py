@@ -7,13 +7,15 @@ capped raster surface, in minutes, on a single machine, with no GPU.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -22,6 +24,7 @@ import pandas as pd
 import rasterio
 from pyproj import Transformer
 from pyproj.exceptions import CRSError
+from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
@@ -46,6 +49,15 @@ from .pullpush import (
     downsample_sum,
     pull_push,
 )
+
+# rasterio's MemoryDataset.__init__ (used by reproject for ndarray buffers)
+# always warns NotGeoreferencedWarning on the initial transform read of the
+# MEM::: dataset, then sets the real transform immediately after. It normally
+# hides the warning in a nested warnings.catch_warnings, but CPython warning
+# filters are process-global, not thread-safe: with concurrent warps (S3.3)
+# another thread can restore a stale filter snapshot and leak the benign
+# warning. It carries no information here, so ignore the category.
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 WORK_CRS: int = 6933  # Wagner VII — global equal-area, metres are true
 SRC_CRS: int = 4326  # WGS 84 lon/lat (default input)
@@ -118,6 +130,11 @@ _RUN_TEMP_FILES = (
     "_val_lvl1.npy",
     "_sup_lvl1.npy",
 )
+
+# Ingest parallelism (S3.5): minimum data rows per CSV chunk for the process
+# pool. Below this the pool overhead exceeds the parse time, so ingest stays
+# on the single serial parse.
+_INGEST_MIN_CHUNK_ROWS = 100_000
 
 
 @dataclass
@@ -424,6 +441,46 @@ def _block_neighbourhood_nonempty(
     return any(starts[bid + 1] > starts[bid] for bid in _neighbour_block_ids(bx, by, nbx, nby))
 
 
+def _warp_dst_tile(
+    src_path: str,
+    i0: int,
+    j0: int,
+    band_h: int,
+    warp_tile: int,
+    dst_width: int,
+    dst_transform: Any,
+    dst_crs: str,
+) -> tuple[int, np.ndarray]:
+    """Nearest-neighbour warp of one coarse 2048px dst tile.
+
+    Pure per-pixel function of the dst grid with no state shared between
+    tiles, so the tile can be warped from any thread and the result is
+    identical to the serial loop. The source is opened per tile: GDAL
+    dataset handles are not thread-safe, and opening is cheap relative to
+    the warp (S3.3).
+
+    Returns:
+        Tuple of (tile column origin i0, warped int16 tile buffer).
+
+    """
+    band_w = min(warp_tile, dst_width - i0)
+    with rasterio.open(src_path) as src:
+        w = Window(i0, j0, band_w, band_h)
+        w_bounds = rasterio.windows.bounds(w, dst_transform)
+        local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
+        buf = np.zeros((band_h, band_w), dtype=np.int16)
+        reproject(
+            rasterio.band(src, 1),
+            buf,
+            src_transform=src.transform,
+            dst_transform=local_dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+            nodata=NODATA,
+        )
+    return i0, buf
+
+
 def _reproject_band(
     src_path: str,
     dst_path: str,
@@ -432,6 +489,7 @@ def _reproject_band(
     dst_transform: Any,
     dst_width: int,
     dst_height: int,
+    n_threads: int = 1,
 ) -> None:
     """Nearest-neighbour reproject one band into a fresh output-CRS GeoTIFF.
 
@@ -442,6 +500,14 @@ def _reproject_band(
     calls -> ~15% faster) but flush TILE_PX blocks in raster-scan order,
     exactly as the 512px baseline does. The result is byte-identical to the
     baseline.
+
+    n_threads > 1 (S3.3) warps the 2048px tiles of each row band in a thread
+    pool: reproject releases the GIL (2.88x at 4 threads, design A.4) and the
+    tiles are independent, so the pool changes wall time only, never bytes.
+    The 512px flush loop stays serial, raster-scan: the file bytes depend on
+    the tile write order. n_threads == 1 keeps the exact serial code path (A8);
+    the outer src handle is still read by the main thread for profile, tags,
+    scales and offsets.
     """
     with rasterio.open(src_path) as src:
         dst_profile = dict(
@@ -460,25 +526,28 @@ def _reproject_band(
             warp_tile = 2048
             for j0 in range(0, dst_height, warp_tile):
                 band_h = min(warp_tile, dst_height - j0)
-                # Warp the coarse tiles across this row band.
+                # Warp the coarse tiles across this row band (independent
+                # tiles: the pool only overlaps them, see the docstring).
                 coarse: dict[int, np.ndarray] = {}
-                for i0 in range(0, dst_width, warp_tile):
-                    band_w = min(warp_tile, dst_width - i0)
-                    w = Window(i0, j0, band_w, band_h)
-                    w_bounds = rasterio.windows.bounds(w, dst_transform)
-                    local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
-                    buf = np.zeros((band_h, band_w), dtype=np.int16)
-                    reproject(
-                        rasterio.band(src, 1),
-                        buf,
-                        src_transform=src.transform,
-                        dst_transform=local_dst_transform,
+                if n_threads > 1:
+                    warp = partial(
+                        _warp_dst_tile,
+                        src_path,
+                        j0=j0,
+                        band_h=band_h,
+                        warp_tile=warp_tile,
+                        dst_width=dst_width,
+                        dst_transform=dst_transform,
                         dst_crs=dst_crs,
-                        resampling=Resampling.nearest,
-                        nodata=NODATA,
                     )
-                    coarse[i0] = buf
-                # Flush TILE_PX blocks in raster-scan order.
+                    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                        coarse.update(ex.map(warp, range(0, dst_width, warp_tile)))
+                else:
+                    for i0 in range(0, dst_width, warp_tile):
+                        _, buf = _warp_dst_tile(src_path, i0, j0, band_h, warp_tile, dst_width, dst_transform, dst_crs)
+                        coarse[i0] = buf
+                # Flush TILE_PX blocks in raster-scan order (serial: the file
+                # bytes depend on the tile write order).
                 for j in range(j0, j0 + band_h, TILE_PX):
                     w_h = min(TILE_PX, j0 + band_h - j)
                     for i in range(0, dst_width, TILE_PX):
@@ -486,6 +555,107 @@ def _reproject_band(
                         i0 = (i // warp_tile) * warp_tile
                         sub = coarse[i0][j - j0 : j - j0 + w_h, i - i0 : i - i0 + w_w]
                         dst.write(sub, 1, window=Window(i, j, w_w, w_h))
+
+
+def _read_csv_chunk(
+    task: tuple[str, int, int, bool, list[str], list[str]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Parse one CSV row chunk in a worker process (S3.5).
+
+    The parent split the file into complete records at newline offsets and
+    this worker seeks its byte range. The wanted columns parse with explicit
+    float64 dtypes and the per-chunk dtype equality is asserted (review F3):
+    a single whole-file parse infers per column, and per-chunk inference can
+    disagree on edge rows (int64 vs float64, divergent doubles for
+    |x| >= 2**53).
+
+    Args:
+        task: Tuple of (path, byte_start, byte_end, has_header, wanted, all_names).
+
+    Returns:
+        Tuple of (value, lon, lat) float64 arrays in original row order.
+
+    Raises:
+        RuntimeError: If a wanted column does not parse as float64 (schema pin).
+
+    """
+    path, start, end, has_header, wanted, all_names = task
+    with Path(path).open("rb") as f:
+        f.seek(start)
+        raw = f.read(end - start)
+    dtype = dict.fromkeys(wanted, np.float64)
+    if has_header:
+        df = pd.read_csv(io.BytesIO(raw), usecols=wanted, dtype=dtype)
+    else:
+        df = pd.read_csv(io.BytesIO(raw), header=None, names=all_names, usecols=wanted, dtype=dtype)
+    for c in wanted:
+        if df[c].dtype != np.dtype(np.float64):
+            msg = f"ingest chunk dtype mismatch for column {c!r}: {df[c].dtype}"
+            raise RuntimeError(msg)
+    out = df[wanted].to_numpy(dtype=np.float64)
+    return out[:, 0], out[:, 1], out[:, 2]
+
+
+def _csv_chunk_tasks(
+    path: str,
+    wanted: list[str],
+    n_threads: int,
+) -> tuple[list[tuple[str, int, int, bool, list[str], list[str]]], int] | None:
+    """Plan the parallel CSV read (S3.5): split the file into row chunks.
+
+    Reads the file once and finds record boundaries at newline offsets. The
+    split is used only when every chunk is a set of complete CSV records:
+    an even quote parity per chunk (a boundary inside a quoted field leaves
+    an unbalanced quote) and a single-line header. Any doubt returns None
+    and the caller keeps the single serial parse, so the parallel path can
+    never change values, only wall time.
+
+    Returns:
+        Tuple of (chunk tasks, expected data rows) or None for the serial
+        parse. Each task is (path, byte_start, byte_end, has_header,
+        wanted, all_names); byte ranges are half-open and include the row
+        terminator.
+
+    """
+    try:
+        data = Path(path).read_bytes()
+        if not data:
+            return None
+        nl = np.flatnonzero(np.frombuffer(data, dtype=np.uint8) == 10)
+        n_nl = int(nl.size)
+        # One physical line per row, the header is the first line; a file
+        # without a final newline has one extra unterminated row.
+        data_rows = n_nl - 1 if data[-1] == 10 else n_nl
+        if n_nl == 0 or data_rows < 2 * _INGEST_MIN_CHUNK_ROWS:
+            return None
+        # n_threads >= 2 and the data_rows guard above make this >= 2.
+        n_chunks = min(n_threads, data_rows // _INGEST_MIN_CHUNK_ROWS)
+
+        # Header via pandas so the names match exactly what a serial parse
+        # would see (BOM, quoting, coercion included).
+        hdr = pd.read_csv(path, nrows=0)
+        all_names = [str(c) for c in hdr.columns]
+        if data[: int(nl[0])].count(b'"') % 2 != 0 or any(all_names.count(w) != 1 for w in wanted):
+            return None  # embedded-newline header, or missing/duplicated column
+
+        tasks: list[tuple[str, int, int, bool, list[str], list[str]]] = []
+        lo = np.linspace(0, data_rows, n_chunks + 1).astype(np.int64)
+        for k in range(n_chunks):
+            r0, r1 = int(lo[k]), int(lo[k + 1])
+            # Data row r (0-based) is physical line r + 1: the bytes after
+            # newline nl[r], up to and including newline nl[r + 1].
+            start = 0 if r0 == 0 else int(nl[r0]) + 1
+            end = len(data) if r1 >= n_nl else int(nl[r1]) + 1
+            if data[start:end].count(b'"') % 2 != 0:
+                return None  # chunk boundary splits a quoted field
+            tasks.append((path, start, end, r0 == 0, list(wanted), list(all_names)))
+    except (OSError, ValueError, IndexError):
+        # Planning is best effort: any surprise (odd encoding, ragged
+        # header, ...) falls back to the serial parse, which has the
+        # historical behaviour.
+        return None
+    else:
+        return tasks, data_rows
 
 
 class Pipeline:
@@ -514,6 +684,7 @@ class Pipeline:
         work_crs: int = WORK_CRS,
         out_crs: int = OUT_CRS,
         skip_calibration: bool = False,
+        n_threads: int = 1,
     ) -> None:
         """Initialise the interpolation pipeline.
 
@@ -521,6 +692,7 @@ class Pipeline:
             ValueError: If scale * PERCENTILE_MAX exceeds int16 max.
             ValueError: If percentile_step is outside (0, PERCENTILE_MAX].
             ValueError: If saturation is not > 0.
+            ValueError: If n_threads is not >= 1.
 
         """
         self.input_path = input_path
@@ -549,6 +721,10 @@ class Pipeline:
         self.work_crs = work_crs
         self.out_crs = out_crs
         self.skip_calibration = skip_calibration
+        if n_threads < 1:
+            msg = f"n_threads must be >= 1: {n_threads}"
+            raise ValueError(msg)
+        self.n_threads = n_threads
 
         if self.scale * PERCENTILE_MAX > INT16_MAX:
             msg = (
@@ -593,24 +769,33 @@ class Pipeline:
     def ingest(self) -> None:
         """Read input, filter, project to working CRS.
 
+        CSV input with n_threads > 1 and enough rows is split into complete
+        row records and parsed in a process pool (S3.5): read_csv holds the
+        GIL, so threads cannot overlap the parse. Every chunk parses the
+        wanted columns with explicit float64 dtypes, asserts per-chunk dtype
+        equality, and the chunks are concatenated in original row order. Any
+        split uncertainty (small file, blank lines, quoted newlines, header
+        quirks) falls back to the single serial parse, so n_threads == 1
+        (the default) is byte-identical to before (A8).
+
         Raises:
             ValueError: If no valid points remain after filtering.
             ImportError: If pyarrow is missing for Parquet input.
 
         """
+        wanted = [self.value_col, self.lng_col, self.lat_col]
         if self.input_path.endswith((".parquet", ".pq")):
             try:
                 import pyarrow as pa  # ruff: ignore[unused-import]
             except ImportError:
                 msg = "pyarrow is required for Parquet files. Install with: pip install ppgrid[parquet]"
                 raise ImportError(msg) from None
-            df = pd.read_parquet(self.input_path, columns=[self.value_col, self.lng_col, self.lat_col])
+            df = pd.read_parquet(self.input_path, columns=wanted)
+            v = df[self.value_col].to_numpy(dtype=np.float64)
+            lon = df[self.lng_col].to_numpy(dtype=np.float64)
+            lat = df[self.lat_col].to_numpy(dtype=np.float64)
         else:
-            df = pd.read_csv(self.input_path, usecols=[self.value_col, self.lng_col, self.lat_col])
-
-        v = df[self.value_col].to_numpy(dtype=np.float64)
-        lon = df[self.lng_col].to_numpy(dtype=np.float64)
-        lat = df[self.lat_col].to_numpy(dtype=np.float64)
+            v, lon, lat = self._read_points(wanted)
 
         good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
         v, lon, lat = v[good], lon[good], lat[good]
@@ -625,6 +810,41 @@ class Pipeline:
         self.x = np.asarray(x)
         self.y = np.asarray(y)
         self.v = v
+
+    def _read_points(self, wanted: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read (value, lon, lat) float64 arrays from the CSV input.
+
+        Single serial parse by default. With n_threads > 1 and a file large
+        enough, a process pool parses row chunks in original order (see
+        ingest). A row-count mismatch after the parallel read (e.g. blank
+        lines, which pandas skips but the newline scan counts) re-runs the
+        serial parse.
+
+        Returns:
+            Tuple of (value, lon, lat) float64 arrays in original row order.
+
+        """
+
+        def serial() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            df = pd.read_csv(self.input_path, usecols=wanted)
+            return (
+                df[self.value_col].to_numpy(dtype=np.float64),
+                df[self.lng_col].to_numpy(dtype=np.float64),
+                df[self.lat_col].to_numpy(dtype=np.float64),
+            )
+
+        tasks = _csv_chunk_tasks(self.input_path, wanted, self.n_threads) if self.n_threads > 1 else None
+        if tasks is None:
+            return serial()
+        task_list, expected = tasks
+        with ProcessPoolExecutor(max_workers=len(task_list)) as ex:
+            chunks = list(ex.map(_read_csv_chunk, task_list))
+        v = np.concatenate([c[0] for c in chunks])
+        lon = np.concatenate([c[1] for c in chunks])
+        lat = np.concatenate([c[2] for c in chunks])
+        if v.size != expected:
+            return serial()
+        return v, lon, lat
 
     def calibrate(self) -> None:
         """Load or run calibration. Sets transform, percentile, cap.
@@ -1070,8 +1290,26 @@ class Pipeline:
                     )
 
                 out_crs = f"EPSG:{self.out_crs}"
-                _reproject_band(str(tmp_v), str(vpath), vprof, out_crs, dst_transform, dst_width, dst_height)
-                _reproject_band(str(tmp_s), str(spath), sprof, out_crs, dst_transform, dst_width, dst_height)
+                _reproject_band(
+                    str(tmp_v),
+                    str(vpath),
+                    vprof,
+                    out_crs,
+                    dst_transform,
+                    dst_width,
+                    dst_height,
+                    n_threads=self.n_threads,
+                )
+                _reproject_band(
+                    str(tmp_s),
+                    str(spath),
+                    sprof,
+                    out_crs,
+                    dst_transform,
+                    dst_width,
+                    dst_height,
+                    n_threads=self.n_threads,
+                )
             except Exception:
                 if tmp_v.exists():
                     tmp_v.rename(vpath)
