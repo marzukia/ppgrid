@@ -196,6 +196,50 @@ def test_bc_knee_boundary() -> None:
     assert _plan_full_au(c_star - 0.5).regime == "C"
 
 
+@pytest.mark.parametrize("cap_gb", [24.13, 24.2, 24.42])
+def test_b_knife_edge_falls_through_to_c(cap_gb: float) -> None:
+    """B admits at the knee but the tile cache leaves c = 0: no crash.
+
+    The B candidate is degenerate (0 workers) on full-AU for C in
+    [24.13, 24.42) GB, so plan() falls through to regime C, which yields
+    c = 3, b = 4, 3 workers, inside the 0.85*C budget.
+    """
+    pl = _plan_full_au(cap_gb)
+    assert pl.regime == "C"
+    assert pl.box_chunks == 3
+    assert pl.descent_bands == 4
+    assert pl.workers == 3
+    assert pl.val_sup_memmap is True
+    assert pl.est_peak_bytes <= pl.budget_bytes
+    dec = precheck(pl, strict=True, cap_source="auto")
+    assert dec.path == "shared"
+    assert dec.exit_code == 0
+
+
+def test_b_knife_edge_regime_b_one_unit() -> None:
+    """Just past the hole (24.43 GB): regime B with c = 1, b = 1, 1 worker."""
+    pl = _plan_full_au(24.43)
+    assert pl.regime == "B"
+    assert pl.box_chunks == 1
+    assert pl.descent_bands == 1
+    assert pl.workers == 1
+    assert pl.wall_s == pytest.approx(770.0)  # 30 + 740 / 1
+
+
+def test_regime_c_large_radius_falls_to_per_box() -> None:
+    """Same guard class in regime C at large r: c = 0 goes per-box, no crash.
+
+    r = 2000 cells makes M_box ~4.03 GB; at 18.7 GB the 8 GB floor leaves
+    c = 0, b = 2, which the old max(c, b) >= 2 gate admitted with 0
+    workers (wall_model_s division by zero).
+    """
+    pl = plan(18.7, N_FULL_AU, WC_FULL_AU, 2000, cpu=CPU)
+    assert pl.regime == "per_box"
+    assert pl.box_chunks == 0
+    assert pl.descent_bands == 0
+    assert pl.workers == 4
+
+
 def test_regime_b_48gb() -> None:
     """48 GB (not a preset): regime B, c = 9, 8 workers (3.6.2 reading)."""
     pl = _plan_full_au(48.0)
