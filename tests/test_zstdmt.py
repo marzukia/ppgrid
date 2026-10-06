@@ -274,3 +274,84 @@ def test_oracle_predictor1_identity_path(tmp_path: Path) -> None:
         arr = ds.read(1)
     # tile 0 is the top-left 32x32 block; raw bytes, no differencing
     assert seen["data"] == arr[0:32, 0:32].tobytes()
+
+
+# ---------------------------------------------------------------- BigTIFF parser
+
+
+def _write_bigtiff(path: Path) -> None:
+    """Write a 512x512 tiled ZSTD predictor-2 BigTIFF for the parser tests."""
+    rng = np.random.default_rng(11)
+    arr = rng.integers(0, 1000, size=(TILE_PX, TILE_PX), dtype="int16")
+    xform = rasterio.transform.from_origin(0.0, 5120.0, 10.0, 10.0)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=TILE_PX,
+        height=TILE_PX,
+        count=1,
+        dtype="int16",
+        crs="EPSG:3857",
+        transform=xform,
+        tiled=True,
+        blockxsize=TILE_PX,
+        blockysize=TILE_PX,
+        compress="ZSTD",
+        predictor=2,
+        bigtiff="YES",
+        nodata=-1,
+    ) as dst:
+        dst.write(arr, 1)
+
+
+def test_tif_info_parses_bigtiff(tmp_path: Path) -> None:
+    """_tif_info reads 20-byte BigTIFF IFD entries without struct.error.
+
+    Raises:
+        AssertionError: If the written file is not a little-endian BigTIFF.
+
+    """
+    p = tmp_path / "big.tif"
+    _write_bigtiff(p)
+    head = p.read_bytes()[:4]
+    if head != b"II\x2b\x00":
+        msg = f"file is not a little-endian BigTIFF: {head!r}"
+        raise AssertionError(msg)
+    info = zstdmt._tif_info(p)  # ruff: ignore[private-member-access]
+    assert info.width == TILE_PX
+    assert info.height == TILE_PX
+    assert info.tilew == TILE_PX
+    assert info.tileh == TILE_PX
+    assert info.bps == 16
+    assert info.spp == 1
+    assert info.predictor == 2
+    assert len(info.tile_bytes) == 1
+    assert info.tile_bytes[0][:4] == _ZSTD_MAGIC
+
+
+def test_oracle_runs_on_bigtiff(tmp_path: Path) -> None:
+    """oracle_check on a BigTIFF runs end-to-end without crashing the parser.
+
+    On the current stack the CPL pfn frames differ from the libtiff
+    streaming frames, so the verdict is expected to be mismatch, the same
+    frame-level behavior as the classic fixture.
+    """
+    p = tmp_path / "big.tif"
+    _write_bigtiff(p)
+    verdict = oracle_check(p, tile=0)
+    assert verdict.turbo_size > 0
+    assert verdict.stock_size > 0
+    assert "oracle" in verdict.detail
+    if not verdict.ok:
+        assert "mismatch" in verdict.detail
+        assert "serial" in verdict.detail
+
+
+def test_tif_info_corrupt_body_raises_zstdmterror(tmp_path: Path) -> None:
+    """A valid TIFF magic with a truncated IFD raises ZstdmtError, not struct.error."""
+    p = tmp_path / "corrupt.tif"
+    # classic header claiming the first IFD at offset 8, but the file ends there
+    p.write_bytes(b"II\x2a\x00\x08\x00\x00\x00")
+    with pytest.raises(ZstdmtError, match="corrupt TIFF"):
+        zstdmt._tif_info(p)  # ruff: ignore[private-member-access]
