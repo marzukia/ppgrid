@@ -9,6 +9,7 @@ reuses the banded descent math, whose one-row overlap makes chunks
 independent.
 """
 
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,7 @@ from ppgrid.pullpush import (
     box_count_mt,
     downsample_sum,
     grid_index_mt,
+    upsample_bilinear,
     upsample_nearest,
 )
 
@@ -164,6 +166,61 @@ def test_descent_banded_mt_1e8_cells(tmp_path: Path) -> None:
     assert np.array_equal(sup_ref, sup_mt)
 
 
+def test_descent_banded_mt_odd_bands(tmp_path: Path) -> None:
+    """band_rows=3 (odd): the one-row overlap at odd r0 stays bit-exact.
+
+    Small multi-level banded descent (4 banded levels, odd r0 bands at every
+    level plus edge-clamped final bands): threaded == serial.
+    """
+    rng = np.random.default_rng(40)
+    n0 = n1 = 128
+    levels = 5
+    res, sat = 50.0, 2.0
+    n = 5_000
+    ix = rng.integers(0, n0, n)
+    iy = rng.integers(0, n1, n)
+    w = rng.lognormal(0.0, 1.0, n)
+    s0, c0 = bin_points(ix, iy, w, n0, n1)
+    sums, counts = _pyramid(s0, c0, levels)
+    val_in, sup_in = _pull_push_descent(sums, counts, res, levels, saturation=sat, stop_level=3)
+    (tmp_path / "ref").mkdir()
+    (tmp_path / "mt").mkdir()
+
+    val_ref = np.zeros((n0, n1), np.float32)
+    sup_ref = np.zeros((n0, n1), np.float32)
+    _descent_banded(
+        sums,
+        counts,
+        res,
+        sat,
+        start_level=3,
+        val_in=val_in,
+        sup_in=sup_in,
+        out_val=val_ref,
+        out_sup=sup_ref,
+        level_dir=tmp_path / "ref",
+        band_rows=3,
+    )
+    val_mt = np.zeros((n0, n1), np.float32)
+    sup_mt = np.zeros((n0, n1), np.float32)
+    _descent_banded(
+        sums,
+        counts,
+        res,
+        sat,
+        start_level=3,
+        val_in=val_in,
+        sup_in=sup_in,
+        out_val=val_mt,
+        out_sup=sup_mt,
+        level_dir=tmp_path / "mt",
+        band_rows=3,
+        n_threads=_THREADS,
+    )
+    assert np.array_equal(val_ref, val_mt)
+    assert np.array_equal(sup_ref, sup_mt)
+
+
 def test_pull_push_descent_mt() -> None:
     """In-RAM descent: threaded row chunks == full-array pass, bit-exact."""
     rng = np.random.default_rng(36)
@@ -206,6 +263,60 @@ def test_pull_push_descent_mt_nearest() -> None:
     )
     assert np.array_equal(val_ref, val_mt)
     assert np.array_equal(sup_ref, sup_mt)
+
+
+def test_pull_push_descent_mt_custom_upsample_fallback() -> None:
+    """A custom upsample takes the full-array pass at n_threads>1, bit-exact.
+
+    Neither nearest nor bilinear, so the threaded banded pass must not run.
+    The shape recorder pins the fallback: the banded pass would call
+    upsample per band slice, the full-array pass once per level on the whole
+    parent array (band_rows=128 < level sizes, so a stray banded pass would
+    show different shapes).
+    """
+    rng = np.random.default_rng(41)
+    n0 = n1 = 512
+    levels = 4
+    res, sat = 10.0, 2.0
+    n = 50_000
+    ix = rng.integers(0, n0, n)
+    iy = rng.integers(0, n1, n)
+    w = rng.lognormal(0.0, 1.0, n)
+    s0, c0 = bin_points(ix, iy, w, n0, n1)
+    sums, counts = _pyramid(s0, c0, levels)
+
+    def recording(shapes: list[tuple[int, int]]) -> Callable[[np.ndarray], np.ndarray]:
+        def up(x: np.ndarray) -> np.ndarray:
+            shapes.append(x.shape)
+            return upsample_bilinear(x) + np.float32(1.5)
+
+        return up
+
+    shapes_ref: list[tuple[int, int]] = []
+    val_ref, sup_ref = _pull_push_descent(sums, counts, res, levels, upsample=recording(shapes_ref), saturation=sat)
+
+    shapes_mt: list[tuple[int, int]] = []
+    val_mt, sup_mt = _pull_push_descent(
+        sums,
+        counts,
+        res,
+        levels,
+        upsample=recording(shapes_mt),
+        saturation=sat,
+        n_threads=_THREADS,
+        band_rows=128,
+    )
+
+    assert np.array_equal(val_ref, val_mt)
+    assert np.array_equal(sup_ref, sup_mt)
+
+    # Fallback pin: whole parent array, twice per level (val + sup), no band slices.
+    expected: list[tuple[int, int]] = []
+    for k in range(levels - 1, -1, -1):
+        parent = n0 >> (k + 1)
+        expected += [(parent, parent), (parent, parent)]
+    assert shapes_mt == expected
+    assert shapes_mt == shapes_ref
 
 
 def test_grid_index_mt() -> None:
