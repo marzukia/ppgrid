@@ -6,9 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# Runner scoping (2026-10-06, per Frank/jarate pattern): PRs run on
+# GitHub-hosted runners; pushes to main run on the self-hosted 'nf'
+# runners (2x, label 'nf', marzukia org). 
+env:
+  RUNNER: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'nf' }}
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ env.RUNNER }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
