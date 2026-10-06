@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-10-06
+- Turbo: pipeline read-side MT (issue #32) behind a new `Pipeline(n_threads=...)` kwarg (default `1`: the serial code path, byte-identical output):
+  - `_reproject_band`: the 2048px warp tiles of each row band run on a `ThreadPoolExecutor` (the GDAL warp runs under `nogil`; each tile opens its own source handle, GDAL dataset handles are not thread-safe). The 512px flush loop stays serial raster-scan, so the on-disk bytes never change (sha256-equal to the serial run is test-covered).
+  - `ingest`: CSVs with enough rows (>= 100k per chunk) are split into complete-record byte ranges (newline scan with quote-parity guards; any doubt falls back to the serial parse) and parsed in a `ProcessPoolExecutor` (`read_csv` holds the GIL, so threads cannot overlap the parse). Each chunk parses the wanted columns with explicit float64 dtypes and asserts per-chunk dtype equality; chunks concatenate in original row order (`bin_points` is order-sensitive). A row-count mismatch re-runs the serial parse.
+  - New `tests/test_turbo.py` (6 tests): MT reproject sha256-equality vs serial, MT ingest bit-identity vs the single whole-file parse on a 500k-row edge-row fixture (2**53 +/- 1, empty/inf rows, int-only column, quoted fields, non-adjacent columns), serial-parse fallbacks (small file, quoted embedded newline), end-to-end full-run sha256 equality `n_threads=1` vs `4`, and `n_threads` validation.
+  - Ignores rasterio's benign `NotGeoreferencedWarning` (MemoryDataset initial transform read): CPython warning filters are process-global and not thread-safe, so the library's nested suppression can leak under concurrent warps.
+  - Bench harnesses: `bench/turbo_bench.py` (full paths), `bench/turbo_decomp.py` (parallelisable part in isolation).
+
 ## [0.2.2] - 2026-09-25
 - Code hygiene (no behavior change; output rasters remain byte-identical) — issues #4/#5:
   - Renamed `ppgrid/idwgrid.py` -> `ppgrid/pipeline.py`; `ppgrid/idwgrid` is now a thin backwards-compat shim, `ppgrid.Pipeline` is exported from the package root, and the `ppgrid` console script points at `ppgrid.pipeline:main`.
