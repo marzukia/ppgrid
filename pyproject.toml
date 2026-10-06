@@ -92,6 +92,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
+# tests/fixtures/*.py are runnable fixture generators; prints are the output.
+"tests/fixtures/*.py" = [
+    "INP001",     # implicit namespace package (script dir)
+    "T201",       # print (generator output)
+]
 # bench/*.py are local perf/repro harnesses (not shipped); relax style rules.
 "bench/*.py" = [
     "INP001",     # implicit namespace package (script dir)
