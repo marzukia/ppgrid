@@ -207,9 +207,12 @@ def box_count_mt(
        most of the speedup).
     3. Final window subtract: elementwise, parallel over row chunks.
 
-    n_threads=1 is bit-identical to box_count (A8). Peak transient memory is
-    ~2 full arrays, less than box_count's ~4, because each buffer is freed as
-    soon as the next pass owns the data.
+    n_threads=1 is bit-identical to box_count (A8). Peak transient memory,
+    tracemalloc-measured: float32 regime ~2 full arrays vs box_count's ~4
+    (each buffer is freed as soon as the next pass owns the data); int64
+    regime on float32 input (the pipeline case) ~5 vs ~5, parity, because
+    the int64 cast is held across pass 1 and the fancy-index copies set the
+    peak.
 
     Returns:
         Box-count array with the same shape as input. float32 (exact integer
