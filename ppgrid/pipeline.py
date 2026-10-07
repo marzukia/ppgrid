@@ -31,7 +31,7 @@ from rasterio.transform import from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 
-from . import __version__, turbop, zstdmt
+from . import __version__, _prof, turbop, zstdmt
 from .calibrate import (
     M_PER_KM,
     PERCENTILE_MAX,
@@ -1251,7 +1251,8 @@ class Pipeline:
             lon = df[self.lng_col].to_numpy(dtype=np.float64)
             lat = df[self.lat_col].to_numpy(dtype=np.float64)
         else:
-            v, lon, lat = self._read_points(wanted)
+            with _prof.phase("ingest.csv"):
+                v, lon, lat = self._read_points(wanted)
 
         good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
         v, lon, lat = v[good], lon[good], lat[good]
@@ -1261,11 +1262,12 @@ class Pipeline:
             msg = "No valid points found in input. Check columns and data."
             raise ValueError(msg)
 
-        tr = Transformer.from_crs(self.src_crs, self.work_crs, always_xy=True)
-        x, y = tr.transform(lon, lat)
-        self.x = np.asarray(x)
-        self.y = np.asarray(y)
-        self.v = v
+        with _prof.phase("ingest.proj"):
+            tr = Transformer.from_crs(self.src_crs, self.work_crs, always_xy=True)
+            x, y = tr.transform(lon, lat)
+            self.x = np.asarray(x)
+            self.y = np.asarray(y)
+            self.v = v
 
     def _read_points(self, wanted: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Read (value, lon, lat) float64 arrays from the CSV input.
@@ -1521,10 +1523,13 @@ class Pipeline:
 
         """
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
-        self.ingest()
-        self.calibrate()
+        with _prof.phase("ingest"):
+            self.ingest()
+        with _prof.phase("calibrate"):
+            self.calibrate()
         try:
-            self.grid()
+            with _prof.phase("grid"):
+                self.grid()
             self._turbo_precheck()
             return self._write_rasters()
         finally:
@@ -1546,7 +1551,14 @@ class Pipeline:
         available - 8 GB instead of planning against RAM the process
         cannot see (a capped slice OOMs at its own limit).
 
+        PPGRID_CAP_GB (debug/test only, not a CLI flag): forces the cap,
+        skipping detection and the clamp. Used to exercise a regime on a
+        capped slice without matching the slice to the box.
+
         """
+        override = os.environ.get("PPGRID_CAP_GB")
+        if override is not None:
+            return max(float(override), turbop.CAP_FLOOR_GB), f"PPGRID_CAP_GB override {override:g} GB"
         return turbop.resolve_cap(
             self.turbo_cap_gb,
             physical_gb=turbop._read_physical_gb(),  # ruff: ignore[private-member-access]
@@ -1662,6 +1674,11 @@ class Pipeline:
             probe.unlink(missing_ok=True)
         return False
 
+    def _is_regime_a(self) -> bool:
+        """Return True when the pre-check selected regime A (full in-RAM)."""
+        d = self._turbo_decision
+        return d is not None and d.regime == "A"
+
     def _prepare_shared(self) -> bool:
         """Prebuild the full-grid pull-push field shared by all blocks (bit-exact).
 
@@ -1704,37 +1721,59 @@ class Pipeline:
                     return False
 
         pts = np.load(self.pts_path, mmap_mode="r")
-        ix = ((pts[PTS_X][:] - self.x0) // self.res).astype(np.int64)
-        iy = ((pts[PTS_Y][:] - self.y0) // self.res).astype(np.int64)
+        with _prof.phase("shared.ix"):
+            ix = ((pts[PTS_X][:] - self.x0) // self.res).astype(np.int64)
+            iy = ((pts[PTS_Y][:] - self.y0) // self.res).astype(np.int64)
         cap_cells = round(self.cap_km_val * M_PER_KM / self.res)
         out_dir = Path(self.out_dir)
-        if self.nx_padded * self.ny_padded > _SHARED_MEMMAP_CELLS:
+        force_memmap = os.environ.get("PPGRID_FORCE_MEMMAP") == "1"
+        # Regime A = "full in-RAM, all workers" (SIZING table): keep the
+        # shared grids in anonymous RAM even past the 1e8 memmap threshold
+        # (issue #39: on a box under memory pressure the tmpfs memmap pages
+        # self-evict and the run pays a 46 us/fault re-fault storm).
+        use_memmap = (
+            self.nx_padded * self.ny_padded > _SHARED_MEMMAP_CELLS and not (self.turbo and self._is_regime_a())
+        ) or force_memmap
+        if use_memmap:
             # Keep the finest grids off the RAM budget: memmap + row banded
             # bin/near (bit-identical to the in-RAM pass, see pullpush).
             shape = (self.nx_padded, self.ny_padded)
             s0 = _open_fresh_memmap(out_dir / "_s0.npy", np.float32, shape)
             c0 = _open_fresh_memmap(out_dir / "_c0.npy", np.float32, shape)
-            bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
+            with _prof.phase("shared.bin"):
+                bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
             near_full = _open_fresh_memmap(out_dir / "_near.npy", bool, shape)
-            box_count_banded(c0, cap_cells, near_full, n_threads=n_threads)
+            with _prof.phase("shared.boxcount"):
+                box_count_banded(c0, cap_cells, near_full, n_threads=n_threads)
         else:
-            s0, c0 = bin_points(ix, iy, pts[PTS_TV][:], self.nx_padded, self.ny_padded)
+            with _prof.phase("shared.bin"):
+                s0, c0 = bin_points(ix, iy, pts[PTS_TV][:], self.nx_padded, self.ny_padded)
             if n_threads > 1:
-                near_full = box_count_mt(c0, cap_cells, n_threads=n_threads) > 0
+                with _prof.phase("shared.boxcount"):
+                    near_full = box_count_mt(c0, cap_cells, n_threads=n_threads) > 0
             else:
-                near_full = box_count(c0, cap_cells) > 0
+                with _prof.phase("shared.boxcount"):
+                    near_full = box_count(c0, cap_cells) > 0
 
-        sums: list[np.ndarray] = [s0]
-        for _ in range(self.levels):
-            sums.append(downsample_sum(sums[-1]))
-        counts: list[np.ndarray] = [c0]
-        for _ in range(self.levels):
-            counts.append(downsample_sum(counts[-1]))
+        with _prof.phase("shared.pyramid"):
+            sums: list[np.ndarray] = [s0]
+            for _ in range(self.levels):
+                sums.append(downsample_sum(sums[-1]))
+            counts: list[np.ndarray] = [c0]
+            for _ in range(self.levels):
+                counts.append(downsample_sum(counts[-1]))
 
-        if self.nx_padded * self.ny_padded <= _SHARED_MEMMAP_CELLS:
-            val_full, sup_full = _pull_push_descent(
-                sums, counts, self.res, self.levels, saturation=self.cfg.sat, n_threads=n_threads
-            )
+        if not use_memmap:
+            with _prof.phase("shared.descent"):
+                val_full, sup_full = _pull_push_descent(
+                    sums,
+                    counts,
+                    self.res,
+                    self.levels,
+                    saturation=self.cfg.sat,
+                    free_levels=True,
+                    n_threads=n_threads,
+                )
         else:
             # Full descent to level 2 (small arrays), then band levels 2 -> 1
             # -> 0 through memmap to bound RAM on multi-billion-cell grids.
@@ -1754,19 +1793,20 @@ class Pipeline:
             )
             val_full = _open_fresh_memmap(Path(self.out_dir) / "_val_full.npy", np.float32, s0.shape)
             sup_full = _open_fresh_memmap(Path(self.out_dir) / "_sup_full.npy", np.float32, s0.shape)
-            _descent_banded(
-                sums,
-                counts,
-                self.res,
-                self.cfg.sat,
-                start_level=lvl2,
-                val_in=val2,
-                sup_in=sup2,
-                out_val=val_full,
-                out_sup=sup_full,
-                level_dir=Path(self.out_dir),
-                n_threads=n_threads,
-            )
+            with _prof.phase("shared.descent_banded"):
+                _descent_banded(
+                    sums,
+                    counts,
+                    self.res,
+                    self.cfg.sat,
+                    start_level=lvl2,
+                    val_in=val2,
+                    sup_in=sup2,
+                    out_val=val_full,
+                    out_sup=sup_full,
+                    level_dir=Path(self.out_dir),
+                    n_threads=n_threads,
+                )
             for k in range(min(3, self.levels + 1)):
                 sums[k] = None  # type: ignore[assignment]
                 counts[k] = None  # type: ignore[assignment]
@@ -1875,7 +1915,7 @@ class Pipeline:
                     _CTX["cfg"] = cfg
                     if self._prepare_shared():
                         cfg.shared = True
-                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                    with ThreadPoolExecutor(max_workers=self.workers) as ex, _prof.phase("write.serial"):
                         for bx, by, out in ex.map(_process_block, self.tasks):
                             w = _block_window(bx, by, self.cfg)
 
@@ -1922,26 +1962,28 @@ class Pipeline:
                     )
 
                 out_crs = f"EPSG:{self.out_crs}"
-                _reproject_band(
-                    str(tmp_v),
-                    str(vpath),
-                    vprof,
-                    out_crs,
-                    dst_transform,
-                    dst_width,
-                    dst_height,
-                    n_threads=self.n_threads,
-                )
-                _reproject_band(
-                    str(tmp_s),
-                    str(spath),
-                    sprof,
-                    out_crs,
-                    dst_transform,
-                    dst_width,
-                    dst_height,
-                    n_threads=self.n_threads,
-                )
+                with _prof.phase("write.reproj_value"):
+                    _reproject_band(
+                        str(tmp_v),
+                        str(vpath),
+                        vprof,
+                        out_crs,
+                        dst_transform,
+                        dst_width,
+                        dst_height,
+                        n_threads=self.n_threads,
+                    )
+                with _prof.phase("write.reproj_support"):
+                    _reproject_band(
+                        str(tmp_s),
+                        str(spath),
+                        sprof,
+                        out_crs,
+                        dst_transform,
+                        dst_width,
+                        dst_height,
+                        n_threads=self.n_threads,
+                    )
             except Exception:
                 if tmp_v.exists():
                     tmp_v.rename(vpath)
@@ -1990,31 +2032,32 @@ class Pipeline:
 
         partial = False
         try:
-            val_dn = np.full((self.ny, self.nx), NODATA, np.int16)
-            sup_dn = np.full((self.ny, self.nx), NODATA, np.int16)
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
-                # One shared config object for all worker threads (no
-                # per-field dict copy). Rebuilt fresh each run: stale state
-                # from a previous run in this process is dropped.
-                _CTX.clear()
-                cfg = self.cfg
-                cfg.pts = np.load(cfg.pts_path, mmap_mode="r")
-                cfg.tf = make_transform(cfg.transform_state)
-                cfg.pct = PercentileTransform(cfg.pct_quantiles)
-                _CTX["cfg"] = cfg
-                if self._prepare_shared():
-                    cfg.shared = True
-                with ThreadPoolExecutor(max_workers=self.workers) as ex:
-                    for bx, by, out in ex.map(_process_block, self.tasks):
-                        w = _block_window(bx, by, self.cfg)
-                        if out is None:
-                            continue  # already NODATA
-                        rows = slice(w.row_off, w.row_off + w.height)
-                        cols = slice(w.col_off, w.col_off + w.width)
-                        vq, rq = out
-                        val_dn[rows, cols] = vq.T[::-1, :]
-                        sup_dn[rows, cols] = rq.T[::-1, :]
+            with _prof.phase("write.dnfill"):
+                val_dn = np.full((self.ny, self.nx), NODATA, np.int16)
+                sup_dn = np.full((self.ny, self.nx), NODATA, np.int16)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
+                    # One shared config object for all worker threads (no
+                    # per-field dict copy). Rebuilt fresh each run: stale state
+                    # from a previous run in this process is dropped.
+                    _CTX.clear()
+                    cfg = self.cfg
+                    cfg.pts = np.load(cfg.pts_path, mmap_mode="r")
+                    cfg.tf = make_transform(cfg.transform_state)
+                    cfg.pct = PercentileTransform(cfg.pct_quantiles)
+                    _CTX["cfg"] = cfg
+                    if self._prepare_shared():
+                        cfg.shared = True
+                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                        for bx, by, out in ex.map(_process_block, self.tasks):
+                            w = _block_window(bx, by, self.cfg)
+                            if out is None:
+                                continue  # already NODATA
+                            rows = slice(w.row_off, w.row_off + w.height)
+                            cols = slice(w.col_off, w.col_off + w.width)
+                            vq, rq = out
+                            val_dn[rows, cols] = vq.T[::-1, :]
+                            sup_dn[rows, cols] = rq.T[::-1, :]
         except BaseException:
             # Mid-run failure (worker error, OOM): the DN field is lost; warn
             # for parity with the serial path.
@@ -2046,13 +2089,31 @@ class Pipeline:
         # Budgeted MT thread count from the turbo plan drives the warp pool;
         # the n_threads kwarg stays the explicit non-turbo knob.
         warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
-        parallel = self._turbo_zstd_ok()
-        for arr, prof, path, tags, scales in (
-            (val_dn, vprof, vpath, vtags, (1.0 / self.scale,)),
-            (sup_dn, sprof, spath, stags, (1.0,)),
+        with _prof.phase("write.oracle"):
+            parallel = self._turbo_zstd_ok()
+        for band, arr, prof, path, tags, scales in (
+            ("value", val_dn, vprof, vpath, vtags, (1.0 / self.scale,)),
+            ("support", sup_dn, sprof, spath, stags, (1.0,)),
         ):
-            if not parallel:
-                _reproject_band_array(
+            with _prof.phase(f"write.reproj_{band}"):
+                if not parallel:
+                    _reproject_band_array(
+                        arr,
+                        xform,
+                        work_crs,
+                        str(path),
+                        prof,
+                        out_crs,
+                        dst_transform,
+                        dst_width,
+                        dst_height,
+                        tags=tags,
+                        scales=scales,
+                        offsets=(0.0,),
+                        n_threads=warp_threads,
+                    )
+                    continue
+                if not _turbo_write_parallel(
                     arr,
                     xform,
                     work_crs,
@@ -2066,40 +2127,24 @@ class Pipeline:
                     scales=scales,
                     offsets=(0.0,),
                     n_threads=warp_threads,
-                )
-                continue
-            if not _turbo_write_parallel(
-                arr,
-                xform,
-                work_crs,
-                str(path),
-                prof,
-                out_crs,
-                dst_transform,
-                dst_width,
-                dst_height,
-                tags=tags,
-                scales=scales,
-                offsets=(0.0,),
-                n_threads=warp_threads,
-            ):
-                # Layout guard tripped (see _turbo_write_parallel): the
-                # serial array reproject is byte-identical by construction.
-                _reproject_band_array(
-                    arr,
-                    xform,
-                    work_crs,
-                    str(path),
-                    prof,
-                    out_crs,
-                    dst_transform,
-                    dst_width,
-                    dst_height,
-                    tags=tags,
-                    scales=scales,
-                    offsets=(0.0,),
-                    n_threads=warp_threads,
-                )
+                ):
+                    # Layout guard tripped (see _turbo_write_parallel): the
+                    # serial array reproject is byte-identical by construction.
+                    _reproject_band_array(
+                        arr,
+                        xform,
+                        work_crs,
+                        str(path),
+                        prof,
+                        out_crs,
+                        dst_transform,
+                        dst_width,
+                        dst_height,
+                        tags=tags,
+                        scales=scales,
+                        offsets=(0.0,),
+                        n_threads=warp_threads,
+                    )
 
 
 def run(
