@@ -1126,6 +1126,25 @@ parallel write is trusted.
   the ctypes mechanics above are proven, only the exact codec parameters are
   pinned by the oracle at runtime.
 
+Committed-example anchor table (A6 byte-identity gate, `compare_anchor` in
+`bench/compare_tier2.py`). These sha256 are the byte-identity references for
+the committed rasters under `examples/`; a run that changes any of them has
+changed the pipeline output, not just the timing.
+
+| anchor | sha256 |
+|---|---|
+| `examples/melb/10m/value.tif` | `74d76b9b3a01dbc2ce76bf11c8fcd67d2c8b8b08ad1720b17983c28e00a5db43` |
+| `examples/melb/10m/support_km.tif` | `3d0822e1f15b545e359e51f748686d0500053f09b80e646ef7bf22b636a6c47d` |
+| `examples/melb/500m/value.tif` | `4a30bf476a85c9d30bb46aa84aa3aa140c532af0d03fda1dc90a72bfda3d45a7` |
+| `examples/melb/500m/support_km.tif` | `530cc25f3d4c5ebe2ab17359baeac56c635bc2f0096a14d70d7e790efaad9346` |
+| `examples/equakes/value.tif` | `e8a69ac692b3268723b7189db60eb288bf7d6764f033c98685a44b21b39efe4d` |
+| `examples/equakes/support_km.tif` | `e649801a615f1d9f6b38f734b12b54fe8a56bb858ca2b0f0bb71478973d6cd62` |
+
+The melb10 `value.tif` row was regenerated in this branch: the committed file
+predated a pipeline change, and pre-turbo `main` already produced the new
+bytes (verified against the pre-turbo HEAD in a clean worktree). The other
+rows are unchanged from `main`.
+
 ### A.7 Calibration oracle (spec)
 
 In words: the oracle in three steps. Write one tile the stock way, compress
