@@ -24,6 +24,7 @@ before the first heavy allocation (and before heavy imports) once wired.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -110,6 +111,8 @@ PER_BOX_WRITE_BUFFER_BYTES: float = 1.0e9
 # Host files for auto-detect (monkeypatched in tests).
 CGROUP_MEMORY_MAX: str = "/sys/fs/cgroup/memory.max"  # cgroup v2
 CGROUP_V1_LIMIT: str = "/sys/fs/cgroup/memory/memory.limit_in_bytes"  # cgroup v1 fallback
+CGROUP_ROOT: str = "/sys/fs/cgroup"  # cgroup v2 mount root (test seam)
+PROC_SELF_CGROUP: str = "/proc/self/cgroup"  # process cgroup paths (v2 unified line)
 MEMINFO_PATH: str = "/proc/meminfo"
 
 _PHASE_B_PER_CELL: dict[str, float] = {
@@ -530,19 +533,51 @@ def _finish_plan(
 
 
 def _read_cgroup_max_gb() -> float:
-    """Read cgroup memory.max in GB; 'max', missing, or unreadable -> inf."""
+    """Read the effective cgroup memory limit in GB for this process.
+
+    Walks the process's own cgroup up to the root and returns the smallest
+    finite memory.max found: a slice limit above the service cgroup (e.g.
+    user-1000.slice) binds even when the service cgroup itself is 'max'.
+    Falls back to the fixed v2/v1 paths when /proc/self/cgroup is
+    unavailable (old kernels, some containers). 'max', missing, or
+    unreadable everywhere -> inf.
+
+    """
+    limit = math.inf
+    try:
+        rel = ""
+        for line in Path(PROC_SELF_CGROUP).read_text(encoding="utf-8").splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0":  # cgroup v2 unified hierarchy
+                rel = parts[2].strip("/")
+                break
+        root = Path(CGROUP_ROOT)
+        cur = root / rel if rel else root
+        while True:
+            try:
+                raw = (cur / "memory.max").read_text(encoding="utf-8").strip()
+            except OSError:
+                raw = "max"
+            if raw not in ("max", ""):
+                with contextlib.suppress(ValueError):
+                    limit = min(limit, int(raw) / GB)
+            if cur in (root, cur.parent):
+                break
+            cur = cur.parent
+    except OSError:
+        pass
     for path_str in (CGROUP_MEMORY_MAX, CGROUP_V1_LIMIT):
         try:
             raw = Path(path_str).read_text(encoding="utf-8").strip()
         except OSError:
             continue
         if raw == "max":
-            return math.inf
+            continue
         try:
-            return int(raw) / GB
+            limit = min(limit, int(raw) / GB)
         except ValueError:
             continue
-    return math.inf
+    return limit
 
 
 def _read_physical_gb() -> float:

@@ -250,7 +250,9 @@ def box_count_mt(
     return out
 
 
-def box_count_banded(counts: np.ndarray, radius: int, out: np.ndarray, band_rows: int = 4096) -> None:
+def box_count_banded(
+    counts: np.ndarray, radius: int, out: np.ndarray, band_rows: int = 4096, n_threads: int = 1
+) -> None:
     """Row-banded box count, writing a boolean mask into `out` in place.
 
     Same window as box_count; each band re-derives the row prefixes over
@@ -262,6 +264,11 @@ def box_count_banded(counts: np.ndarray, radius: int, out: np.ndarray, band_rows
     The window subtractions use contiguous slices (the index offsets are
     linear in the row/column position except at the clamped edges), avoiding
     the per-element gathers of the full pass.
+
+    n_threads > 1 (S3.1) runs the band loop in a thread pool: each band
+    writes disjoint rows of `out` and re-derives its prefixes from the
+    read-only `counts`, so the bands are independent and the result stays
+    bit-identical to the serial loop (n_threads=1).
 
     """
     n0, n1 = counts.shape
@@ -275,7 +282,8 @@ def box_count_banded(counts: np.ndarray, radius: int, out: np.ndarray, band_rows
     if small_cols:
         lo_idx = np.clip(np.arange(n1) - radius, 0, n1)
         hi_idx = np.clip(np.arange(n1) + radius + 1, 0, n1)
-    for b0 in range(0, n0, band_rows):
+
+    def band(b0: int) -> None:
         b1 = min(n0, b0 + band_rows)
         e0 = max(0, b0 - radius)
         e1 = min(n0, b1 + radius)
@@ -304,6 +312,13 @@ def box_count_banded(counts: np.ndarray, radius: int, out: np.ndarray, band_rows
             alo = q[a - radius - e0 : b - radius - e0] if a >= radius else q[0]
             ahi = q[a + radius + 1 - e0 : b + radius + 1 - e0] if b <= n0 - radius else q[n0 - e0]
             out[a:b] = (ahi - alo) > 0
+
+    band_starts = [(b0, min(n0, b0 + band_rows)) for b0 in range(0, n0, band_rows)]
+    if n_threads > 1:
+        _thread_bands(band_starts, lambda b0, _b1: band(b0), n_threads)
+    else:
+        for b0, _b1 in band_starts:
+            band(b0)
 
 
 def _descent_band_body(

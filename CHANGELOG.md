@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+- Turbo: write path + budget cap + CLI (issue #33):
+  - `--turbo` (optional preset `16|32|64|128`; bare = auto `min(physical, cgroup) - 8 GB`), `--max-ram <GB>` (implies turbo), `--ram-gb` alias, `--turbo-strict`.
+  - Pre-check after `grid()`: prints the cap/budget/regime actually used; shared infeasible (per-box regime) -> strict: error + exit 3, else `[warn]` + continue on the per-box path with turbo warp/write (exit 0, correct output).
+  - `_write_rasters` turbo: skips the work-CRS intermediate files, keeps the quantised int16 DN fields in RAM, and reprojects tile-by-tile from arrays through the same GDAL warp kernel (byte-identical to the file-based path, sha256-tested). Optional parallel per-tile ZSTD via `zstdmt.compress_tiles`, gated by the compression oracle (mismatch -> serial GDAL write, byte-exact). In-RAM DN is budget-gated; oversized grids fall back to the file-based reproject path with MT warp.
+  - Budget-derived shared cap (S3.3) replaces the hard 2.5e8 cell cap in turbo mode; non-turbo keeps 2.5e8; the 1e8 in-RAM/memmap tier is unchanged.
+  - `_prepare_shared` / `box_count_banded` run threaded under the budgeted worker count when turbo (serial at `n_threads == 1`, A8 preserved).
+  - Fixed `turbop._read_cgroup_max_gb`: now walks the process cgroup hierarchy to the root and takes the smallest finite `memory.max` (a slice limit above the service cgroup binds; previously only the root cgroup was read, so capped user slices saw the full physical RAM and the auto cap could plan a regime that OOMs the slice).
+  - Regenerated stale anchor `examples/melb/10m/value.tif` (byte-identical to current `main` output; the committed file predated a pipeline change).
+
 ## [0.3.0] - 2026-10-06
 - Turbo: pipeline read-side MT (issue #32) behind a new `Pipeline(n_threads=...)` kwarg (default `1`: the serial code path, byte-identical output):
   - `_reproject_band`: the 2048px warp tiles of each row band run on a `ThreadPoolExecutor` (the GDAL warp runs under `nogil`; each tile opens its own source handle, GDAL dataset handles are not thread-safe). The 512px flush loop stays serial raster-scan, so the on-disk bytes never change (sha256-equal to the serial run is test-covered).
