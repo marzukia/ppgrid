@@ -337,16 +337,38 @@ def test_resolve_cap_clamp_and_floor() -> None:
 
 
 def test_cgroup_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_read_cgroup_max_gb parses v2 'max'/bytes and falls back to v1."""
-    f = tmp_path / "memory.max"
-    f.write_text("64000000000\n")  # 64 GB decimal (A.5 post-raise value)
-    monkeypatch.setattr(turbop, "CGROUP_MEMORY_MAX", str(f))
+    """_read_cgroup_max_gb: walk-up min over the process hierarchy, legacy fallback."""
+    # Walk-up: service cgroup is 'max', parent slice is finite -> the slice binds.
+    cg = tmp_path / "cg"
+    service = cg / "user.slice" / "user-1000.slice" / "user@1000.service"
+    service.mkdir(parents=True)
+    (service / "memory.max").write_text("max\n")
+    (cg / "user.slice" / "user-1000.slice" / "memory.max").write_text(f"{64 * 10**9}\n")
+    (cg / "memory.max").write_text("max\n")
+    proc = tmp_path / "self_cgroup"
+    proc.write_text("0::/user.slice/user-1000.slice/user@1000.service\n")
+    monkeypatch.setattr(turbop, "CGROUP_ROOT", str(cg))
+    monkeypatch.setattr(turbop, "PROC_SELF_CGROUP", str(proc))
+    monkeypatch.setattr(turbop, "CGROUP_MEMORY_MAX", str(tmp_path / "missing"))
+    monkeypatch.setattr(turbop, "CGROUP_V1_LIMIT", str(tmp_path / "missing_v1"))
     assert _read_cgroup_max_gb() == pytest.approx(64.0, abs=1e-6)
-    f.write_text("max\n")
+
+    # Deeper hierarchy: nearest finite limit wins when nested values differ.
+    (service / "memory.max").write_text(f"{16 * 10**9}\n")
+    assert _read_cgroup_max_gb() == pytest.approx(16.0, abs=1e-6)
+
+    # All 'max' -> inf (unlimited).
+    (service / "memory.max").write_text("max\n")
+    (cg / "user.slice" / "user-1000.slice" / "memory.max").write_text("max\n")
     assert math.isinf(_read_cgroup_max_gb())
+
+    # Legacy fallback: unreadable /proc/self/cgroup -> fixed v2/v1 paths.
+    monkeypatch.setattr(turbop, "PROC_SELF_CGROUP", str(tmp_path / "nope"))
+    f = tmp_path / "memory.max"
+    f.write_text("max\n")
     f1 = tmp_path / "limit"
     f1.write_text(str(16 * 10**9))
-    monkeypatch.setattr(turbop, "CGROUP_MEMORY_MAX", str(tmp_path / "missing"))
+    monkeypatch.setattr(turbop, "CGROUP_MEMORY_MAX", str(f))
     monkeypatch.setattr(turbop, "CGROUP_V1_LIMIT", str(f1))
     assert _read_cgroup_max_gb() == pytest.approx(16.0, abs=1e-6)
 
