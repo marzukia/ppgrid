@@ -16,6 +16,7 @@ estimate, in metres) which drives honest opacity / masking downstream.
 from __future__ import annotations
 
 import itertools
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -32,14 +33,26 @@ _COUNT_EPS = 1e-9
 _UNRESOLVED_M = 1e9
 
 
-def downsample_sum(a: np.ndarray) -> np.ndarray:
+def downsample_sum(a: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
     """2x2 block sum. Sums (not means) so s and c stay consistent.
+
+    Args:
+        a: Input array.
+        out: Optional preallocated destination, shape (a.shape[0] // 2,
+            a.shape[1] // 2), same dtype. Accumulates in place, skipping the
+            two intermediate full-size temporaries of the plain form (issue
+            #39). Bit-identical: same left-to-right addition order.
 
     Returns:
         Downsampled array with half the dimensions.
 
     """
-    return a[0::2, 0::2] + a[1::2, 0::2] + a[0::2, 1::2] + a[1::2, 1::2]
+    if out is None:
+        out = np.empty((a.shape[0] // 2, a.shape[1] // 2), dtype=a.dtype)
+    np.add(a[0::2, 0::2], a[1::2, 0::2], out=out)
+    out += a[0::2, 1::2]
+    out += a[1::2, 1::2]
+    return out
 
 
 def upsample_nearest(a: np.ndarray) -> np.ndarray:
@@ -86,6 +99,83 @@ def upsample_bilinear(a: np.ndarray) -> np.ndarray:
 
     """
     return _smooth3(upsample_nearest(a).astype(np.float32))
+
+
+def _smooth3_into(a: np.ndarray, out: np.ndarray, t: np.ndarray) -> None:
+    """In-place separable [1,2,1]/4 filter, same formulas as _smooth3.
+
+    All reads of `a` complete before any write to `out` (row pass, then
+    column pass), so `out` may alias `a` and `t` is scratch only. Bit-
+    identical to _smooth3: same per-element formulas and association; the
+    only reassociation is commutative addend order (x + y == y + x exactly
+    in IEEE-754).
+    """
+    if a.shape[0] <= 1 or a.shape[1] <= 1:
+        out[: a.shape[0], : a.shape[1]] = a
+        return
+    # Row pass: accumulate the (1,2,1) row convolution into t, then scale
+    # into out - every read of a lands in t first.
+    np.multiply(2.0, a[1:-1], out=t[1:-1])
+    t[1:-1] += a[:-2]
+    t[1:-1] += a[2:]
+    np.multiply(3.0, a[0], out=t[0])
+    t[0] += a[1]
+    np.multiply(3.0, a[-1], out=t[-1])
+    t[-1] += a[-2]
+    np.multiply(0.25, t[1:-1], out=out[1:-1])
+    np.multiply(0.25, t[0], out=out[0])
+    np.multiply(0.25, t[-1], out=out[-1])
+    # Column pass on the row-smoothed array (now `out`): same pattern.
+    np.multiply(2.0, out[:, 1:-1], out=t[:, 1:-1])
+    t[:, 1:-1] += out[:, :-2]
+    t[:, 1:-1] += out[:, 2:]
+    np.multiply(3.0, out[:, 0], out=t[:, 0])
+    t[:, 0] += out[:, 1]
+    np.multiply(3.0, out[:, -1], out=t[:, -1])
+    t[:, -1] += out[:, -2]
+    np.multiply(0.25, t[:, 1:-1], out=out[:, 1:-1])
+    np.multiply(0.25, t[:, 0], out=out[:, 0])
+    np.multiply(0.25, t[:, -1], out=out[:, -1])
+
+
+def _upsample_bilinear_into(src: np.ndarray, dst: np.ndarray, t: np.ndarray) -> None:
+    """In-place upsample_bilinear: 2x nearest + tent, into preallocated buffers.
+
+    Bit-identical to upsample_bilinear(src) (same per-element formulas; the
+    nearest step is four strided copies instead of two np.repeat passes).
+    dst and t must have shape at least (2 * src.shape[0], 2 * src.shape[1]);
+    only that prefix is touched.
+    """
+    h, w = src.shape
+    hh, ww = 2 * h, 2 * w
+    up = dst[:hh, :ww]
+    tt = t[:hh, :ww]
+    up[0::2, 0::2] = src
+    up[1::2, 0::2] = src
+    up[0::2, 1::2] = src
+    up[1::2, 1::2] = src
+    _smooth3_into(up, up, tt)
+
+
+def _band_bufs(band_rows: int, n1: int) -> dict[str, np.ndarray]:
+    """Per-thread preallocated scratch for _descent_band_body (issue #39).
+
+    Sized for the widest band (band_rows rows) at a level with n1 columns;
+    a thread reuses its set across every band of the level, which cuts the
+    ~9 full-band-sized per-call allocations to zero first-touch pages. The
+    up/t buffers hold band_rows + 4 rows: an interior band's parent slice
+    is (band_rows // 2 + 2) rows, i.e. band_rows + 4 upsampled rows.
+    """
+    f = np.float32
+    return {
+        "a": np.empty((band_rows, n1), f),
+        "local": np.empty((band_rows, n1), f),
+        "om": np.empty((band_rows, n1), f),
+        "pv": np.empty((band_rows, n1), f),
+        "ps": np.empty((band_rows, n1), f),
+        "up": np.empty((band_rows + 4, n1), f),
+        "t": np.empty((band_rows + 4, n1), f),
+    }
 
 
 def _box_count_int64(counts: np.ndarray, radius: int) -> np.ndarray:
@@ -179,7 +269,9 @@ def _thread_bands(bands: list[tuple[int, int]], fn: Callable[[int, int], None], 
 
 def _row_prefix_rows(p: np.ndarray, c: np.ndarray, r0: int, r1: int) -> None:
     """box_count_mt pass 1 chunk: exclusive column prefix for rows [r0, r1)."""
-    p[r0:r1, 1:] = np.cumsum(c[r0:r1], axis=1, dtype=p.dtype)
+    # out= skips the per-chunk (rows, n1+1) cumsum temporary (issue #39);
+    # the accumulation sequence per row is unchanged (bit-identical).
+    np.cumsum(c[r0:r1], axis=1, dtype=p.dtype, out=p[r0:r1, 1:])
 
 
 def _window_sub_rows(q: np.ndarray, out: np.ndarray, lo: np.ndarray, hi: np.ndarray, r0: int, r1: int) -> None:
@@ -232,7 +324,19 @@ def box_count_mt(
 
     lo = np.clip(np.arange(n1) - radius, 0, n1)
     hi = np.clip(np.arange(n1) + radius + 1, 0, n1)
-    w = p[:, hi] - p[:, lo]
+    # Window sums into one preallocated buffer (issue #39). The index offsets
+    # are linear in the column position except at the clamped edges, so the
+    # interior and both edges are contiguous slice subtractions - no
+    # fancy-index gather temporaries. Bit-identical to p[:, hi] - p[:, lo]:
+    # same elementwise subtractions, same order.
+    w = np.empty((n0, n1), dtype)
+    r = radius
+    if 2 * r + 1 <= n1:
+        np.subtract(p[:, r + 1 : 2 * r + 1], p[:, :1], out=w[:, :r])
+        np.subtract(p[:, 2 * r + 1 :], p[:, : n1 - 2 * r], out=w[:, r : n1 - r])
+        np.subtract(p[:, n1 : n1 + 1], p[:, n1 - 2 * r : n1 - r], out=w[:, n1 - r :])
+    else:
+        w = p[:, hi] - p[:, lo]
     del p
 
     # Pass 2: row prefix of the window sums, contiguous via the transpose.
@@ -337,6 +441,7 @@ def _descent_band_body(
     out: np.ndarray,
     outs: np.ndarray,
     upsample: Callable[[np.ndarray], np.ndarray] = upsample_bilinear,
+    bufs: dict[str, np.ndarray] | None = None,
 ) -> None:
     """One row band of the pull-push descent: level k -> output rows [r0, r1).
 
@@ -355,12 +460,44 @@ def _descent_band_body(
     e0 = max(0, r0 // 2 - 1)
     e1 = min(val.shape[0], r1 // 2 + 1)
     p0 = 2 * e0
-    a = np.minimum(counts_k[r0:r1] / saturation, 1.0).astype(np.float32)
-    local = sums_k[r0:r1] / np.maximum(counts_k[r0:r1], _COUNT_EPS)
-    pv = upsample(val[e0:e1])[r0 - p0 : r1 - p0]
-    ps = upsample(sup[e0:e1])[r0 - p0 : r1 - p0]
-    out[r0:r1] = np.where(a >= 1.0, local, a * local + (1.0 - a) * pv)
-    outs[r0:r1] = a * np.float32(res * (1 << k)) + (1.0 - a) * ps
+    if bufs is None:
+        a = np.minimum(counts_k[r0:r1] / saturation, 1.0).astype(np.float32)
+        local = sums_k[r0:r1] / np.maximum(counts_k[r0:r1], _COUNT_EPS)
+        pv = upsample(val[e0:e1])[r0 - p0 : r1 - p0]
+        ps = upsample(sup[e0:e1])[r0 - p0 : r1 - p0]
+        out[r0:r1] = np.where(a >= 1.0, local, a * local + (1.0 - a) * pv)
+        outs[r0:r1] = a * np.float32(res * (1 << k)) + (1.0 - a) * ps
+        return
+    # Preallocated path (issue #39): same formulas and IEEE-754 association
+    # as the alloc path, but every scratch array is a per-thread buffer, so
+    # a band touches zero fresh pages. (1.0 - a) below is bit-equal to the
+    # alloc path's: x - y == x + (-y) exactly in IEEE-754.
+    bh = r1 - r0
+    a = bufs["a"][:bh]
+    local = bufs["local"][:bh]
+    om = bufs["om"][:bh]
+    pv = bufs["pv"][:bh]
+    ps = bufs["ps"][:bh]
+    up = bufs["up"]
+    tt = bufs["t"]
+    np.divide(counts_k[r0:r1], saturation, out=a)
+    np.minimum(a, 1.0, out=a)
+    np.maximum(counts_k[r0:r1], _COUNT_EPS, out=om)
+    np.divide(sums_k[r0:r1], om, out=local)
+    _upsample_bilinear_into(val[e0:e1], up, tt)
+    pv[:] = up[r0 - p0 : r1 - p0]
+    _upsample_bilinear_into(sup[e0:e1], up, tt)
+    ps[:] = up[r0 - p0 : r1 - p0]
+    o = out[r0:r1]
+    np.multiply(a, local, out=o)
+    np.subtract(1.0, a, out=om)
+    np.multiply(om, pv, out=om)
+    o += om
+    np.copyto(o, local, where=a >= 1.0)
+    os = outs[r0:r1]
+    np.multiply(a, np.float32(res * (1 << k)), out=os)
+    np.multiply(om, ps, out=om)
+    os += om
 
 
 def _pull_push_descent(
@@ -375,7 +512,7 @@ def _pull_push_descent(
     *,
     free_levels: bool = False,
     n_threads: int = 1,
-    band_rows: int = 1024,
+    band_rows: int = 512,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Descend a prebuilt pull-push pyramid (coarsest -> finest).
 
@@ -420,9 +557,14 @@ def _pull_push_descent(
     for k in range(levels - 1, stop_level - 1, -1):
         if threaded:
             n0 = sums[k].shape[0]
+            n1 = sums[k].shape[1]
             bands = [(r0, min(n0, r0 + band_rows)) for r0 in range(0, n0, band_rows)]
             out = np.empty_like(sums[k])
             outs = np.empty_like(counts[k])
+            # Per-thread buffer sets (issue #39): a thread reuses one set
+            # across every band of the level; the set is sized for this
+            # level's column count and dropped when the level ends.
+            bufs: dict[int, dict[str, np.ndarray]] = {}
 
             def _band(
                 r0: int,
@@ -434,11 +576,21 @@ def _pull_push_descent(
                 _sup: np.ndarray = sup,
                 _sums_k: np.ndarray = sums[k],
                 _counts_k: np.ndarray = counts[k],
+                _bufs: dict[int, dict[str, np.ndarray]] = bufs,
+                _n1: int = n1,
+                _n0: int = n0,
             ) -> None:
-                _descent_band_body(_sums_k, _counts_k, _val, _sup, res, saturation, _k, r0, r1, _out, _outs, upsample)
+                tid = threading.get_ident()
+                b = _bufs.get(tid)
+                if b is None:
+                    b = _bufs[tid] = _band_bufs(min(band_rows, _n0), _n1)
+                _descent_band_body(
+                    _sums_k, _counts_k, _val, _sup, res, saturation, _k, r0, r1, _out, _outs, upsample, bufs=b
+                )
 
             _thread_bands(bands, _band, n_threads)
             val, sup = out, outs
+            bufs.clear()
         else:
             c = counts[k]
             a = np.minimum(c / saturation, 1.0).astype(np.float32)
