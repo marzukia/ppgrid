@@ -365,8 +365,12 @@ def plan(
 
     Selection: A if ``N <= (0.85*C - 4)/24.5`` (full in-RAM), else B if
     ``Bt >= N*M_in + max(M_box, M_band)`` (input in RAM, banded), else C
-    (all memmap, 8 GB page-cache floor, viable with >= 2 in-flight
-    units), else per-box fallback with turbo warp/write.
+    (all memmap, 8 GB page-cache floor), else per-box fallback with turbo
+    warp/write. B admits on that bound, but the 0.1*Bt tile cache is
+    reserved before in-flight sizing; if it leaves c = 0 or b = 0 the B
+    candidate is degenerate (0 workers) and falls through to C. C is
+    viable with c >= 1, b >= 1, and >= 2 in-flight units; the gate runs
+    before any division.
 
     Args:
         cap_gb: RAM cap C in GB (after :func:`resolve_cap`).
@@ -421,36 +425,46 @@ def plan(
         left = sizing - n_in - t * M_TILE_BYTES
         c = max(0, int(left // m_box))
         b = max(0, int(left // m_band))
-        workers = min(MAX_WORKERS, cpu, c, b)
-        inflight = max(c * m_box, b * m_band)
-        val_ram = sizing >= n_cells * (M_IN_B_PER_CELL + M_VS_B_PER_CELL) + t * M_TILE_BYTES + inflight
-        # Component-bound est peak (3.6.2). The in-flight sizing keeps the
-        # planned peak at or below Bt + B0 = 0.85*C, the bound the
-        # pre-check compares against.
-        comp = n_in + t * M_TILE_BYTES + c * m_box + b * m_band + B0_BYTES
-        est = min(comp, sizing + B0_BYTES)
-        wall = wall_model_s(workers)
-        return _finish_plan(
-            row,
-            cap_gb,
-            n_cells,
-            "B",
-            c,
-            b,
-            workers,
-            t,
-            val_sup_memmap=not val_ram,
-            est=est,
-            budget=budget,
-            sizing=sizing,
-            wall=wall,
-        )
+        # Knife-edge guard: the admission bound above does not account for
+        # the tile-cache reservation, so left can hold under one unit of a
+        # kind (full-AU, C in [24.13, 24.42) GB: c = 0). With c or b at 0
+        # the worker count would be 0 and wall_model_s would divide by
+        # zero; fall through to the regime C candidate instead.
+        if c >= 1 and b >= 1:
+            workers = min(MAX_WORKERS, cpu, c, b)
+            inflight = max(c * m_box, b * m_band)
+            val_ram = sizing >= n_cells * (M_IN_B_PER_CELL + M_VS_B_PER_CELL) + t * M_TILE_BYTES + inflight
+            # Component-bound est peak (3.6.2). The in-flight sizing keeps the
+            # planned peak at or below Bt + B0 = 0.85*C, the bound the
+            # pre-check compares against.
+            comp = n_in + t * M_TILE_BYTES + c * m_box + b * m_band + B0_BYTES
+            est = min(comp, sizing + B0_BYTES)
+            wall = wall_model_s(workers)
+            return _finish_plan(
+                row,
+                cap_gb,
+                n_cells,
+                "B",
+                c,
+                b,
+                workers,
+                t,
+                val_sup_memmap=not val_ram,
+                est=est,
+                budget=budget,
+                sizing=sizing,
+                wall=wall,
+            )
 
     # Regime C candidate: all memmap, 8 GB page-cache floor.
     left = sizing - PAGE_CACHE_FLOOR_BYTES
     c = max(0, int(left // m_box))
     b = max(0, int(left // m_band))
-    if max(c, b) >= 2:
+    # Viability gate runs before any division: c >= 1 and b >= 1 keep the
+    # worker count at 1 or more. max(c, b) >= 2 alone admits c = 0 or
+    # b = 0 (large radii make M_box outrun the floor), which would hit
+    # the same wall_model_s division by zero.
+    if c >= 1 and b >= 1 and max(c, b) >= 2:
         workers = min(MAX_WORKERS, cpu, c, b)
         # The tile cache lives inside the page-cache floor here.
         est = max(c * m_box, b * m_band) + PAGE_CACHE_FLOOR_BYTES + B0_BYTES
@@ -632,13 +646,18 @@ def resolve_cap(
 
     Precedence: --max-ram > --turbo preset > auto. Clamp rule: a preset
     >= physical RAM means whole box, so C = physical - 8 GB (keep OS
-    headroom); below physical the preset stands as given. Floor
-    C = max(C, 8).
+    headroom); below physical the preset stands as given. The clamp runs
+    only when physical_gb is passed; with a preset and physical_gb None
+    it is skipped and no read happens (callers that want the clamp must
+    pass physical_gb, e.g. from _read_physical_gb). Floor C = max(C, 8).
 
     Args:
         preset_gb: Explicit --max-ram or --turbo preset in GB; None = auto.
-        physical_gb: Physical RAM in GB, for the clamp and auto; read if None.
-        cgroup_gb: cgroup memory.max in GB, for the auto path; read if None.
+        physical_gb: Physical RAM in GB. Preset path: passed = clamp
+            applies; None = clamp skipped, no read. Auto path: read from
+            /proc/meminfo if None.
+        cgroup_gb: cgroup memory.max in GB, used only on the auto path;
+            read if None (inf = unlimited).
 
     Returns:
         (cap_gb, source) tuple; source is printable for deploy visibility.
