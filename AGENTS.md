@@ -81,6 +81,35 @@ not downstream calculation).
   ```
 - Branches go to a PR, not main, per the fleet merge gate.
 
+## What changed recently (2026-10-07, PR #39 review fixes: M-1..M-3, Y-1)
+
+- M-1: equakes anchors regenerated under the rasterio 1.5.1 lock (the committed
+  files were cut on 1.5.0; the vendored GDAL emits different BigTIFF ZSTD tile
+  bytes — arrays equal, tile offsets moved). New shas in the A.6 table:
+  `examples/equakes/value.tif` `99c8a01c…`, `support_km.tif` `5e545742…`.
+  `bench/compare_tier2.py` re-run: bit-identical (melb anchors unchanged).
+- M-2: `turbop.resolve_cap` clamps a preset against `min(physical, cgroup)`
+  (a capped slice OOMs at its own limit); the pipeline wires both reads via
+  `Pipeline._resolve_turbo_cap` (before: preset 32 on a 25.8 GB slice planned
+  32 GB; now clamps to 17.8 GB).
+- M-3: `turbop.per_box_peak_bytes` (64 B/cell bottom-up + 2 GB fixed, x
+  in-flight blocks + points/DN extra) + `precheck(per_box_peak_bytes=…)`;
+  the pipeline computes it from the worst snapped box after `grid()`.
+  Non-strict per-box over budget now warns "best-effort, OOM risk, output may
+  be partial" instead of promising exit-0 correct output; strict names the
+  per-box infeasibility. Verified: melb @1m --max-ram 8 warns 189.7 GB est >
+  6.8 GB budget, then dies 137.
+- Y-1: BigTIFF slot widths in the parallel ZSTD write. `_tif_parse_ifd` sizes
+  tags per TIFF type (type 16 LONG8 added; unknown type = hard error) and
+  returns `sz324/sz325/fmt324/fmt325`; `_turbo_write_parallel` patches 324
+  (8-byte slots) and 325 (4-byte slots) at their real strides, shared
+  `_TIFF_TYPE_SIZES` with the overlap guard. Pre-fix, one 8-byte stride
+  corrupted both arrays on every real BigTIFF output (7888 tiles: 325 sizes
+  read `2000, 0, 2001, 0, …`). Pinned: BigTIFF parallel byte-identity test +
+  IFD parse value asserts.
+- Tests: 170 -> 176 (resolve_cap cgroup clamp, per-box peak model + gate,
+  pipeline wiring, BigTIFF parallel, IFD value pins).
+
 ## What changed recently (2026-10-07, turbo write path + CLI, issue #33)
 
 - CLI: `--turbo` (optional preset `16|32|64|128`; bare = auto cap), `--max-ram <GB>` (implies turbo), `--ram-gb` (alias of `--max-ram`), `--turbo-strict`. Pre-check after `grid()` prints cap/budget/regime used; shared infeasible (per-box regime) -> strict: stderr error + exit 3, else `[warn]` + continue on per-box with turbo warp/write (exit 0, correct output).

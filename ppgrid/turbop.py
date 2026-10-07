@@ -112,6 +112,18 @@ PER_BOX_SKIP_WORKFILE_S: float = 89.3  # skip the work-CRS intermediate (S3.4)
 PER_BOX_BASE_RSS_BYTES: float = 3.69e9
 PER_BOX_WRITE_BUFFER_BYTES: float = 1.0e9
 
+# Per-box fallback peak sizing (M-3): bytes per box cell, bottom-up from the
+# live arrays in the per-box block path (bin_points -> pull_push -> serial
+# descent -> box_count -> quantize): s + c f32 (8) + pyramid levels 1..L f32
+# (<= 8/3) + serial-descent finest-level live peak (val, sup, a, local,
+# upsample chain ~12, np.where temps ~16; ~48) + box_count fast path
+# (p, w, q, out f32; ~16). Rounded up: the overestimate is deliberate, an
+# OOM warning must fire early, never late.
+PER_BOX_B_PER_CELL: float = 64.0
+# Fixed (non-per-cell) per-process overhead of the per-box path: block
+# outputs, GDAL/rasterio runtime, python/numpy/allocator floor.
+PER_BOX_FIXED_BYTES: float = 2.0 * GB
+
 # Host files for auto-detect (monkeypatched in tests).
 CGROUP_MEMORY_MAX: str = "/sys/fs/cgroup/memory.max"  # cgroup v2
 CGROUP_V1_LIMIT: str = "/sys/fs/cgroup/memory/memory.limit_in_bytes"  # cgroup v1 fallback
@@ -286,6 +298,27 @@ def per_box_wall_s() -> float:
 
     """
     return ANCHOR_WALL_S - PER_BOX_WARP_SAVE_S - PER_BOX_ZSTD_SAVE_S - PER_BOX_SKIP_WORKFILE_S
+
+
+def per_box_peak_bytes(box_cells: int, *, in_flight: int = 1, extra_bytes: int = 0) -> int:
+    """Estimate the per-box fallback peak RSS (M-3).
+
+    The per-box block loop runs up to `in_flight` boxes concurrently, each
+    holding its own snapped (bsize + 2*halo) grid; that peak is what the
+    shared-path pre-check estimate (field-wide) does not cover.
+
+    Args:
+        box_cells: Worst-case per-box grid size in cells: (bsize + 2*halo)
+            snapped up to the pyramid step, squared.
+        in_flight: Max boxes in flight at once (block-loop worker count).
+        extra_bytes: Other always-live memory (in-RAM DN field on the turbo
+            write, points arrays).
+
+    Returns:
+        Estimated peak in bytes.
+
+    """
+    return int(box_cells * PER_BOX_B_PER_CELL * max(1, in_flight) + PER_BOX_FIXED_BYTES + extra_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -649,20 +682,24 @@ def resolve_cap(
 ) -> tuple[float, str]:
     """Resolve the RAM cap C from an explicit preset or auto-detect (3.6.1).
 
-    Precedence: --max-ram > --turbo preset > auto. Clamp rule: a preset
-    >= physical RAM means whole box, so C = physical - 8 GB (keep OS
-    headroom); below physical the preset stands as given. The clamp runs
-    only when physical_gb is passed; with a preset and physical_gb None
-    it is skipped and no read happens (callers that want the clamp must
-    pass physical_gb, e.g. from _read_physical_gb). Floor C = max(C, 8).
+    Precedence: --max-ram > --turbo preset > auto. Clamp rule: a preset at
+    or above the process-visible memory means whole box, so
+    C = available - 8 GB (keep OS headroom); below available the preset
+    stands as given. The binding limit is the smaller of physical RAM and
+    the cgroup ceiling (M-2): a memory-capped slice OOMs at its own limit
+    long before the physical one. The clamp runs only when physical_gb is
+    passed; with a preset and physical_gb None it is skipped and no read
+    happens (callers that want the clamp must pass physical_gb, e.g. from
+    _read_physical_gb). Floor C = max(C, 8).
 
     Args:
         preset_gb: Explicit --max-ram or --turbo preset in GB; None = auto.
         physical_gb: Physical RAM in GB. Preset path: passed = clamp
-            applies; None = clamp skipped, no read. Auto path: read from
-            /proc/meminfo if None.
-        cgroup_gb: cgroup memory.max in GB, used only on the auto path;
-            read if None (inf = unlimited).
+            applies against min(physical, cgroup); None = clamp skipped,
+            no read. Auto path: read from /proc/meminfo if None.
+        cgroup_gb: cgroup memory.max in GB; read if None (inf = unlimited).
+            Preset path: the clamp compares against min(physical, cgroup);
+            auto path: the cap is min(physical, cgroup) - 8 GB.
 
     Returns:
         (cap_gb, source) tuple; source is printable for deploy visibility.
@@ -670,14 +707,23 @@ def resolve_cap(
     """
     if preset_gb is None:
         return detect_cap_gb(physical_gb, cgroup_gb)
-    cap = preset_gb
-    if physical_gb is not None and preset_gb >= physical_gb:
-        cap = physical_gb - AUTO_HEADROOM_GB
-        source = (
-            f"preset {preset_gb:g} GB >= physical {physical_gb:g} GB; clamped to physical - {AUTO_HEADROOM_GB:g} GB"
-        )
+    if physical_gb is None:
+        return max(preset_gb, CAP_FLOOR_GB), f"preset {preset_gb:g} GB"
+    available = min(physical_gb, cgroup_gb) if cgroup_gb is not None else physical_gb
+    if preset_gb >= available:
+        cap = available - AUTO_HEADROOM_GB
+        if cgroup_gb is not None:
+            cgroup_str = "unlimited" if math.isinf(cgroup_gb) else f"{cgroup_gb:g} GB"
+            source = (
+                f"preset {preset_gb:g} GB >= min(physical {physical_gb:g} GB, cgroup {cgroup_str}); "
+                f"clamped to available {available:g} GB - {AUTO_HEADROOM_GB:g} GB"
+            )
+        else:
+            source = (
+                f"preset {preset_gb:g} GB >= physical {physical_gb:g} GB; clamped to physical - {AUTO_HEADROOM_GB:g} GB"
+            )
     else:
-        source = f"preset {preset_gb:g} GB"
+        cap, source = preset_gb, f"preset {preset_gb:g} GB"
     return max(cap, CAP_FLOOR_GB), source
 
 
@@ -699,7 +745,13 @@ class PrecheckDecision:
     summary: str  # cap + budgets + plan used, printable for deploy visibility
 
 
-def precheck(plan: TurboPlan, *, strict: bool = False, cap_source: str = "auto") -> PrecheckDecision:
+def precheck(
+    plan: TurboPlan,
+    *,
+    strict: bool = False,
+    cap_source: str = "auto",
+    per_box_peak_bytes: int | None = None,
+) -> PrecheckDecision:
     """Gate the selected regime's est peak against the 0.85*C budget.
 
     A feasible regime fits the budget by construction (3.6.2), so the
@@ -708,10 +760,19 @@ def precheck(plan: TurboPlan, *, strict: bool = False, cap_source: str = "auto")
     regime-A field estimate, per A9. Non-strict always continues (exit
     0); strict exits 3 when only per-box fits (A9 pin: 16 GB full-AU).
 
+    Per-box gate (M-3): when per_box_peak_bytes is passed (the pipeline
+    computes it from the worst-case snapped box grid x in-flight blocks),
+    a per-box est above the budget is named explicitly: non-strict warns
+    "best effort, OOM risk" (the run may SIGKILL with partial output),
+    strict's error line reports the per-box infeasibility too. Without it
+    (pre-grid call, unit pins) the legacy per-box message stands.
+
     Args:
         plan: TurboPlan from :func:`plan`.
         strict: True for --turbo-strict (hard-fail instead of fallback).
         cap_source: Human-readable cap source from :func:`resolve_cap`.
+        per_box_peak_bytes: Worst-case per-box fallback peak in bytes
+            (:func:`per_box_peak_bytes`); None = not estimated.
 
     Returns:
         PrecheckDecision with exit_code 0 or 3 and the [warn]/error line.
@@ -739,13 +800,28 @@ def precheck(plan: TurboPlan, *, strict: bool = False, cap_source: str = "auto")
     # Per-box fallback: the natural shared estimate (regime A, field-only,
     # 2.2 base) is what overran; the per-box plan itself peaks ~4-6 GB.
     est_a_gb = plan.n_cells * PHASE_A_B_PER_CELL / GB
+    per_box_gb = per_box_peak_bytes / GB if per_box_peak_bytes is not None else None
+    est_gb = per_box_gb if per_box_gb is not None else est_a_gb
+    if per_box_gb is not None:
+        summary += f"; per-box est {per_box_gb:.1f} GB (worst snapped box x {plan.workers} in-flight)"
     if strict:
         message = f"error: --turbo est peak {est_a_gb:.1f} GB > budget {budget_gb:.1f} GB; shared path infeasible"
-        return PrecheckDecision("per_box", "per_box", est_a_gb, budget_gb, 3, message, summary)
-    message = (
-        f"[warn] --turbo: est peak {est_a_gb:.1f} GB > budget {budget_gb:.1f} GB; using per-box (turbo warp/write)"
-    )
-    return PrecheckDecision("per_box", "per_box", est_a_gb, budget_gb, 0, message, summary)
+        if per_box_gb is not None:
+            if per_box_gb > budget_gb:
+                message += f"; per-box est peak {per_box_gb:.1f} GB also > budget (will OOM)"
+            else:
+                message += f"; per-box est peak {per_box_gb:.1f} GB fits the budget"
+        return PrecheckDecision("per_box", "per_box", est_gb, budget_gb, 3, message, summary)
+    if per_box_gb is not None and per_box_gb > budget_gb:
+        message = (
+            f"[warn] --turbo: per-box est peak {per_box_gb:.1f} GB > budget {budget_gb:.1f} GB; "
+            "continuing best-effort (OOM risk, output may be partial)"
+        )
+    else:
+        message = (
+            f"[warn] --turbo: est peak {est_a_gb:.1f} GB > budget {budget_gb:.1f} GB; using per-box (turbo warp/write)"
+        )
+    return PrecheckDecision("per_box", "per_box", est_gb, budget_gb, 0, message, summary)
 
 
 # ---------------------------------------------------------------------------

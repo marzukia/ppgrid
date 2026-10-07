@@ -1137,13 +1137,23 @@ changed the pipeline output, not just the timing.
 | `examples/melb/10m/support_km.tif` | `3d0822e1f15b545e359e51f748686d0500053f09b80e646ef7bf22b636a6c47d` |
 | `examples/melb/500m/value.tif` | `4a30bf476a85c9d30bb46aa84aa3aa140c532af0d03fda1dc90a72bfda3d45a7` |
 | `examples/melb/500m/support_km.tif` | `530cc25f3d4c5ebe2ab17359baeac56c635bc2f0096a14d70d7e790efaad9346` |
-| `examples/equakes/value.tif` | `e8a69ac692b3268723b7189db60eb288bf7d6764f033c98685a44b21b39efe4d` |
-| `examples/equakes/support_km.tif` | `e649801a615f1d9f6b38f734b12b54fe8a56bb858ca2b0f0bb71478973d6cd62` |
+| `examples/equakes/value.tif` | `99c8a01cc1aebda91ef486af08aff5f81a61d1f125ca3055d4ec803eb8e5b2ef` |
+| `examples/equakes/support_km.tif` | `5e545742db90a6f969b5e4919841cef49c38de100d1cafc4adecc59922af03f3` |
 
 The melb10 `value.tif` row was regenerated in this branch: the committed file
 predated a pipeline change, and pre-turbo `main` already produced the new
-bytes (verified against the pre-turbo HEAD in a clean worktree). The other
-rows are unchanged from `main`.
+bytes (verified against the pre-turbo HEAD in a clean worktree). The two
+equakes rows were also regenerated in this branch: they were committed
+(rasterio 1.5.0 lock) before main moved to rasterio 1.5.1, whose vendored
+GDAL emits different BigTIFF ZSTD tile bytes (tile offsets moved, full
+tiled arrays are equal). All other rows are unchanged from `main`.
+
+Pre-box per-box fallback note (M-3): when the shared path is infeasible
+and the run continues on the per-box path, the pre-check also estimates
+the worst-case per-box peak (snapped box grid x in-flight blocks +
+overheads). Non-strict: a per-box est above the budget is announced with
+an explicit OOM-risk warning (output may be partial, exit can be 137);
+strict: the error line reports the per-box infeasibility and exits 3.
 
 ### A.7 Calibration oracle (spec)
 

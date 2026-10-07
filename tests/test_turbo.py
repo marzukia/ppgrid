@@ -13,6 +13,7 @@
 import hashlib
 import math
 import struct
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -353,6 +354,49 @@ def test_turbo_precheck_nonstrict_continues(tmp_path: Path, monkeypatch: pytest.
     assert p._turbo_budget_bytes == turbop.precheck_budget_bytes(16.0)  # ruff: ignore[private-member-access]
 
 
+def test_resolve_turbo_cap_cgroup_wired(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """M-2: the precheck resolves the cap with physical + cgroup (clamp-aware)."""
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_physical_gb", lambda: 134.9)
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_cgroup_max_gb", lambda: 24.0)
+    p = Pipeline(str(DATA_CSV), "price", "longitude", "latitude", str(tmp_path / "o"), turbo=True, turbo_cap_gb=32.0)
+    cap, source = p._resolve_turbo_cap()  # ruff: ignore[private-member-access]
+    assert cap == 16.0  # min(134.9, 24) - 8: the slice limit binds
+    assert "cgroup 24 GB" in source
+    p.turbo_cap_gb = None  # auto path, same wired values
+    cap, source = p._resolve_turbo_cap()  # ruff: ignore[private-member-access]
+    assert cap == 16.0
+    assert source.startswith("auto")
+
+
+def test_turbo_precheck_per_box_peak(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """M-3: the precheck hands the worst-case per-box est to turbop.precheck."""
+    monkeypatch.setattr(pipeline_mod.turbop, "resolve_cap", _identity_cap)
+    seen: dict[str, object] = {}
+    orig = pipeline_mod.turbop.precheck
+
+    def spy(plan: turbop.TurboPlan, **kw: object) -> Any:
+        seen.update(kw)
+        return orig(plan, **kw)
+
+    monkeypatch.setattr(pipeline_mod.turbop, "precheck", spy)
+    p = _a9_pipeline(tmp_path, 16.0)
+    # Pre-grid: box geometry unknown -> no estimate (legacy message path).
+    p._turbo_precheck()  # ruff: ignore[private-member-access]
+    assert seen["per_box_peak_bytes"] is None
+    # Post-grid: worst snapped box x in-flight + points + in-RAM DN field.
+    p.bsize, p.halo, p.step = 2048, 256, 256
+    p.nx, p.ny = _A9_WC, _A9_CELLS // _A9_WC
+    p.tasks = [(i, 0) for i in range(1000)]
+    p._turbo_precheck()  # ruff: ignore[private-member-access]
+    worst = -(-(2048 + 2 * 256) // 256) * 256  # 2560
+    expect = turbop.per_box_peak_bytes(
+        worst * worst, in_flight=min(p.workers, 1000), extra_bytes=p.n * 32 + p.nx * p.ny * 4
+    )
+    assert seen["per_box_peak_bytes"] == expect
+    assert p._turbo_decision is not None  # ruff: ignore[private-member-access]
+    assert p._turbo_decision.path == "per_box"  # ruff: ignore[private-member-access]
+
+
 def test_turbo_cap_gb_validation() -> None:
     """turbo_cap_gb must be > 0."""
     with pytest.raises(ValueError, match="turbo_cap_gb"):
@@ -444,10 +488,10 @@ def _stock_frames(path: Path) -> list[bytes]:
     """Read the stored (compressed) tile frames of a tiled GTiff in raster-scan order."""
     data = path.read_bytes()
     info = _tif_parse_ifd(data)
-    fmt = info["off_fmt"]
     n = info["n_tiles"]
-    offs = struct.unpack_from(info["e"] + f"{n}{fmt}", data, info["t324"][2])
-    sizes = struct.unpack_from(info["e"] + f"{n}{fmt}", data, info["t325"][2])
+    # Per-tag slot widths (Y-1): BigTIFF 324 is LONG8 (8 B), 325 is LONG (4 B).
+    offs = struct.unpack_from(info["e"] + f"{n}{'Q' if info['sz324'] == 8 else 'I'}", data, info["t324"][2])
+    sizes = struct.unpack_from(info["e"] + f"{n}{'Q' if info['sz325'] == 8 else 'I'}", data, info["t325"][2])
     frames = [data[o : o + s] for o, s in zip(offs, sizes, strict=True)]
     assert len(frames) == n
     assert all(f[:4] == b"\x28\xb5\x2f\xfd" for f in frames)  # zstd magic
@@ -512,6 +556,68 @@ def test_turbo_write_parallel_matches_serial(tmp_path: Path, monkeypatch: pytest
             assert ds.tags()[k] == v
 
 
+def test_turbo_write_parallel_bigtiff_matches_serial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """BigTIFF heads patch per-tag slot widths; output is byte-identical (Y-1).
+
+    Same oracle pass as the classic test, but the reference head is a
+    real BigTIFF: tag 324 is LONG8 (8-byte slots) while 325 is LONG
+    (4-byte slots). Patching both at one stride corrupts the 325 region
+    (the pre-fix bug); per-tag strides keep the file byte-identical.
+
+    """
+    a, xform = _demo_field(1600, 1400, 100.0, seed=11)
+    dst_transform, dst_width, dst_height = _dst_grid(1600, 1400, 100.0)
+    work_crs, dst_crs = f"EPSG:{WORK_CRS}", f"EPSG:{OUT_CRS}"
+    tags = {"transform": "identity", "res_m": "100.0"}
+    scales, offsets = (1.0 / 100.0,), (0.0,)
+    profile = dict(_demo_profile(), BIGTIFF="YES")
+    out_ser = tmp_path / "ser.tif"
+    _reproject_band_array(
+        a,
+        xform,
+        work_crs,
+        str(out_ser),
+        profile,
+        dst_crs,
+        dst_transform,
+        dst_width,
+        dst_height,
+        tags=tags,
+        scales=scales,
+        offsets=offsets,
+        n_threads=1,
+    )
+    info = _tif_parse_ifd(out_ser.read_bytes())
+    assert info["big"] is True  # the reference head really is BigTIFF
+    assert info["sz324"] == 8  # 324 = LONG8
+    assert info["sz325"] == 4  # 325 = LONG
+    frames = iter(_stock_frames(out_ser))
+
+    def stub(tiles: list[np.ndarray], n_threads: int = 1) -> list[bytes]:  # ruff: ignore[unused-function-argument]
+        """Stock-frame stand-in: consume the real frames in raster-scan order."""
+        return [next(frames) for _ in tiles]
+
+    monkeypatch.setattr(pipeline_mod.zstdmt, "compress_tiles", stub)
+    out_par = tmp_path / "par.tif"
+    ok = _turbo_write_parallel(
+        a,
+        xform,
+        work_crs,
+        str(out_par),
+        profile,
+        dst_crs,
+        dst_transform,
+        dst_width,
+        dst_height,
+        tags=tags,
+        scales=scales,
+        offsets=offsets,
+        n_threads=4,
+    )
+    assert ok
+    assert _sha(out_ser) == _sha(out_par)
+
+
 def test_turbo_write_parallel_4gib_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Classic head + assembled size beyond 4 GiB -> False (serial fallback)."""
     a, xform = _demo_field(800, 700, 100.0, seed=12)
@@ -567,6 +673,37 @@ def test_tif_parse_ifd_classic_and_bigtiff(tmp_path: Path) -> None:
             dst.write(a, 1)
         info = _tif_parse_ifd(path.read_bytes())
         assert info["big"] is big
+        assert info["n_tiles"] == n_tiles
+        assert info["t324"][1] == n_tiles
+        assert info["t325"][1] == n_tiles
+        # Y-1: per-tag slot widths. BigTIFF 324 = LONG8 (8 B), 325 = LONG (4 B);
+        # classic stores both as LONG.
+        if big:
+            assert info["t324"][0] == 16
+            assert info["sz324"] == 8
+            assert info["t325"][0] == 4
+            assert info["sz325"] == 4
+        else:
+            assert info["t324"][0] == 4
+            assert info["sz324"] == 4
+            assert info["t325"][0] == 4
+            assert info["sz325"] == 4
+        d = path.read_bytes()
+        offs = [struct.unpack_from(info["fmt324"], d, info["t324"][2] + i * info["sz324"])[0] for i in range(n_tiles)]
+        sizes = [struct.unpack_from(info["fmt325"], d, info["t325"][2] + i * info["sz325"])[0] for i in range(n_tiles)]
+        # The parsed first offset is the first stored tile, offsets run
+        # monotonically (raster-scan order), and each frame is a zstd stream.
+        assert offs[0] == info["first"]
+        assert all(o2 > o1 for o1, o2 in pairwise(offs))
+        for o, s in zip(offs, sizes, strict=True):
+            assert d[o : o + 4] == b"\x28\xb5\x2f\xfd"  # zstd magic at each tile
+            assert o + s <= len(d)
+        # The 324/325 arrays are disjoint and sit before the first tile
+        # (the head-cut assumption of the parallel writer).
+        a0, a1 = info["t324"][2], info["t324"][2] + info["sz324"] * n_tiles
+        b0, b1 = info["t325"][2], info["t325"][2] + info["sz325"] * n_tiles
+        assert a1 <= b0 or b1 <= a0
+        assert min(a0, b0) < info["first"]
         assert info["n_tiles"] == n_tiles
         assert info["t324"][1] == n_tiles
         assert info["t325"][1] == n_tiles

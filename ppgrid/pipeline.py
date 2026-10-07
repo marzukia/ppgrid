@@ -744,6 +744,29 @@ def _reproject_band_array(
     )
 
 
+# TIFF base type -> bytes per element (Y-1). The parser and the head-
+# overlap guard share it so a type can never be sized in one place and
+# mis-sized in the other. 16/17/18 = the BigTIFF 64-bit types (LONG8,
+# SLONG8, IFD8).
+_TIFF_TYPE_SIZES = {
+    1: 1,
+    2: 1,
+    3: 2,
+    4: 4,
+    5: 8,
+    6: 8,
+    7: 8,
+    8: 1,
+    9: 2,
+    10: 4,
+    11: 4,
+    12: 8,
+    16: 8,
+    17: 8,
+    18: 8,
+}
+
+
 def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
     """Parse the first IFD of a single-band classic or BigTIFF tiled raster.
 
@@ -754,10 +777,13 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
         Dict: e (struct endian), big (bool), off_fmt (offset width name),
         tags {tag: (typ, count, value-or-inline offset)}, t324/t325
         (tag 324/325 entries), n_tiles, first (offset of the first stored
-        tile).
+        tile), sz324/sz325 (per-tag slot bytes: classic 4/4, BigTIFF
+        324=8 (LONG8) / 325=4 (LONG)) and the matching fmt324/fmt325
+        struct formats.
 
     Raises:
-        ValueError: On unknown endian/magic, missing 324/325, inline tile
+        ValueError: On unknown endian/magic, missing 324/325, an unknown
+            TIFF type, a non-LONG/LONG8 tile array type, inline tile
             arrays, or a count mismatch.
 
     """
@@ -785,13 +811,17 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
         ifd = struct.unpack_from(e + "Q", data, 8)[0]
         cnt = struct.unpack_from(e + "H", data, ifd)[0]
         ent_size, count_fmt, off_fmt, entry_off, val_at, inline = 20, "Q", "Q", 8, 12, 12
-    per_typ = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 11: 4, 12: 8}
+    per_typ = _TIFF_TYPE_SIZES
     tags: dict[int, tuple[int, int, int]] = {}
     for i in range(cnt):
         off = ifd + entry_off + i * ent_size
         tag, typ = struct.unpack_from(e + "HH", data, off)
         count = struct.unpack_from(e + count_fmt, data, off + 4)[0]
-        total = per_typ.get(typ, 0) * count
+        sz = per_typ.get(typ)
+        if sz is None:
+            msg = f"unsupported TIFF type {typ} for tag {tag}"
+            raise ValueError(msg)
+        total = sz * count
         if total <= inline:
             tags[tag] = (typ, count, off + val_at)
         else:
@@ -804,12 +834,19 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
     if t324[1] != t325[1]:
         msg = "TileOffsets/TileByteCounts count mismatch"
         raise ValueError(msg)
+    if t324[0] not in (4, 16) or t325[0] not in (4, 16):
+        msg = f"unexpected tile array types (324: {t324[0]}, 325: {t325[0]})"
+        raise ValueError(msg)
     n_tiles = t324[1]
-    val_sz = (8 if big else 4) * n_tiles
-    if t324[2] + val_sz > len(data) or t325[2] + val_sz > len(data):
+    # Slot width is per tag (Y-1): BigTIFF stores 324 as LONG8 (8-byte
+    # slots) but 325 as LONG (4-byte slots); classic stores both as LONG.
+    sz324, sz325 = per_typ[t324[0]], per_typ[t325[0]]
+    fmt324 = e + ("Q" if sz324 == 8 else "I")
+    fmt325 = e + ("Q" if sz325 == 8 else "I")
+    if t324[2] + sz324 * n_tiles > len(data) or t325[2] + sz325 * n_tiles > len(data):
         msg = "tile value arrays stored inline or beyond EOF"
         raise ValueError(msg)
-    first = struct.unpack_from(e + off_fmt, data, t324[2])[0]
+    first = struct.unpack_from(fmt324, data, t324[2])[0]
     return {
         "e": e,
         "big": big,
@@ -820,6 +857,10 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
         "t325": t325,
         "n_tiles": n_tiles,
         "first": first,
+        "sz324": sz324,
+        "sz325": sz325,
+        "fmt324": fmt324,
+        "fmt325": fmt325,
     }
 
 
@@ -934,7 +975,7 @@ def _turbo_write_parallel(
     # the head cut keeps every array and drops every reference tile.
     head_end = info["first"]
     for typ, count, voff in info["tags"].values():
-        total = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 11: 4, 12: 8}.get(typ, 0) * count
+        total = _TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
             print("[warn] turbo zstd head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
             return False
@@ -943,12 +984,14 @@ def _turbo_write_parallel(
         return False
 
     head = bytearray(data[:head_end])
-    off_fmt = info["e"] + info["off_fmt"]
-    off_sz = 8 if info["big"] else 4
+    # Patch stride is per tag (Y-1): BigTIFF 324 slots are 8 bytes, 325
+    # slots 4; patching both at one width corrupts the 325 array region.
+    sz324, sz325 = info["sz324"], info["sz325"]
+    fmt324, fmt325 = info["fmt324"], info["fmt325"]
     pos = 0
     for i, t in enumerate(tiles):
-        struct.pack_into(off_fmt, head, t324[2] + i * off_sz, head_end + pos)
-        struct.pack_into(off_fmt, head, t325[2] + i * off_sz, len(t))
+        struct.pack_into(fmt324, head, t324[2] + i * sz324, head_end + pos)
+        struct.pack_into(fmt325, head, t325[2] + i * sz325, len(t))
         pos += len(t)
     with Path(dst_path).open("wb") as f:
         f.write(bytes(head))
@@ -1495,6 +1538,43 @@ class Pipeline:
         for fname in _RUN_TEMP_FILES:
             (Path(self.out_dir) / fname).unlink(missing_ok=True)
 
+    def _resolve_turbo_cap(self) -> tuple[float, str]:
+        """Resolve the turbo RAM cap with the cgroup-aware preset clamp (M-2).
+
+        Passes both physical RAM and the cgroup ceiling so a --turbo /
+        --max-ram preset at/above the process-visible memory clamps to
+        available - 8 GB instead of planning against RAM the process
+        cannot see (a capped slice OOMs at its own limit).
+
+        """
+        return turbop.resolve_cap(
+            self.turbo_cap_gb,
+            physical_gb=turbop._read_physical_gb(),  # ruff: ignore[private-member-access]
+            cgroup_gb=turbop._read_cgroup_max_gb(),  # ruff: ignore[private-member-access]
+        )
+
+    def _per_box_peak_bytes(self) -> int | None:
+        """Worst-case per-box fallback peak, or None pre-grid (M-3).
+
+        The per-box block loop runs up to `workers` boxes in flight, each
+        holding a snapped (bsize + 2*halo) grid; on the turbo write the
+        4 B/cell DN field is also alive when the output is reprojected.
+        Used to announce a per-box OOM risk instead of promising exit-0
+        correct output into an OOM.
+
+        """
+        if not all(hasattr(self, attr) for attr in ("bsize", "halo", "step", "nx", "ny", "tasks", "n")):
+            return None
+        worst_dim = -(-(self.bsize + 2 * self.halo) // self.step) * self.step
+        extra = self.n * 32  # x/y/tv/v float64 points arrays, alive all run
+        if self.out_crs != self.work_crs:
+            extra += self.nx * self.ny * 4  # in-RAM DN field (turbo write)
+        return turbop.per_box_peak_bytes(
+            worst_dim * worst_dim,
+            in_flight=min(self.workers, len(self.tasks)),
+            extra_bytes=extra,
+        )
+
     def _turbo_precheck(self) -> None:
         """Size the turbo plan against the RAM budget before heavy allocation (3.5).
 
@@ -1502,7 +1582,9 @@ class Pipeline:
         _prepare_shared's first big allocation. Prints the budget value
         actually used. Shared infeasible: strict -> stderr error + exit 3;
         non-strict -> [warn] + continue on the per-box path (exit 0, correct
-        output, turbo warp/write still apply).
+        output, turbo warp/write still apply). When the per-box est peak
+        itself exceeds the budget the warning is explicit: best-effort,
+        OOM risk, output may be partial (M-3).
 
         Raises:
             SystemExit: code 3 when --turbo-strict and the shared path does
@@ -1516,9 +1598,14 @@ class Pipeline:
             return
         n_cells = self.nx_padded * self.ny_padded
         radius = round(self.cap_km_val * M_PER_KM / self.res)
-        cap_gb, cap_source = turbop.resolve_cap(self.turbo_cap_gb)
+        cap_gb, cap_source = self._resolve_turbo_cap()
         plan = turbop.plan(cap_gb, n_cells, self.nx_padded, radius)
-        decision = turbop.precheck(plan, strict=self.turbo_strict, cap_source=cap_source)
+        decision = turbop.precheck(
+            plan,
+            strict=self.turbo_strict,
+            cap_source=cap_source,
+            per_box_peak_bytes=self._per_box_peak_bytes(),
+        )
         self._turbo_plan = plan
         self._turbo_decision = decision
         self._turbo_budget_bytes = plan.budget_bytes
