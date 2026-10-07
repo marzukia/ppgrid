@@ -58,6 +58,10 @@ __all__ = [
 
 log = logging.getLogger("ppgrid.turbop")
 
+# os.process_cpu_count is Python 3.13+; fall back to os.cpu_count on older
+# interpreters (the repo supports 3.11+). Process-aware where available.
+_cpu_count = getattr(os, "process_cpu_count", None) or os.cpu_count
+
 # ---------------------------------------------------------------------------
 # Price list (design 3.6.2). Every value is derived, pending A/B validation
 # (3.6.5). GB is decimal, 1 GB = 1e9 bytes, matching the design arithmetic.
@@ -377,7 +381,8 @@ def plan(
         n_cells: Total padded cells N.
         wc: Padded columns Wc.
         radius: Cap radius in cells r.
-        cpu: Thread count; defaults to os.process_cpu_count().
+        cpu: Thread count; defaults to the process-visible CPU count
+        (os.process_cpu_count on 3.13+, os.cpu_count before).
 
     Returns:
         TurboPlan sized to fit the 0.85*C budget.
@@ -390,7 +395,7 @@ def plan(
         msg = f"need n_cells > 0, wc > 0, radius >= 0; got {n_cells}, {wc}, {radius}"
         raise ValueError(msg)
     if cpu is None:
-        cpu = os.process_cpu_count() or 1
+        cpu = _cpu_count() or 1
     sizing = sizing_budget_bytes(cap_gb)
     budget = precheck_budget_bytes(cap_gb)
     m_box = box_chunk_bytes(wc, radius)
