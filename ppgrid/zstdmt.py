@@ -422,31 +422,35 @@ def _tif_info(path: Path) -> _TifInfo:
     else:
         msg = f"bad TIFF byte order mark {data[:2]!r}"
         raise ZstdmtError(msg)
-    magic = struct.unpack_from(e + "H", data, 2)[0]
-    if magic == 42:
-        offset_size = 4
-        ifd_off = struct.unpack_from(e + "I", data, 4)[0]
-    elif magic == 43:
-        offset_size = struct.unpack_from(e + "H", data, 4)[0]
-        if offset_size != 8:
-            msg = f"unsupported BigTIFF offset size {offset_size}"
+    try:
+        magic = struct.unpack_from(e + "H", data, 2)[0]
+        if magic == 42:
+            offset_size = 4
+            ifd_off = struct.unpack_from(e + "I", data, 4)[0]
+        elif magic == 43:
+            offset_size = struct.unpack_from(e + "H", data, 4)[0]
+            if offset_size != 8:
+                msg = f"unsupported BigTIFF offset size {offset_size}"
+                raise ZstdmtError(msg)
+            ifd_off = struct.unpack_from(e + "Q", data, 8)[0]
+        else:
+            msg = f"unknown TIFF magic {magic}"
             raise ZstdmtError(msg)
-        ifd_off = struct.unpack_from(e + "Q", data, 8)[0]
-    else:
-        msg = f"unknown TIFF magic {magic}"
-        raise ZstdmtError(msg)
-    off_fmt = "I" if offset_size == 4 else "Q"
-    entry_size = 12 if offset_size == 4 else 20
-    cnt_size = 2 if offset_size == 4 else 8  # IFD entry-count field width
-    while True:
-        tags = _parse_ifd_tags(data, e, off_fmt, cnt_size, entry_size, ifd_off)
-        if 324 in tags and 325 in tags:
-            return _tif_info_from_tags(data, e, tags)
-        next_off = _next_ifd(data, e, off_fmt, cnt_size, entry_size, ifd_off)
-        if not next_off:
-            msg = "no tiled IFD found (strip TIFF?)"
-            raise ZstdmtError(msg)
-        ifd_off = next_off
+        off_fmt = "I" if offset_size == 4 else "Q"
+        entry_size = 12 if offset_size == 4 else 20
+        cnt_size = 2 if offset_size == 4 else 8  # IFD entry-count field width
+        while True:
+            tags = _parse_ifd_tags(data, e, off_fmt, cnt_size, entry_size, ifd_off)
+            if 324 in tags and 325 in tags:
+                return _tif_info_from_tags(data, e, tags)
+            next_off = _next_ifd(data, e, off_fmt, cnt_size, entry_size, ifd_off)
+            if not next_off:
+                msg = "no tiled IFD found (strip TIFF?)"
+                raise ZstdmtError(msg)
+            ifd_off = next_off
+    except struct.error as exc:
+        msg = f"corrupt TIFF structure: {exc}"
+        raise ZstdmtError(msg) from exc
 
 
 def _parse_ifd_tags(
@@ -466,7 +470,9 @@ def _parse_ifd_tags(
         tag = struct.unpack_from(e + "H", data, off)[0]
         typ = struct.unpack_from(e + "H", data, off + 2)[0]
         count = struct.unpack_from(e + off_fmt, data, off + 4)[0]
-        val_off = off + 8
+        # Classic entries are 12 B (tag2 type2 count4 value4); BigTIFF entries
+        # are 20 B (tag2 type2 count8 value8), so the value field sits at +12.
+        val_off = off + (12 if cnt_size == 8 else 8)
         per = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 11: 4, 12: 8, 16: 8}.get(typ)
         if per is None:
             continue
