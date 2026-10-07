@@ -13,11 +13,13 @@ import math
 import os
 import struct
 import sys
+import threading
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+from itertools import starmap
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -27,7 +29,7 @@ import rasterio
 from pyproj import Transformer
 from pyproj.exceptions import CRSError
 from rasterio.errors import NotGeoreferencedWarning
-from rasterio.transform import from_bounds, from_origin
+from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 
@@ -901,7 +903,6 @@ def _turbo_write_parallel(
         >= 4 GiB assembled file).
 
     """
-    out = np.zeros((dst_height, dst_width), dtype=np.int16)
     warp_tile = 2048
     tiles: list[bytes] = []
     band_tiles: list[np.ndarray] = []
@@ -935,8 +936,11 @@ def _turbo_write_parallel(
                 w = min(TILE_PX, dst_width - i)
                 i0 = (i // warp_tile) * warp_tile
                 band_tiles.append(coarse[i0][j - j0 : j - j0 + h, i - i0 : i - i0 + w])
+        # Predictor 2 must be applied before compression: the stock codec
+        # (and the oracle) compress the predicted bytes, not the raw tiles.
+        band_tiles = [zstdmt.predictor2(t) for t in band_tiles]
         tiles.extend(zstdmt.compress_tiles(band_tiles, n_threads=n_threads))
-    del out, coarse, band_tiles
+    del coarse, band_tiles
 
     ref_path = Path(dst_path + ".refhead.tif")
     try:
@@ -986,6 +990,184 @@ def _turbo_write_parallel(
     head = bytearray(data[:head_end])
     # Patch stride is per tag (Y-1): BigTIFF 324 slots are 8 bytes, 325
     # slots 4; patching both at one width corrupts the 325 array region.
+    sz324, sz325 = info["sz324"], info["sz325"]
+    fmt324, fmt325 = info["fmt324"], info["fmt325"]
+    pos = 0
+    for i, t in enumerate(tiles):
+        struct.pack_into(fmt324, head, t324[2] + i * sz324, head_end + pos)
+        struct.pack_into(fmt325, head, t325[2] + i * sz325, len(t))
+        pos += len(t)
+    with Path(dst_path).open("wb") as f:
+        f.write(bytes(head))
+        f.writelines(tiles)
+    return True
+
+
+def _stock_band_frames(
+    buf: np.ndarray,
+    i0: int,
+    j0: int,
+    bw: int,
+    bh: int,
+    dst_transform: Any,
+    out_crs: str,
+    profile: dict[str, Any],
+    scratch: Path,
+) -> list[bytes]:
+    """Compress one warp band's 512^2 tiles with the stock GTiff zstd codec.
+
+    A per-band scratch dataset carries the identical codec profile (zstd,
+    tiled, predictor 2, same tile windows, same nodata), so libtiff's
+    streaming Ctx compresses each tile exactly as the serial full-raster
+    write would: the frames are byte-equal to the serial path by
+    construction, on any GDAL/libtiff stack (issue #39). GDAL writes tiles
+    in the order requested, so the frames come back in raster-scan order.
+
+    Args:
+        buf: Warped band, shape (bh, bw), int16.
+        i0: Band origin column in the dst raster (the transform keeps the
+            scratch a valid GeoTIFF; frames are codec-only).
+        j0: Band origin row in the dst raster.
+        bw: Band size (px, columns).
+        bh: Band size (px, rows).
+        dst_transform: Geotransform of the full dst raster.
+        out_crs: CRS string for the scratch.
+        profile: The final raster's profile (width/height/transform/crs are
+            overridden to the band's).
+        scratch: Scratch path (reused per thread across bands).
+
+    Returns:
+        One zstd frame per tile, raster-scan order.
+
+    """
+    t = dst_transform * Affine(1, 0, i0, 0, 1, -j0)
+    prof = dict(profile, width=bw, height=bh, transform=t, crs=out_crs)
+    with rasterio.open(scratch, "w", **prof) as dst:
+        for j in range(0, bh, TILE_PX):
+            h = min(TILE_PX, bh - j)
+            for i in range(0, bw, TILE_PX):
+                w = min(TILE_PX, bw - i)
+                dst.write(buf[j : j + h, i : i + w], 1, window=Window(i, j, w, h))
+    data = scratch.read_bytes()
+    info = _tif_parse_ifd(data)
+    n = info["n_tiles"]
+    offs = [struct.unpack_from(info["fmt324"], data, info["t324"][2] + k * info["sz324"])[0] for k in range(n)]
+    szs = [struct.unpack_from(info["fmt325"], data, info["t325"][2] + k * info["sz325"])[0] for k in range(n)]
+    return [data[o : o + s] for o, s in zip(offs, szs, strict=True)]
+
+
+def _turbo_write_stock_parallel(
+    arr: np.ndarray,
+    src_transform: Any,
+    src_crs: str,
+    dst_path: str,
+    profile: dict[str, Any],
+    dst_crs: str,
+    dst_transform: Any,
+    dst_width: int,
+    dst_height: int,
+    tags: dict[str, str],
+    scales: tuple[float, ...],
+    offsets: tuple[float, ...] | None,
+    n_threads: int,
+    scratch_dir: str,
+) -> bool:
+    """Assemble the output-CRS GeoTIFF with parallel stock-codec compression.
+
+    Fallback for stacks where the CPL zstd pfn drifts from libtiff's
+    streaming codec (the A.7 oracle mismatches - e.g. the bundled GDAL
+    3.12.4 / libtiff 6.2 stack, whose pfn emits a different frame header:
+    single-segment flag + 8-byte FCS + a different windowLog, and which
+    ignores every zstd option). Strategy (S3.4a, issue #39):
+
+    1. Warp 2048^2 blocks in a thread pool (same kernel and windows as the
+       serial path).
+    2. Each block's 512^2 tiles are compressed with the stock codec via a
+       per-thread scratch raster with the identical profile - frames are
+       byte-equal to the serial flush by construction.
+    3. The head comes from a zero-filled reference raster with the identical
+       profile + tags + scales (layout matches by construction); the
+       TileOffsets/TileByteCounts arrays are patched and the frames
+       appended in raster-scan order.
+
+    Returns:
+        True if the file was written, False if the caller must fall back to
+        the serial array reproject (layout guards).
+
+    """
+    warp_tile = 2048
+    # 1. Zero-filled reference raster: stock GDAL head + exact tag layout.
+    ref_path = Path(str(dst_path) + ".refhead.tif")
+    try:
+        zero = np.zeros((dst_height, dst_width), dtype=np.int16)
+        with rasterio.open(
+            ref_path,
+            "w",
+            **dict(
+                profile,
+                width=dst_width,
+                height=dst_height,
+                transform=dst_transform,
+                crs=dst_crs,
+            ),
+        ) as dst:
+            dst.update_tags(**tags)
+            if scales:
+                dst.scales = scales
+            if offsets:
+                dst.offsets = offsets
+            dst.write(zero, 1)
+        data = ref_path.read_bytes()
+    finally:
+        ref_path.unlink(missing_ok=True)
+        del zero
+    try:
+        info = _tif_parse_ifd(data)
+    except ValueError as e:
+        print(f"[warn] turbo stock head parse: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+    t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
+    head_end = info["first"]
+    for typ, count, voff in info["tags"].values():
+        total = _TIFF_TYPE_SIZES[typ] * count
+        if total > info["inline"] and voff + total > info["first"]:
+            print("[warn] turbo stock head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
+            return False
+    # Compressed frames are never longer than the raw band, so raw size is
+    # a sound classic-4GiB upper bound.
+    if not info["big"] and head_end + arr.nbytes > _TIFF_CLASSIC_MAX_BYTES:
+        print("[warn] turbo stock head: assembled file may exceed classic 4 GiB; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+
+    # 2. Warp blocks in parallel; each block compresses through its thread's
+    #    scratch raster.
+    band_jobs = [(i0, j0) for j0 in range(0, dst_height, warp_tile) for i0 in range(0, dst_width, warp_tile)]
+    scratch_local = threading.local()
+
+    def _block(i0: int, j0: int) -> list[bytes]:
+        bw = min(warp_tile, dst_width - i0)
+        bh = min(warp_tile, dst_height - j0)
+        scratch: Path | None = getattr(scratch_local, "path", None)
+        if scratch is None:
+            scratch = Path(scratch_dir) / f"_stock_scratch_{threading.get_ident() & 0xFFFF:x}.tif"
+            scratch_local.path = scratch
+        _, buf = _warp_dst_tile_arr(
+            arr, src_transform, src_crs, i0, j0, bh, warp_tile, dst_width, dst_transform, dst_crs
+        )
+        return _stock_band_frames(buf, i0, j0, bw, bh, dst_transform, dst_crs, profile, scratch)
+
+    if n_threads > 1:
+        with ThreadPoolExecutor(max_workers=n_threads) as ex:
+            block_frames = list(ex.map(lambda jb: _block(*jb), band_jobs))
+    else:
+        block_frames = list(starmap(_block, band_jobs))
+    tiles = [f for fs in block_frames for f in fs]
+    if len(tiles) != n_tiles:
+        print(f"[warn] turbo stock: tile count {len(tiles)} != {n_tiles}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+
+    # 3. Patch the head and assemble: head + frames in raster-scan order.
+    head = bytearray(data[:head_end])
     sz324, sz325 = info["sz324"], info["sz325"]
     fmt324, fmt325 = info["fmt324"], info["fmt325"]
     pos = 0
@@ -1746,8 +1928,19 @@ class Pipeline:
             with _prof.phase("shared.boxcount"):
                 box_count_banded(c0, cap_cells, near_full, n_threads=n_threads)
         else:
-            with _prof.phase("shared.bin"):
-                s0, c0 = bin_points(ix, iy, pts[PTS_TV][:], self.nx_padded, self.ny_padded)
+            if self.nx_padded * self.ny_padded > _SHARED_MEMMAP_CELLS:
+                # Regime A scale (issue #39): the flat f64 bincount
+                # intermediates of bin_points (two 8 B/cell arrays plus two
+                # astype copies) are the single largest first-touch churn in
+                # the run. The banded scatter is bit-identical (same per-cell
+                # f64 accumulation order) and fills preallocated f32 grids.
+                with _prof.phase("shared.bin"):
+                    s0 = np.zeros((self.nx_padded, self.ny_padded), np.float32)
+                    c0 = np.zeros((self.nx_padded, self.ny_padded), np.float32)
+                    bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
+            else:
+                with _prof.phase("shared.bin"):
+                    s0, c0 = bin_points(ix, iy, pts[PTS_TV][:], self.nx_padded, self.ny_padded)
             if n_threads > 1:
                 with _prof.phase("shared.boxcount"):
                     near_full = box_count_mt(c0, cap_cells, n_threads=n_threads) > 0
@@ -1774,6 +1967,13 @@ class Pipeline:
                     free_levels=True,
                     n_threads=n_threads,
                 )
+            # Level 0 is dead after the descent: free the finest grids
+            # (two f32 full arrays, ~12 GB at full-AU scale) before the
+            # dnfill block loop (issue #39).
+            sums[0] = None  # type: ignore[index]
+            counts[0] = None  # type: ignore[index]
+            s0 = c0 = None  # type: ignore[assignment]
+            del ix, iy
         else:
             # Full descent to level 2 (small arrays), then band levels 2 -> 1
             # -> 0 through memmap to bound RAM on multi-billion-cell grids.
@@ -2014,16 +2214,19 @@ class Pipeline:
         of the 0.85*C pre-check budget the serial write (work file + MT
         reproject) is the safe path (10 m full-AU DN field: ~626 GB).
 
-        Serial strategy (the default when the A.7 zstd oracle mismatches the
-        stock CPL codec, as on the current stack): warp the output raster
-        tile-by-tile from the in-RAM arrays through the same GDAL warp
-        kernel and flush in serial raster-scan order, byte-identical to
-        _reproject_band on the work-CRS file.
-        Parallel strategy (oracle pass): warp + compress every 512^2 tile in
-        parallel, then assemble the file from the stock GDAL head (a
-        zero-filled reference raster with the identical profile) with the
-        TileOffsets/TileByteCounts arrays patched (see
-        _turbo_write_parallel).
+        Serial strategy (final fallback, byte-identical reference): warp the
+        output raster tile-by-tile from the in-RAM arrays through the same
+        GDAL warp kernel and flush in serial raster-scan order, byte-identical
+        to _reproject_band on the work-CRS file.
+        Parallel strategies (issue #39): when the A.7 zstd oracle passes, warp
+        + compress every 512^2 tile in parallel through the CPL zstd pfn and
+        assemble the file from the stock GDAL head with the
+        TileOffsets/TileByteCounts arrays patched (_turbo_write_parallel).
+        When the oracle mismatches (the pfn drifts from libtiff's streaming
+        codec, as on the bundled GDAL 3.12.4 stack), the stock codec runs
+        per 2048^2 warp block through a per-thread scratch raster with the
+        identical profile - frames byte-equal to the serial flush by
+        construction on any stack (_turbo_write_stock_parallel).
         """
         budget = self._turbo_budget_bytes
         if budget is not None and self.nx * self.ny * 4 > budget // 2:
@@ -2058,11 +2261,10 @@ class Pipeline:
                             vq, rq = out
                             val_dn[rows, cols] = vq.T[::-1, :]
                             sup_dn[rows, cols] = rq.T[::-1, :]
-        except BaseException:
-            # Mid-run failure (worker error, OOM): the DN field is lost; warn
-            # for parity with the serial path.
-            partial = True
-            raise
+                    # The shared field is dead after the block loop: free it
+                    # before the reproject/write (val/sup f32 + near bool,
+                    # ~13.7 GB at full-AU scale) (issue #39).
+                    cfg.val_full = cfg.sup_full = cfg.near_full = None
         finally:
             self._remove_run_temps()
             if partial:
@@ -2089,62 +2291,77 @@ class Pipeline:
         # Budgeted MT thread count from the turbo plan drives the warp pool;
         # the n_threads kwarg stays the explicit non-turbo knob.
         warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
+        out_dir = Path(self.out_dir)
         with _prof.phase("write.oracle"):
-            parallel = self._turbo_zstd_ok()
-        for band, arr, prof, path, tags, scales in (
-            ("value", val_dn, vprof, vpath, vtags, (1.0 / self.scale,)),
-            ("support", sup_dn, sprof, spath, stags, (1.0,)),
-        ):
-            with _prof.phase(f"write.reproj_{band}"):
-                if not parallel:
-                    _reproject_band_array(
-                        arr,
-                        xform,
-                        work_crs,
-                        str(path),
-                        prof,
-                        out_crs,
-                        dst_transform,
-                        dst_width,
-                        dst_height,
-                        tags=tags,
-                        scales=scales,
-                        offsets=(0.0,),
-                        n_threads=warp_threads,
-                    )
-                    continue
-                if not _turbo_write_parallel(
-                    arr,
-                    xform,
-                    work_crs,
-                    str(path),
-                    prof,
-                    out_crs,
-                    dst_transform,
-                    dst_width,
-                    dst_height,
-                    tags=tags,
-                    scales=scales,
-                    offsets=(0.0,),
-                    n_threads=warp_threads,
-                ):
-                    # Layout guard tripped (see _turbo_write_parallel): the
-                    # serial array reproject is byte-identical by construction.
-                    _reproject_band_array(
-                        arr,
-                        xform,
-                        work_crs,
-                        str(path),
-                        prof,
-                        out_crs,
-                        dst_transform,
-                        dst_width,
-                        dst_height,
-                        tags=tags,
-                        scales=scales,
-                        offsets=(0.0,),
-                        n_threads=warp_threads,
-                    )
+            cpl = self._turbo_zstd_ok()
+        try:
+            for band, arr, prof, path, tags, scales in (
+                ("value", val_dn, vprof, vpath, vtags, (1.0 / self.scale,)),
+                ("support", sup_dn, sprof, spath, stags, (1.0,)),
+            ):
+                with _prof.phase(f"write.reproj_{band}"):
+                    wrote = False
+                    if cpl:
+                        try:
+                            wrote = _turbo_write_parallel(
+                                arr,
+                                xform,
+                                work_crs,
+                                str(path),
+                                prof,
+                                out_crs,
+                                dst_transform,
+                                dst_width,
+                                dst_height,
+                                tags=tags,
+                                scales=scales,
+                                offsets=(0.0,),
+                                n_threads=warp_threads,
+                            )
+                        except Exception as e:  # ruff: ignore[blind-except] - layout surprise: fall back
+                            print(f"[warn] turbo zstd parallel: {e}; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
+                    if not wrote:
+                        try:
+                            wrote = _turbo_write_stock_parallel(
+                                arr,
+                                xform,
+                                work_crs,
+                                str(path),
+                                prof,
+                                out_crs,
+                                dst_transform,
+                                dst_width,
+                                dst_height,
+                                tags=tags,
+                                scales=scales,
+                                offsets=(0.0,),
+                                n_threads=warp_threads,
+                                scratch_dir=str(out_dir),
+                            )
+                        except Exception as e:  # ruff: ignore[blind-except] - any surprise: serial
+                            print(f"[warn] turbo stock parallel: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+                    if not wrote:
+                        # Layout guard tripped (see the parallel writers): the
+                        # serial array reproject is byte-identical by
+                        # construction.
+                        _reproject_band_array(
+                            arr,
+                            xform,
+                            work_crs,
+                            str(path),
+                            prof,
+                            out_crs,
+                            dst_transform,
+                            dst_width,
+                            dst_height,
+                            tags=tags,
+                            scales=scales,
+                            offsets=(0.0,),
+                            n_threads=warp_threads,
+                        )
+        finally:
+            for p in out_dir.glob("_stock_scratch_*.tif"):
+                p.unlink(missing_ok=True)
 
 
 def run(
