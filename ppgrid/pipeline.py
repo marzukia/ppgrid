@@ -14,6 +14,7 @@ import os
 import struct
 import sys
 import threading
+import time
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -28,6 +29,7 @@ import pandas as pd
 import rasterio
 from pyproj import Transformer
 from pyproj.exceptions import CRSError
+from rasterio._io import MemoryDataset
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
@@ -45,6 +47,7 @@ from .calibrate import (
 )
 from .pullpush import (
     _descent_banded,
+    _nohuge,
     _pull_push_descent,
     bin_points,
     bin_points_banded,
@@ -137,6 +140,8 @@ _RUN_TEMP_FILES = (
     "_near.npy",
     "_val_full.npy",
     "_sup_full.npy",
+    "_val_dn.npy",
+    "_sup_dn.npy",
     "_val_lvl1.npy",
     "_sup_lvl1.npy",
 )
@@ -341,6 +346,13 @@ def _block_points(cfg: _WorkerConfig, bx: int, by: int) -> np.ndarray:
     return np.concatenate(out, axis=1) if out else np.empty((PTS_NBANDS, 0))
 
 
+# Thread-local f32 scratch for _quantize's support chain (see docstring
+# there). The int16 outputs are owned by the caller - returning scratch
+# raced the worker pool's ex.map prefetch (worker overwrote the buffer
+# before the main thread finished vd.write), corrupting blocks randomly.
+_QUANT_TLS = threading.local()
+
+
 def _quantize(
     cfg: _WorkerConfig,
     v_out: np.ndarray,
@@ -350,29 +362,67 @@ def _quantize(
     """Transform interpolated (value, support) to int16 percentile DN grids.
 
     Shared by the per-block and shared-field paths so the rounding is
-    structurally identical.
+    structurally identical. `r_out` is the support field in METRES (the raw
+    sup slice); the /M_PER_KM division runs into the per-thread f32 scratch
+    (issue #39 pass 3: the old out-of-place division was a fresh 16 MB f32
+    array per block).
 
     Returns:
         Tuple of (value, support) int16 arrays with NODATA where not near data.
+        The arrays are owned by the caller (fresh each call) - the f32 work
+        buffer is per-thread scratch (issue #39 pass 3: returning scratch
+        raced the worker pool's prefetch and corrupted ~10% of blocks).
 
     """
     # Transform: interpolate space -> raw -> percentile
     tf = cfg.tf
     pct = cfg.pct
-    pv = pct.fwd(tf.inv(v_out))
+    s = _QUANT_TLS.__dict__.get("q")
+    if s is None or s[0].shape != v_out.shape:
+        s = (
+            np.empty(v_out.shape, np.float32),
+            np.empty(v_out.shape, np.float64),
+        )
+        _nohuge(s[0], s[1])
+        _QUANT_TLS.q = s
+    w, x64 = s
+    v_in = tf.inv(v_out)
+    # np.interp's C core casts a non-f64 x to a FRESH f64 array (32 MB per
+    # block at full scale). Cast into the per-thread scratch instead: an
+    # exact f32 -> f64 conversion, same bits, no allocation (issue #39 pass
+    # 3). If v_in is already f64 (non-identity transform), reuse it as-is.
+    if v_in.dtype != np.float64:
+        np.copyto(x64, v_in)
+        v_in = x64
+    pv = pct.fwd(v_in)
     if cfg.pct_step is not None:
         # Round to the nearest step (e.g. 5 -> 90/95/100), clamp to 0-100.
-        pv = np.clip(np.round(pv / cfg.pct_step) * cfg.pct_step, 0.0, PERCENTILE_MAX)
-    vq = np.where(near_out, np.round(pv * cfg.scale), NODATA).astype(np.int16)
-    rq = np.where(
-        near_out,
-        np.clip(
-            np.round(np.log2(np.maximum(r_out, SUPPORT_KM_FLOOR)) * SUPPORT_LOG2_SCALE),
-            -SUPPORT_DN_MAX,
-            SUPPORT_DN_MAX,
-        ),
-        NODATA,
-    ).astype(np.int16)
+        # In-place: the out-of-place chain allocated 3 fresh full-size f64
+        # arrays per block; at full-AU scale that was the dominant fault
+        # source of write.dnfill. Same IEEE ops in the same order, so the
+        # bits are identical.
+        np.divide(pv, cfg.pct_step, out=pv)
+        np.round(pv, out=pv)
+        np.multiply(pv, cfg.pct_step, out=pv)
+        np.clip(pv, 0.0, PERCENTILE_MAX, out=pv)
+    vq = np.empty(v_out.shape, np.int16)
+    rq = np.empty(v_out.shape, np.int16)
+    _nohuge(vq, rq)
+    # Integer-valued intermediates (round first, exact int16 cast second), so
+    # fill + copyto(where=) match the old where-then-astype bits (np.where has
+    # no out=; copyto uses the same standard f64/f32 -> int16 cast).
+    np.multiply(pv, cfg.scale, out=pv)
+    np.round(pv, out=pv)
+    vq.fill(NODATA)
+    np.copyto(vq, pv, where=near_out, casting="unsafe")
+    np.divide(r_out, M_PER_KM, out=w)
+    np.maximum(w, SUPPORT_KM_FLOOR, out=w)
+    np.log2(w, out=w)
+    np.multiply(w, SUPPORT_LOG2_SCALE, out=w)
+    np.round(w, out=w)
+    np.clip(w, -SUPPORT_DN_MAX, SUPPORT_DN_MAX, out=w)
+    rq.fill(NODATA)
+    np.copyto(rq, w, where=near_out, casting="unsafe")
     return vq, rq
 
 
@@ -392,7 +442,7 @@ def _block_shared(cfg: _WorkerConfig, bx: int, by: int) -> tuple[np.ndarray, np.
     bsize = cfg.bsize
     i0, j0, i1, j1 = _block_bounds(bx, by, bsize, cfg.nx, cfg.ny)
     sl = (slice(i0, i1), slice(j0, j1))
-    return _quantize(cfg, cfg.val_full[sl], cfg.sup_full[sl] / M_PER_KM, cfg.near_full[sl])
+    return _quantize(cfg, cfg.val_full[sl], cfg.sup_full[sl], cfg.near_full[sl])
 
 
 def _process_block(
@@ -437,7 +487,7 @@ def _process_block(
     a0 = i0 - hi0
     b0 = j0 - hj0
     sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
-    return bx, by, _quantize(cfg, val[sl], sup[sl] / M_PER_KM, near[sl])
+    return bx, by, _quantize(cfg, val[sl], sup[sl], near[sl])
 
 
 def _block_neighbourhood_nonempty(
@@ -479,6 +529,7 @@ def _warp_dst_tile(
         w_bounds = rasterio.windows.bounds(w, dst_transform)
         local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
         buf = np.zeros((band_h, band_w), dtype=np.int16)
+        _nohuge(buf)
         reproject(
             rasterio.band(src, 1),
             buf,
@@ -502,6 +553,7 @@ def _warp_dst_tile_arr(
     dst_width: int,
     dst_transform: Any,
     dst_crs: str,
+    src_ds: Any | None = None,
 ) -> tuple[int, np.ndarray]:
     """Nearest-neighbour warp of one coarse 2048px dst tile.
 
@@ -523,6 +575,12 @@ def _warp_dst_tile_arr(
         dst_width: Full dst width.
         dst_transform: Geotransform of the target raster.
         dst_crs: Target CRS.
+        src_ds: Optional prewrapped MemoryDataset over src_arr (copy=False).
+            Uses reproject's MultiBand tuple form, which consumes the
+            dataset's GDAL handle directly; the ndarray form copies the
+            whole band into a fresh MEM dataset on every call (3 GB per
+            block at full-AU scale, issue #39 pass 3). Must stay alive for
+            the duration of the warp.
 
     Returns:
         (i0, buf) - buf shape (band_h, band_w).
@@ -533,8 +591,10 @@ def _warp_dst_tile_arr(
     w_bounds = rasterio.windows.bounds(w, dst_transform)
     local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
     buf = np.zeros((band_h, band_w), dtype=np.int16)
+    _nohuge(buf)
+    src = src_arr if src_ds is None else (src_ds, 1, src_arr.dtype, src_arr.shape)
     reproject(
-        src_arr,
+        src,
         buf,
         src_transform=src_transform,
         dst_transform=local_dst_transform,
@@ -1096,10 +1156,19 @@ def _turbo_write_stock_parallel(
 
     """
     warp_tile = 2048
-    # 1. Zero-filled reference raster: stock GDAL head + exact tag layout.
+    # 1. Reference raster: stock GDAL head + exact tag layout. The head
+    # (IFD + tag arrays) is sized from the raster dimensions at creation,
+    # so ONE 512^2 tile write yields the byte-identical head a full-band
+    # zero write would (verified: BigTIFF IFD is complete on close, tag
+    # layout and first-tile offset match a full NODATA write). The full
+    # zero write touched a dst_height*dst_width int16 array (~3 GB at
+    # full-AU) plus the whole file; under memory pressure that was the
+    # write phase's dominant cost (issue #39 pass 3).
     ref_path = Path(str(dst_path) + ".refhead.tif")
     try:
-        zero = np.zeros((dst_height, dst_width), dtype=np.int16)
+        th = min(TILE_PX, dst_height)
+        tw = min(TILE_PX, dst_width)
+        zero = np.zeros((th, tw), dtype=np.int16)
         with rasterio.open(
             ref_path,
             "w",
@@ -1116,7 +1185,7 @@ def _turbo_write_stock_parallel(
                 dst.scales = scales
             if offsets:
                 dst.offsets = offsets
-            dst.write(zero, 1)
+            dst.write(zero, 1, window=Window(0, 0, tw, th))
         data = ref_path.read_bytes()
     finally:
         ref_path.unlink(missing_ok=True)
@@ -1140,28 +1209,75 @@ def _turbo_write_stock_parallel(
         return False
 
     # 2. Warp blocks in parallel; each block compresses through its thread's
-    #    scratch raster.
-    band_jobs = [(i0, j0) for j0 in range(0, dst_height, warp_tile) for i0 in range(0, dst_width, warp_tile)]
+    #    scratch raster. band_jobs is block raster-scan (j0 outer, i0 inner):
+    #    flat index br*n_bcols + bc.
+    n_brows = -(-dst_height // warp_tile)
+    n_bcols = -(-dst_width // warp_tile)
+    band_jobs = [(bc * warp_tile, br * warp_tile) for br in range(n_brows) for bc in range(n_bcols)]
     scratch_local = threading.local()
+    # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
+    # pass 3): reproject's ndarray source form copies the whole band into
+    # a fresh MEM dataset per warp call (3 GB per 2048^2 block at full-AU
+    # scale; 8 such copies in flight OOM-killed the run). The tuple form
+    # reads the shared handle; val_dn/sup_dn are not mutated during the
+    # warp, so concurrent read-only access is safe.
+    src_ds = MemoryDataset(arr, transform=src_transform, crs=src_crs, copy=False)
+    prog = [0, 0.0, 0.0, 0]  # done, warp_s, frames_s, t0 (issue #39 pass 3 progress)
+    prog[3] = time.monotonic()
+    prog_lock = threading.Lock()
 
     def _block(i0: int, j0: int) -> list[bytes]:
         bw = min(warp_tile, dst_width - i0)
         bh = min(warp_tile, dst_height - j0)
         scratch: Path | None = getattr(scratch_local, "path", None)
         if scratch is None:
-            scratch = Path(scratch_dir) / f"_stock_scratch_{threading.get_ident() & 0xFFFF:x}.tif"
+            # Full TID (no mask): two live threads can collide on the low
+            # 16 bits of the kernel TID (observed on hydrogen, 2026-10-07);
+            # a shared path made one thread truncate the other's scratch
+            # mid-write (issue #39, pass 3).
+            scratch = Path(scratch_dir) / f"_stock_scratch_{threading.get_ident()}.tif"
             scratch_local.path = scratch
+        tw0 = time.monotonic()
         _, buf = _warp_dst_tile_arr(
-            arr, src_transform, src_crs, i0, j0, bh, warp_tile, dst_width, dst_transform, dst_crs
+            arr, src_transform, src_crs, i0, j0, bh, warp_tile, dst_width, dst_transform, dst_crs, src_ds=src_ds
         )
-        return _stock_band_frames(buf, i0, j0, bw, bh, dst_transform, dst_crs, profile, scratch)
+        tw1 = time.monotonic()
+        frames = _stock_band_frames(buf, i0, j0, bw, bh, dst_transform, dst_crs, profile, scratch)
+        tf1 = time.monotonic()
+        with prog_lock:
+            prog[0] += 1
+            prog[1] += tw1 - tw0
+            prog[2] += tf1 - tw1
+            if prog[0] % 20 == 0 and _prof.enabled():
+                print(  # ruff: ignore[print]
+                    f"[reproj-prog] blocks={prog[0]}/{len(band_jobs)} "
+                    f"warp={prog[1]:.1f}s frames={prog[2]:.1f}s "
+                    f"elapsed={time.monotonic() - prog[3]:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return frames
 
     if n_threads > 1:
         with ThreadPoolExecutor(max_workers=n_threads) as ex:
             block_frames = list(ex.map(lambda jb: _block(*jb), band_jobs))
     else:
         block_frames = list(starmap(_block, band_jobs))
-    tiles = [f for fs in block_frames for f in fs]
+
+    # Reassemble into global 512 raster-scan (the serial/CPL order). A block's
+    # frames are block-local raster-scan, so block-major concatenation would
+    # interleave tile rows wrongly; expand each block row/col into its 512
+    # tile rows/cols and index frames by (trow_local * tcols + tcol_local).
+    bh_by_br = [min(warp_tile, dst_height - br * warp_tile) for br in range(n_brows)]
+    bw_by_bc = [min(warp_tile, dst_width - bc * warp_tile) for bc in range(n_bcols)]
+    trows_by_br = [-(-bh // TILE_PX) for bh in bh_by_br]
+    tcols_by_bc = [-(-bw // TILE_PX) for bw in bw_by_bc]
+    row_map = [(br, tl) for br in range(n_brows) for tl in range(trows_by_br[br])]
+    col_map = [(bc, cl) for bc in range(n_bcols) for cl in range(tcols_by_bc[bc])]
+    tiles: list[bytes] = []
+    for br, tl in row_map:
+        for bc, cl in col_map:
+            tiles.append(block_frames[br * n_bcols + bc][tl * tcols_by_bc[bc] + cl])
     if len(tiles) != n_tiles:
         print(f"[warn] turbo stock: tile count {len(tiles)} != {n_tiles}; serial write", file=sys.stderr)  # ruff: ignore[print]
         return False
@@ -1922,9 +2038,11 @@ class Pipeline:
             shape = (self.nx_padded, self.ny_padded)
             s0 = _open_fresh_memmap(out_dir / "_s0.npy", np.float32, shape)
             c0 = _open_fresh_memmap(out_dir / "_c0.npy", np.float32, shape)
+            _nohuge(s0, c0)
             with _prof.phase("shared.bin"):
                 bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
             near_full = _open_fresh_memmap(out_dir / "_near.npy", bool, shape)
+            _nohuge(near_full)
             with _prof.phase("shared.boxcount"):
                 box_count_banded(c0, cap_cells, near_full, n_threads=n_threads)
         else:
@@ -1935,8 +2053,12 @@ class Pipeline:
                 # the run. The banded scatter is bit-identical (same per-cell
                 # f64 accumulation order) and fills preallocated f32 grids.
                 with _prof.phase("shared.bin"):
-                    s0 = np.zeros((self.nx_padded, self.ny_padded), np.float32)
-                    c0 = np.zeros((self.nx_padded, self.ny_padded), np.float32)
+                    s0 = np.empty((self.nx_padded, self.ny_padded), np.float32)
+                    c0 = np.empty((self.nx_padded, self.ny_padded), np.float32)
+                    _nohuge(s0, c0)
+                    # rows without points are never written by bin_points_banded
+                    s0.fill(0)
+                    c0.fill(0)
                     bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
             else:
                 with _prof.phase("shared.bin"):
@@ -1957,6 +2079,20 @@ class Pipeline:
                 counts.append(downsample_sum(counts[-1]))
 
         if not use_memmap:
+            out_val = out_sup = None
+            if self.turbo and self._is_regime_a():
+                # Regime A (issue #39 pass 3): back the output fields with
+                # tmpfs instead of anon RAM. The dnfill pass re-reads every
+                # field cell once; on this box external ~15 GB memory hogs
+                # (qemu CI runners) push anon field pages into swap
+                # (100 us+/fault - the 110 s sys in write.dnfill). tmpfs
+                # pages reclaim as clean file cache; a re-fault is a tmpfs
+                # read. Descent writes the final level into these memmaps.
+                shape = (self.nx_padded, self.ny_padded)
+                val_full = _open_fresh_memmap(out_dir / "_val_full.npy", np.float32, shape)
+                sup_full = _open_fresh_memmap(out_dir / "_sup_full.npy", np.float32, shape)
+                _nohuge(val_full, sup_full)
+                out_val, out_sup = val_full, sup_full
             with _prof.phase("shared.descent"):
                 val_full, sup_full = _pull_push_descent(
                     sums,
@@ -1966,6 +2102,8 @@ class Pipeline:
                     saturation=self.cfg.sat,
                     free_levels=True,
                     n_threads=n_threads,
+                    out_val=out_val,
+                    out_sup=out_sup,
                 )
             # Level 0 is dead after the descent: free the finest grids
             # (two f32 full arrays, ~12 GB at full-AU scale) before the
@@ -2236,8 +2374,21 @@ class Pipeline:
         partial = False
         try:
             with _prof.phase("write.dnfill"):
-                val_dn = np.full((self.ny, self.nx), NODATA, np.int16)
-                sup_dn = np.full((self.ny, self.nx), NODATA, np.int16)
+                # File-backed (tmpfs) DN fields, not anon RAM (issue #39
+                # pass 3): the warp pass re-reads every 2048^2 block once,
+                # and external ~15 GB memory hogs swap anon pages out of the
+                # 3 GB fields (30 s/warp block observed vs 0.35 s resident).
+                # tmpfs pages reclaim as clean file cache; a re-fault is a
+                # tmpfs read, never swap I/O.
+                val_dn = np.memmap(
+                    Path(self.out_dir) / "_val_dn.npy", dtype=np.int16, shape=(self.ny, self.nx), mode="w+"
+                )
+                sup_dn = np.memmap(
+                    Path(self.out_dir) / "_sup_dn.npy", dtype=np.int16, shape=(self.ny, self.nx), mode="w+"
+                )
+                _nohuge(val_dn, sup_dn)
+                val_dn.fill(NODATA)
+                sup_dn.fill(NODATA)
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
                     # One shared config object for all worker threads (no

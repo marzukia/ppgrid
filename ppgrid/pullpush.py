@@ -15,7 +15,9 @@ estimate, in metres) which drives honest opacity / masking downstream.
 
 from __future__ import annotations
 
+import ctypes
 import itertools
+import os
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +33,37 @@ _FLOAT32_EXACT_LIMIT = 1 << 24
 _COUNT_EPS = 1e-9
 # Sentinel support (metres) for "no data anywhere in the pyramid ancestry".
 _UNRESOLVED_M = 1e9
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_MADV_NOHUGEPAGE = 15
+_PAGE = os.sysconf("SC_PAGE_SIZE")
+# Below this, glibc serves chunks from arena heap VMAs where a mid-VMA
+# MADV_NOHUGEPAGE split has tripped glibc heap asserts (non-deterministic
+# abort in the test suite). >= 16 MiB arrays are direct mmaps, where the
+# advice is clean, and they are the ones whose fault cost matters.
+_NOHUGE_MIN_BYTES = 16 * 1024 * 1024
+
+
+def _nohuge(*arrays: np.ndarray | None) -> None:
+    """Request plain 4KB pages (no THP) for fresh large arrays.
+
+    On this box the kernel runs THP=always with synchronous defrag=always:
+    the first-touch fault of a fresh multi-GB mapping tries to build a 2MB
+    huge page and stalls in page compaction while the rest of the process is
+    allocating (issue #39 full-AU verify: 20-40 us/page in-run vs ~1 us for
+    4KB pages). Calling this right after allocation (before any first touch)
+    keeps the later fills fast. Values are unaffected - only the page size.
+    No-op on None/empty; safe on memmaps (shmem honours the advice too).
+    """
+    for a in arrays:
+        if a is None or a.size == 0 or a.nbytes < _NOHUGE_MIN_BYTES:
+            continue
+        # numpy's buffer can start mid-page (observed +16 into its own 4KB
+        # VMA, with the rest in the next VMA), and madvise wants both ends
+        # page-aligned: snap the start down, round the length up.
+        start = a.ctypes.data & ~(_PAGE - 1)
+        length = (a.nbytes + (a.ctypes.data - start) + _PAGE - 1) & ~(_PAGE - 1)
+        _LIBC.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_NOHUGEPAGE)
 
 
 def downsample_sum(a: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
@@ -49,6 +82,7 @@ def downsample_sum(a: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
     """
     if out is None:
         out = np.empty((a.shape[0] // 2, a.shape[1] // 2), dtype=a.dtype)
+        _nohuge(out)
     np.add(a[0::2, 0::2], a[1::2, 0::2], out=out)
     out += a[0::2, 1::2]
     out += a[1::2, 1::2]
@@ -81,10 +115,12 @@ def _smooth3(a: np.ndarray) -> np.ndarray:
         return a.copy()
 
     b = np.empty_like(a)
+    _nohuge(b)
     b[1:-1] = 0.25 * (a[:-2] + 2.0 * a[1:-1] + a[2:])
     b[0] = 0.25 * (3.0 * a[0] + a[1])
     b[-1] = 0.25 * (a[-2] + 3.0 * a[-1])
     c = np.empty_like(b)
+    _nohuge(c)
     c[:, 1:-1] = 0.25 * (b[:, :-2] + 2.0 * b[:, 1:-1] + b[:, 2:])
     c[:, 0] = 0.25 * (3.0 * b[:, 0] + b[:, 1])
     c[:, -1] = 0.25 * (b[:, -2] + 3.0 * b[:, -1])
@@ -167,7 +203,7 @@ def _band_bufs(band_rows: int, n1: int) -> dict[str, np.ndarray]:
     is (band_rows // 2 + 2) rows, i.e. band_rows + 4 upsampled rows.
     """
     f = np.float32
-    return {
+    bufs = {
         "a": np.empty((band_rows, n1), f),
         "local": np.empty((band_rows, n1), f),
         "om": np.empty((band_rows, n1), f),
@@ -176,6 +212,8 @@ def _band_bufs(band_rows: int, n1: int) -> dict[str, np.ndarray]:
         "up": np.empty((band_rows + 4, n1), f),
         "t": np.empty((band_rows + 4, n1), f),
     }
+    _nohuge(*bufs.values())
+    return bufs
 
 
 def _box_count_int64(counts: np.ndarray, radius: int) -> np.ndarray:
@@ -223,13 +261,17 @@ def box_count(counts: np.ndarray, radius: int) -> np.ndarray:
         c = counts.astype(np.float32, copy=False)
         # Exclusive row prefix: p[i, j] = sum(c[i, :j]), one cumsum + one copy
         p = np.empty((n0, n1 + 1), np.float32)
+        _nohuge(p)
         p[:, 0] = 0.0
         p[:, 1:] = np.cumsum(c, axis=1)
         lo = np.clip(np.arange(n1) - radius, 0, n1)
         hi = np.clip(np.arange(n1) + radius + 1, 0, n1)
-        w = p[:, hi] - p[:, lo]
+        w = np.empty((n0, n1), np.float32)
+        _nohuge(w)
+        w[:] = p[:, hi] - p[:, lo]
         # Exclusive column prefix over the row-window sums
         q = np.empty((n0 + 1, n1), np.float32)
+        _nohuge(q)
         q[0] = 0.0
         q[1:] = np.cumsum(w, axis=0)
         lo = np.clip(np.arange(n0) - radius, 0, n0)
@@ -315,10 +357,16 @@ def box_count_mt(
         return counts.astype(np.int64)
     dtype = np.float32 if counts.sum() < _FLOAT32_EXACT_LIMIT else np.int64
     n0, n1 = counts.shape
-    c = counts.astype(dtype, copy=False)
+    if counts.dtype == dtype:
+        c = counts
+    else:
+        c = np.empty(counts.shape, dtype)
+        _nohuge(c)
+        c[:] = counts
 
     # Pass 1: exclusive column prefix per row, threaded over row chunks.
     p = np.empty((n0, n1 + 1), dtype)
+    _nohuge(p)
     p[:, 0] = 0
     _thread_bands(_split_bands(n0, n_threads), partial(_row_prefix_rows, p, c), n_threads)
 
@@ -330,6 +378,7 @@ def box_count_mt(
     # fancy-index gather temporaries. Bit-identical to p[:, hi] - p[:, lo]:
     # same elementwise subtractions, same order.
     w = np.empty((n0, n1), dtype)
+    _nohuge(w)
     r = radius
     if 2 * r + 1 <= n1:
         np.subtract(p[:, r + 1 : 2 * r + 1], p[:, :1], out=w[:, :r])
@@ -340,19 +389,25 @@ def box_count_mt(
     del p
 
     # Pass 2: row prefix of the window sums, contiguous via the transpose.
-    wt = np.ascontiguousarray(w.T)
+    wt = np.empty((n1, n0), dtype)
+    _nohuge(wt)
+    wt[:] = w.T
     del w
     qt = np.empty((n1, n0 + 1), dtype)
+    _nohuge(qt)
     qt[:, 0] = 0
     qt[:, 1:] = np.cumsum(wt, axis=1, dtype=dtype)
     del wt
-    q = np.ascontiguousarray(qt.T)
+    q = np.empty((n0 + 1, n1), dtype)
+    _nohuge(q)
+    q[:] = qt.T
     del qt
 
     # Pass 3: window subtract, elementwise over row chunks.
     lo = np.clip(np.arange(n0) - radius, 0, n0)
     hi = np.clip(np.arange(n0) + radius + 1, 0, n0)
     out = np.empty((n0, n1), dtype)
+    _nohuge(out)
     _thread_bands(_split_bands(n0, n_threads), partial(_window_sub_rows, q, out, lo, hi), n_threads)
     return out
 
@@ -390,24 +445,43 @@ def box_count_banded(
         lo_idx = np.clip(np.arange(n1) - radius, 0, n1)
         hi_idx = np.clip(np.arange(n1) + radius + 1, 0, n1)
 
+    # Per-thread p/w/q buffers (issue #39 pass 3): the bands of one run
+    # used to allocate ~2 GB fresh per band (4096-row bands: 3 x ~700 MB),
+    # ~28 GB of churn at full-AU scale. Each band overwrites every row and
+    # column of its slice, so a per-thread buffer (max band size) reused
+    # across that thread's bands is bit-identical with far fewer faults.
+    tls = threading.local()
+    max_rows = band_rows + 2 * radius + 2
+
+    def _bufs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        b = tls.__dict__.get("boxcount")
+        if b is None:
+            p = np.empty((max_rows, n1 + 1), np.float32)
+            w = np.empty((max_rows, n1), np.float32)
+            q = np.empty((max_rows + 1, n1), np.float32)
+            _nohuge(p, w, q)
+            b = tls.boxcount = (p, w, q)
+        return b
+
     def band(b0: int) -> None:
         b1 = min(n0, b0 + band_rows)
         e0 = max(0, b0 - radius)
         e1 = min(n0, b1 + radius)
         seg = counts[e0:e1]
-        p = np.empty((e1 - e0, n1 + 1), np.float32)
+        p, w, q = _bufs()
+        p = p[: e1 - e0]
+        w = w[: e1 - e0]
         p[:, 0] = 0.0
-        p[:, 1:] = np.cumsum(seg, axis=1)
+        np.cumsum(seg, axis=1, out=p[:, 1:])
         if small_cols:
-            w = p[:, hi_idx] - p[:, lo_idx]
+            np.subtract(p[:, hi_idx], p[:, lo_idx], out=w)
         else:
-            w = np.empty((e1 - e0, n1), np.float32)
             w[:, 0:radius] = p[:, radius + 1 : 2 * radius + 1]
             w[:, radius : n1 - radius] = p[:, 2 * radius + 1 : n1 + 1] - p[:, 0 : n1 - 2 * radius]
             w[:, n1 - radius :] = p[:, n1 : n1 + 1] - p[:, n1 - 2 * radius : n1 - radius]
-        q = np.empty((e1 - e0 + 1, n1), np.float32)
+        q = q[: e1 - e0 + 1]
         q[0] = 0.0
-        q[1:] = np.cumsum(w, axis=0)
+        np.cumsum(w, axis=0, out=q[1:])
         # Row-window subtraction. alo(i) = clip(i-r, 0, n0) is constant for
         # i < r and linear for i >= r; ahi(i) = clip(i+r+1, 0, n0) is linear
         # for i < n0-r and constant for i >= n0-r. Cutting at those points
@@ -478,16 +552,34 @@ def _descent_band_body(
     om = bufs["om"][:bh]
     pv = bufs["pv"][:bh]
     ps = bufs["ps"][:bh]
-    up = bufs["up"]
-    tt = bufs["t"]
     np.divide(counts_k[r0:r1], saturation, out=a)
     np.minimum(a, 1.0, out=a)
     np.maximum(counts_k[r0:r1], _COUNT_EPS, out=om)
     np.divide(sums_k[r0:r1], om, out=local)
-    _upsample_bilinear_into(val[e0:e1], up, tt)
-    pv[:] = up[r0 - p0 : r1 - p0]
-    _upsample_bilinear_into(sup[e0:e1], up, tt)
-    ps[:] = up[r0 - p0 : r1 - p0]
+    up = bufs["up"]
+    if upsample is upsample_nearest:
+        # 2x2 block repeat into the same buffer the bilinear path uses
+        # (pure copies - bit-identical to upsample_nearest).
+        h = e1 - e0
+        w = val[e0:e1].shape[1]
+        vs = val[e0:e1]
+        up[0 : 2 * h : 2, 0 : 2 * w : 2] = vs
+        up[0 : 2 * h : 2, 1 : 2 * w : 2] = vs
+        up[1 : 2 * h : 2, 0 : 2 * w : 2] = vs
+        up[1 : 2 * h : 2, 1 : 2 * w : 2] = vs
+        pv[:] = up[r0 - p0 : r1 - p0, :]
+        ss = sup[e0:e1]
+        up[0 : 2 * h : 2, 0 : 2 * w : 2] = ss
+        up[0 : 2 * h : 2, 1 : 2 * w : 2] = ss
+        up[1 : 2 * h : 2, 0 : 2 * w : 2] = ss
+        up[1 : 2 * h : 2, 1 : 2 * w : 2] = ss
+        ps[:] = up[r0 - p0 : r1 - p0, :]
+    else:  # upsample_bilinear
+        tt = bufs["t"]
+        _upsample_bilinear_into(val[e0:e1], up, tt)
+        pv[:] = up[r0 - p0 : r1 - p0]
+        _upsample_bilinear_into(sup[e0:e1], up, tt)
+        ps[:] = up[r0 - p0 : r1 - p0]
     o = out[r0:r1]
     np.multiply(a, local, out=o)
     np.subtract(1.0, a, out=om)
@@ -496,6 +588,9 @@ def _descent_band_body(
     np.copyto(o, local, where=a >= 1.0)
     os = outs[r0:r1]
     np.multiply(a, np.float32(res * (1 << k)), out=os)
+    # om holds (1-a)*pv after the value blend; recompute 1-a so the
+    # support blend is a*res2k + (1-a)*ps, not (1-a)*pv*ps.
+    np.subtract(1.0, a, out=om)
     np.multiply(om, ps, out=om)
     os += om
 
@@ -513,6 +608,8 @@ def _pull_push_descent(
     free_levels: bool = False,
     n_threads: int = 1,
     band_rows: int = 512,
+    out_val: np.ndarray | None = None,
+    out_sup: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Descend a prebuilt pull-push pyramid (coarsest -> finest).
 
@@ -536,6 +633,13 @@ def _pull_push_descent(
             upsample_bilinear (see _descent_band_body); any other upsample
             falls back to the full-array pass.
         band_rows: Row-chunk height for the threaded pass.
+        out_val: Optional preallocated array (same shape as the level
+            stop_level output, e.g. a tmpfs memmap) that the FINAL descent
+            level writes into instead of allocating. Intermediate levels
+            still allocate. Used by regime A (issue #39 pass 3) to back the
+            output fields with tmpfs, whose pages reclaim as clean file
+            cache instead of anon swap I/O under external pressure.
+        out_sup: Same as out_val, for the support field.
 
     Returns:
         Tuple of interpolated value grid and support grid in metres, at
@@ -559,8 +663,12 @@ def _pull_push_descent(
             n0 = sums[k].shape[0]
             n1 = sums[k].shape[1]
             bands = [(r0, min(n0, r0 + band_rows)) for r0 in range(0, n0, band_rows)]
-            out = np.empty_like(sums[k])
-            outs = np.empty_like(counts[k])
+            if k == stop_level and out_val is not None:
+                out, outs = out_val, out_sup
+            else:
+                out = np.empty_like(sums[k])
+                outs = np.empty_like(counts[k])
+                _nohuge(out, outs)
             # Per-thread buffer sets (issue #39): a thread reuses one set
             # across every band of the level; the set is sized for this
             # level's column count and dropped when the level ends.
@@ -595,9 +703,29 @@ def _pull_push_descent(
             c = counts[k]
             a = np.minimum(c / saturation, 1.0).astype(np.float32)
             local = sums[k] / np.maximum(c, _COUNT_EPS)
-            parent = upsample(val)
-            val = np.where(a >= 1.0, local, a * local + (1.0 - a) * parent)
-            sup = a * np.float32(res * (1 << k)) + (1.0 - a) * upsample(sup)
+            if k == stop_level and out_val is not None:
+                # Final level into preallocated arrays (regime A tmpfs
+                # fields). Same formula and IEEE association as the fresh
+                # path below; saturated cells go through the same 0*parent
+                # -> NaN -> restore-from-`local` dance as the threaded band
+                # body, so the bits match.
+                sat = a >= 1.0
+                om = np.empty_like(a)
+                _nohuge(om)
+                np.multiply(a, local, out=out_val)
+                np.subtract(1.0, a, out=om)
+                np.multiply(om, upsample(val), out=om)
+                out_val += om
+                np.copyto(out_val, local, where=sat)
+                np.multiply(a, np.float32(res * (1 << k)), out=out_sup)
+                np.subtract(1.0, a, out=om)
+                np.multiply(om, upsample(sup), out=om)
+                out_sup += om
+                val, sup = out_val, out_sup
+            else:
+                parent = upsample(val)
+                val = np.where(a >= 1.0, local, a * local + (1.0 - a) * parent)
+                sup = a * np.float32(res * (1 << k)) + (1.0 - a) * upsample(sup)
         if free_levels:
             sums[k + 1] = None
             counts[k + 1] = None
@@ -644,6 +772,7 @@ def _descent_banded(
             outs = np.lib.format.open_memmap(
                 level_dir / f"_sup_lvl{k}.npy", mode="w+", dtype=np.float32, shape=counts[k].shape
             )
+            _nohuge(out, outs)
         else:
             out, outs = out_val, out_sup
         n0 = sums[k].shape[0]
@@ -748,8 +877,12 @@ def bin_points(
         msg = f"iy indices out of range [0, {ny}): min={iy.min()}, max={iy.max()}"
         raise ValueError(msg)
     key = ix.astype(np.int64) * ny + iy.astype(np.int64)
-    s = np.bincount(key, weights=values, minlength=nx * ny).reshape(nx, ny).astype(np.float32)
-    c = np.bincount(key, minlength=nx * ny).reshape(nx, ny).astype(np.float32)
+    s64 = np.bincount(key, weights=values, minlength=nx * ny)
+    _nohuge(s64)
+    s = s64.reshape(nx, ny).astype(np.float32)
+    c64 = np.bincount(key, minlength=nx * ny)
+    _nohuge(c64)
+    c = c64.reshape(nx, ny).astype(np.float32)
     return s, c
 
 
@@ -774,6 +907,7 @@ def bin_points_banded(
     xs = ix[order]
     ys = iy[order]
     ws = w[order]
+    _nohuge(order, xs, ys, ws)
     bounds = np.concatenate((np.zeros(1, xs.dtype), np.flatnonzero(np.diff(xs)) + 1, np.array([xs.size], xs.dtype)))
     if bounds.size < 2 or bounds[1] == 0:
         return
