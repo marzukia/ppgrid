@@ -22,7 +22,7 @@ import sys
 import time
 from typing import Self
 
-__all__ = ["phase"]
+__all__ = ["enabled", "phase"]
 
 # Read once at import: PPGRID_PROFILE is a process-start knob.
 _ENABLED: bool = os.environ.get("PPGRID_PROFILE") == "1"
@@ -68,3 +68,8 @@ class _Phase:
 def phase(label: str) -> _Phase:
     """Start a profiler phase (no-op unless PPGRID_PROFILE=1)."""
     return _Phase(label)
+
+
+def enabled() -> bool:
+    """Report whether PPGRID_PROFILE=1 was set at import."""
+    return _ENABLED
