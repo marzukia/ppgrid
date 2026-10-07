@@ -27,6 +27,7 @@ from ppgrid.turbop import (
     descent_band_bytes,
     detect_cap_gb,
     est_peak,
+    per_box_peak_bytes,
     per_box_wall_s,
     phase_peak_bytes,
     plan,
@@ -318,6 +319,46 @@ def test_exit3_pinned_at_16gb() -> None:
     assert strict.message.startswith("error:")
 
 
+def test_per_box_peak_bytes() -> None:
+    """Per-box peak = box cells x 64 B x in-flight + 2 GB fixed + extra (M-3)."""
+    assert per_box_peak_bytes(1_000_000) == 1_000_000 * 64 + 2 * GB
+    assert per_box_peak_bytes(1_000_000, in_flight=4, extra_bytes=1024) == 1_000_000 * 64 * 4 + 2 * GB + 1024
+    assert per_box_peak_bytes(0, in_flight=0) == 2 * GB  # in_flight clamps to 1
+
+
+def test_precheck_per_box_peak_gate() -> None:
+    """Per-box est above budget is announced instead of promised (M-3).
+
+    Non-strict: exit 0 continues, but the warning names the OOM risk
+    (output may be partial). Strict: exit 3 names the per-box
+    infeasibility too. No estimate passed (pre-grid, unit pins): the
+    legacy per-box message stands.
+
+    """
+    plan16 = _plan_full_au(16.0)  # per_box; budget = 13.6 GB
+    small = per_box_peak_bytes(6_553_600, in_flight=4, extra_bytes=int(1.5 * GB))  # ~5.2 GB
+    dec = precheck(plan16, strict=False, cap_source="preset 16 GB", per_box_peak_bytes=small)
+    assert dec.exit_code == 0
+    assert dec.est_peak_gb == pytest.approx(small / GB, rel=1e-9)
+    assert "using per-box" in dec.message  # fits: legacy wording
+    assert "per-box est" in dec.summary
+
+    # res=1-class worst box (24576^2) at 4 in-flight: far over budget.
+    big = per_box_peak_bytes(24_576 * 24_576, in_flight=4, extra_bytes=int(4 * GB))
+    dec = precheck(plan16, strict=False, cap_source="preset 16 GB", per_box_peak_bytes=big)
+    assert dec.exit_code == 0  # non-strict continues...
+    assert dec.message.startswith("[warn]")
+    assert "OOM risk" in dec.message
+    assert "partial" in dec.message
+    strict = precheck(plan16, strict=True, cap_source="preset 16 GB", per_box_peak_bytes=big)
+    assert strict.exit_code == 3
+    assert strict.message is not None
+    assert strict.message.startswith("error:")
+    assert "will OOM" in strict.message
+    legacy = precheck(plan16, strict=False, cap_source="preset 16 GB")
+    assert "using per-box (turbo warp/write)" in legacy.message
+
+
 def test_precheck_clean_at_64gb() -> None:
     """Regime A at 64 GB: no warn, exit 0, printable summary (deploy visibility)."""
     pl = _plan_full_au(64.0)
@@ -365,7 +406,7 @@ def test_detect_cap_auto() -> None:
 
 
 def test_resolve_cap_clamp_and_floor() -> None:
-    """Preset >= physical clamps to physical - 8; sub-floor presets hit 8."""
+    """Preset >= available clamps to available - 8; sub-floor presets hit 8."""
     cap, source = resolve_cap(32.0, physical_gb=64.0)
     assert cap == 32.0
     assert source == "preset 32 GB"
@@ -378,6 +419,29 @@ def test_resolve_cap_clamp_and_floor() -> None:
     cap, source = resolve_cap(None, physical_gb=64.0, cgroup_gb=64.0)
     assert cap == 56.0
     assert source.startswith("auto")
+
+
+def test_resolve_cap_preset_clamp_cgroup_aware() -> None:
+    """The preset clamp compares against min(physical, cgroup) (M-2).
+
+    A memory-capped slice OOMs at its own limit long before the physical
+    one, so a preset >= the slice ceiling must clamp to ceiling - 8 GB.
+
+    """
+    cap, source = resolve_cap(32.0, physical_gb=134.9, cgroup_gb=24.0)
+    assert cap == 16.0  # 24 - 8: the slice limit binds before physical
+    assert "cgroup 24 GB" in source
+    cap, source = resolve_cap(32.0, physical_gb=16.0, cgroup_gb=math.inf)
+    assert cap == 8.0  # physical binds; unlimited cgroup
+    assert "unlimited" in source
+    # Legacy call style (cgroup None): physical-only string stands.
+    cap, source = resolve_cap(128.0, physical_gb=64.0)
+    assert cap == 56.0
+    assert source == "preset 128 GB >= physical 64 GB; clamped to physical - 8 GB"
+    # Below available: the preset stands as given.
+    cap, source = resolve_cap(16.0, physical_gb=134.9, cgroup_gb=24.0)
+    assert cap == 16.0
+    assert source == "preset 16 GB"
 
 
 def test_cgroup_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
