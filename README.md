@@ -13,7 +13,7 @@ A single 100K-point dataset rendered at four resolutions. The adaptive mipmap py
 
 You have `N` points with `(longitude, latitude, value)`. You want a raster where every cell within a specified distance of real data carries an interpolated value, and everything else is nodata.
 
-Standard IDW in QGIS or ArcGIS is `O(N*M)` (~14 hours for 16M points). This tool uses pull-push mipmap interpolation to reduce cost to `O(M)`, independent of N.
+Standard IDW in QGIS or ArcGIS is `O(N*M)` (hours to days at 16M points, depending on the IDW implementation and machine). This tool uses pull-push mipmap interpolation to reduce cost to `O(M)`, independent of N.
 
 ## How it works
 
@@ -124,6 +124,25 @@ ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
 | `--work-crs` | `6933` | Working CRS for interpolation (equal-area) |
 | `--out-crs` | `3857` | Output CRS for final GeoTIFF |
 | `--skip-calibration` | False | Skip calibration, use defaults |
+| `--turbo` | (none) | Turbo mode: multithreaded pipeline sized to a RAM cap. Optional preset `16|32|64|128` (GB); bare `--turbo` = auto `min(physical, cgroup) - 8 GB` |
+| `--max-ram` | (none) | Explicit RAM cap in GB (overrides the `--turbo` preset). Implies `--turbo` |
+| `--ram-gb` | (none) | Alias of `--max-ram` |
+| `--turbo-strict` | False | Shared path infeasible under the budget: error + exit 3 instead of `[warn]` + per-box fallback (exit 0) |
+
+### Turbo mode
+
+`--turbo` enables the multithreaded pipeline. The RAM cap `C` (a preset, `--max-ram`, or bare `--turbo` auto-detect) drives a planning budget **`Bt = 0.85 * C - 4 GB`** and a regime, printed by a pre-check after gridding. None of the turbo settings change the output bytes.
+
+- **A** — full in-RAM shared fields. Fastest; needs the most RAM.
+- **B** — input in RAM, output bands file-backed with a limited number of descent bands in flight.
+- **C** — shared all-memmap banded descent: input and output bands file-backed (reclaimable memmap), with an 8 GB page-cache floor in its peak accounting.
+- **per_box** — per-box warp/write fallback, taken when regime C has fewer than 2 in-flight units. This is the only genuine low-RAM mode.
+
+When the shared path is infeasible under the budget, the run prints `[warn]` and continues on the per-box path (exit 0, correct output). `--turbo-strict` makes the infeasibility an error (exit 3).
+
+**`--ram-gb` caps the shared-field budget, not process RSS.** Write/descent buffers sit outside the `Bt` sizing, so a regime C run under `--ram-gb 20` can peak well above 20 GB RSS (measured: 39.4 GB). Only the per-box path is genuinely low-RAM (measured: 8.5 GB peak).
+
+**Byte identity.** Turbo output is sha256-identical to the serial path. The optional parallel per-tile ZSTD write is gated by a compression oracle: where the oracle mismatches (e.g. the reference GDAL 3.12.4 / libtiff 6.2 stack), the run uses the stock-codec **parallel** writer instead, which is byte-exact; the serial per-band write is the last resort only, reached if that writer's layout guards fail.
 
 ## Decoding the output
 
@@ -165,6 +184,19 @@ Melbourne Housing dataset (13,580 points) at various resolutions on the same mac
 | 100m | 0.8s | 749 KB |
 | 250m | 0.6s | 159 KB |
 | 500m | 0.6s | 49 KB |
+
+### Turbo benchmarks (full AU)
+
+Full-Australia grid, 16M points, `--res 100 --cap-km 25 --skip-calibration`, on marzuki-hydrogen (Threadripper 24C/48T, 125 GB, CPU-only). All outputs sha256-identical across the pre- and post-turbo-code runs.
+
+| Mode | Wall | Peak RSS |
+|------|------|----------|
+| Pre-PR turbo code, regime A (`--turbo 64`, same code) | 30:45 (quiet) to 50:46 (loaded) | 41.7 GB |
+| Regime A (`--turbo 64`) | 2:33 | 43 GB |
+| per-box (24 GB cgroup slice) | 3:20 | 8.5 GB |
+| Regime C (`--ram-gb 20`) | 6:25 pre-PR, 3:08 post | 39.4 GB |
+
+The pre-PR regime-A wall varies 30:45-50:46 with machine load (two measured runs of the same code on the same box), so the speedup range is ~12-20x rather than a single ratio. Note the `--ram-gb 20` row: the cap bounds the shared-field budget, not RSS — see the caveat above; per-box is the only genuinely low-RAM mode.
 
 ## Example Outputs
 

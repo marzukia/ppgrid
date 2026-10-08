@@ -150,7 +150,7 @@ def _perbox_reference(p: Pipeline, bx: int, by: int) -> tuple[np.ndarray, np.nda
     return _quantize(
         p.cfg,
         val[sl],
-        sup[sl] / M_PER_KM,
+        sup[sl],
         near[sl],
     )
 

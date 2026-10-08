@@ -14,13 +14,15 @@ def _exclude() -> list[str]:
 
 
 def test_sdist_excludes_generated_examples() -> None:
-    """Generated GeoTIFFs/PNGs/JPGs and the 8.3 MB equake CSV must not ship."""
+    """Generated GeoTIFFs/PNGs/JPGs and the large sample CSVs must not ship."""
     excluded = _exclude()
     assert "examples/melb/**" in excluded
     assert "examples/equakes/**" in excluded
     assert "examples/*.png" in excluded
     assert "examples/*.jpg" in excluded
     assert "data/all_equakes.csv" in excluded
+    assert "data/au_gcc_sparse.csv" in excluded
+    assert "tests/fixtures/**" in excluded
 
 
 def test_sdist_keeps_source_data() -> None:
