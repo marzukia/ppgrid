@@ -221,6 +221,33 @@ def test_descent_banded_mt_odd_bands(tmp_path: Path) -> None:
     assert np.array_equal(sup_ref, sup_mt)
 
 
+def test_pull_push_descent_mt_odd_band_rows() -> None:
+    """band_rows=63 (odd): reviewer repro n0=128, full band at odd r0 (issue #41).
+
+    A full band starting at odd r0 needs (band_rows + 1)//2 + 1 = 34 parent
+    rows, i.e. 2h = band_rows + 5 upsampled rows; the buffer was sized
+    band_rows + 4 and the bilinear/nearest copies hit a broadcast error on
+    band [63, 126) of the 128-row level. Threaded must be bit-exact vs
+    serial (n_threads=1 = full-array pass).
+    """
+    rng = np.random.default_rng(41)
+    n0 = n1 = 128
+    levels = 2
+    res, sat = 50.0, 2.0
+    n = 5_000
+    ix = rng.integers(0, n0, n)
+    iy = rng.integers(0, n1, n)
+    w = rng.lognormal(0.0, 1.0, n)
+    s0, c0 = bin_points(ix, iy, w, n0, n1)
+    sums, counts = _pyramid(s0, c0, levels)
+
+    val_ref, sup_ref = _pull_push_descent(sums, counts, res, levels, saturation=sat)
+    for nt in (_THREADS,):
+        val_mt, sup_mt = _pull_push_descent(sums, counts, res, levels, saturation=sat, n_threads=nt, band_rows=63)
+        assert np.array_equal(val_ref, val_mt)
+        assert np.array_equal(sup_ref, sup_mt)
+
+
 def test_pull_push_descent_mt() -> None:
     """In-RAM descent: threaded row chunks == full-array pass, bit-exact."""
     rng = np.random.default_rng(36)

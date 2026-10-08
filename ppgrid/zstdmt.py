@@ -586,7 +586,8 @@ def oracle_check(
         detail = f"zstd oracle: turbo {len(turbo)} B == stock {len(stock)} B (tile {tile})"
         return OracleVerdict(ok=True, turbo_size=len(turbo), stock_size=len(stock), detail=detail)
     detail = (
-        f"zstd oracle mismatch: turbo {len(turbo)} B != stock {len(stock)} B (tile {tile}); "
-        "write serially with the stock path"
+        f"zstd oracle mismatch: bytes differ at tile {tile} "
+        f"(turbo {len(turbo)} B vs stock {len(stock)} B); "
+        "falling back to the stock parallel writer (byte-exact, still parallel)"
     )
     return OracleVerdict(ok=False, turbo_size=len(turbo), stock_size=len(stock), detail=detail)

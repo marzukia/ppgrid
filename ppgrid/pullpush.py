@@ -26,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ._tempfiles import _open_fresh_memmap
+
 # float32 is exact for integers up to 2**24; beyond that, box counts can no
 # longer be represented and the float32 fast path must fall back to int64.
 _FLOAT32_EXACT_LIMIT = 1 << 24
@@ -66,23 +68,18 @@ def _nohuge(*arrays: np.ndarray | None) -> None:
         _LIBC.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_NOHUGEPAGE)
 
 
-def downsample_sum(a: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
+def downsample_sum(a: np.ndarray) -> np.ndarray:
     """2x2 block sum. Sums (not means) so s and c stay consistent.
 
     Args:
         a: Input array.
-        out: Optional preallocated destination, shape (a.shape[0] // 2,
-            a.shape[1] // 2), same dtype. Accumulates in place, skipping the
-            two intermediate full-size temporaries of the plain form (issue
-            #39). Bit-identical: same left-to-right addition order.
 
     Returns:
         Downsampled array with half the dimensions.
 
     """
-    if out is None:
-        out = np.empty((a.shape[0] // 2, a.shape[1] // 2), dtype=a.dtype)
-        _nohuge(out)
+    out = np.empty((a.shape[0] // 2, a.shape[1] // 2), dtype=a.dtype)
+    _nohuge(out)
     np.add(a[0::2, 0::2], a[1::2, 0::2], out=out)
     out += a[0::2, 1::2]
     out += a[1::2, 1::2]
@@ -199,8 +196,9 @@ def _band_bufs(band_rows: int, n1: int) -> dict[str, np.ndarray]:
     Sized for the widest band (band_rows rows) at a level with n1 columns;
     a thread reuses its set across every band of the level, which cuts the
     ~9 full-band-sized per-call allocations to zero first-touch pages. The
-    up/t buffers hold band_rows + 4 rows: an interior band's parent slice
-    is (band_rows // 2 + 2) rows, i.e. band_rows + 4 upsampled rows.
+    up/t buffers hold band_rows + 5 rows: an odd-start full band's parent
+    slice is (band_rows + 1) // 2 + 1 rows, i.e. 2 * ((band_rows + 1) // 2
+    + 1) = band_rows + 5 upsampled rows for odd band_rows (issue #41).
     """
     f = np.float32
     bufs = {
@@ -209,8 +207,8 @@ def _band_bufs(band_rows: int, n1: int) -> dict[str, np.ndarray]:
         "om": np.empty((band_rows, n1), f),
         "pv": np.empty((band_rows, n1), f),
         "ps": np.empty((band_rows, n1), f),
-        "up": np.empty((band_rows + 4, n1), f),
-        "t": np.empty((band_rows + 4, n1), f),
+        "up": np.empty((band_rows + 5, n1), f),
+        "t": np.empty((band_rows + 5, n1), f),
     }
     _nohuge(*bufs.values())
     return bufs
@@ -766,12 +764,10 @@ def _descent_banded(
     sup = sup_in
     for k in range(start_level - 1, -1, -1):
         if k > 0:
-            out = np.lib.format.open_memmap(
-                level_dir / f"_val_lvl{k}.npy", mode="w+", dtype=np.float32, shape=sums[k].shape
-            )
-            outs = np.lib.format.open_memmap(
-                level_dir / f"_sup_lvl{k}.npy", mode="w+", dtype=np.float32, shape=counts[k].shape
-            )
+            # Fresh 0600 regular files (issue #45): a pre-planted symlink is
+            # replaced, never followed, and the O_EXCL race is guarded.
+            out = _open_fresh_memmap(level_dir / f"_val_lvl{k}.npy", np.float32, sums[k].shape)
+            outs = _open_fresh_memmap(level_dir / f"_sup_lvl{k}.npy", np.float32, counts[k].shape)
             _nohuge(out, outs)
         else:
             out, outs = out_val, out_sup
