@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from rasterio.transform import from_origin
@@ -34,9 +35,15 @@ def _make_src(path: Path, nx: int = 6144, ny: int = 6144, res: float = 10.0, bsi
     return t
 
 
-def _task_info_around_44(nby: int = 6, bsize: int = 1024) -> dict:
-    """Return task_info for the 3x3 task neighbourhood of block (4, 4)."""
-    bids = {bx * nby + by for bx in (3, 4, 5) for by in (3, 4, 5)}
+def _task_info_around_41(nby: int = 6, bsize: int = 1024) -> dict:
+    """Return task_info for the 3x3 task neighbourhood of data block (4, 1).
+
+    Block rows are encoded FROM THE BOTTOM, the same convention as
+    Pipeline.tasks (by = (y - y.min()) // res // bsize). The test raster
+    keeps its data in raster rows 4096..5119 from the top, which is bottom
+    block row 1 of the 6144-row grid: top block (4, 4) = bottom block (4, 1).
+    """
+    bids = {bx * nby + by for bx in (3, 4, 5) for by in (0, 1, 2)}
     return {"bsize": bsize, "nby": nby, "task_bids": bids}
 
 
@@ -61,7 +68,7 @@ def test_reproject_skip_output_identical(tmp_path: Path, monkeypatch: pytest.Mon
     n_plain = calls["n"]
 
     calls["n"] = 0
-    _reproject_band(str(src), str(dst_skip), PROFILE, "EPSG:3857", t, 6144, 6144, _task_info_around_44())
+    _reproject_band(str(src), str(dst_skip), PROFILE, "EPSG:3857", t, 6144, 6144, _task_info_around_41())
     n_skip = calls["n"]
 
     with rasterio.open(dst_plain) as a, rasterio.open(dst_skip) as b:
@@ -92,6 +99,85 @@ def test_reproject_skip_no_task_info_is_noop(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setattr(pgrid, "reproject", counting)
     _reproject_band(str(src), str(dst), PROFILE, "EPSG:3857", t, 6144, 6144, None)
     assert calls["n"] == 9
+
+
+def test_reproject_skip_e2e_asymmetric_tasks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end: task_info from self.tasks, skip on vs off is pixel-identical.
+
+    Regression test for the vertical flip (B1, PR #27 review): task blocks
+    encode block rows from the bottom while dst tiles index raster rows from
+    the top. On a vertically asymmetric grid (nby >= 4) with tasks only in
+    opposite corners, mixing the two conventions falsely skips the data
+    tiles. Runs the real Pipeline (work CRS 6933 -> out CRS 3857, the
+    default pair) with a SW corner cluster + one far NE point, skip enabled
+    vs forced-disabled, and requires pixel-identical output.
+    """
+    rng = np.random.default_rng(42)
+    rows = [(float(i + 1), 140.0 + rng.uniform(0.0, 0.15), -3.55 + rng.uniform(0.0, 0.2)) for i in range(100)]
+    rows.append((999.0, 144.8, 3.55))
+    csv = tmp_path / "pts.csv"
+    pd.DataFrame(rows, columns=["value", "lng", "lat"]).to_csv(csv, index=False)
+
+    calls = {"n": 0}
+    orig = pgrid.reproject
+
+    def counting(*a: object, **kw: object) -> object:
+        calls["n"] += 1
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(pgrid, "reproject", counting)
+
+    def run(name: str) -> tuple[np.ndarray, np.ndarray, Pipeline, tuple[int, int], int]:
+        calls["n"] = 0
+        p = Pipeline(
+            str(csv),
+            "value",
+            "lng",
+            "lat",
+            str(tmp_path / name),
+            res=100.0,
+            block_size=2048,
+            workers=2,
+            skip_calibration=True,
+        )
+        v, s = p.run()
+        with rasterio.open(v) as ds:
+            va = ds.read(1)
+            dims = ds.shape  # (height, width)
+        with rasterio.open(s) as ds:
+            sa = ds.read(1)
+        return va, sa, p, dims, calls["n"]
+
+    # Skip ENABLED: task_info from self.tasks (bottom-anchored block rows).
+    va, sa, p_skip, dims, n_skip = run("skip")
+    # Skip forced-disabled: every tile is warped (the no-skip reference).
+
+    def _always_has_task(*_a: object, **_kw: object) -> bool:
+        return True
+
+    monkeypatch.setattr(pgrid, "_footprint_has_task", _always_has_task)
+    vb, sb, p_plain, _, n_plain = run("plain")
+
+    # Grid shape: the flip can only bite with nby >= 4 and the two corner
+    # task sets must sit in opposite block rows/columns (asymmetric).
+    assert p_skip.nby >= 4
+    assert p_skip.nbx >= 3
+    assert p_skip.nby == p_plain.nby
+    assert len(p_skip.tasks) == 8
+
+    # Warp-count sanity: both bands (value + support) reproject the same
+    # grid; the reference warps every coarse 2048px tile, the skip path a
+    # strict subset (some tile is all-NoData).
+    n_tiles = -(-dims[0] // 2048) * -(-dims[1] // 2048)
+    assert n_plain == 2 * n_tiles
+    assert 0 < n_skip < n_plain
+
+    # Core guarantee: skip or no-skip, pixel-identical output.
+    assert np.array_equal(va, vb)
+    assert np.array_equal(sa, sb)
+    # The SW corner cluster must survive the skip path.
+    h = va.shape[0]
+    assert (va[3 * h // 4 :] != NODATA).sum() > 0
 
 
 def test_pipeline_max_band_parallel_validation() -> None:

@@ -785,10 +785,13 @@ def _descent_banded(
 
     Low-RAM guard (PR #27): the per-level pool is clamped to
     min(n_threads, nbands, 8), and each concurrent band holds its own
-    intermediate buffers (a, local, pv, ps), so when /proc/meminfo reports
-    less available memory than the current peak RSS plus two bands' worth
-    of float32 buffers, the level runs single-threaded and peak RSS cannot
-    exceed the sequential path.
+    intermediate buffers (a, local, pv, ps). When /proc/meminfo reports
+    less available memory than the current peak RSS plus two bands' worth of
+    float32 buffers, the level falls back to single-threaded (nw=1), where
+    peak RSS cannot exceed the sequential path. The reserve covers only two
+    bands against up to eight concurrent, so the gate is a headroom
+    heuristic, not a memory bound: it trades wall time under memory
+    pressure and never changes the output.
     """
     if nworkers is not None:
         n_threads = nworkers

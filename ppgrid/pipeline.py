@@ -700,11 +700,14 @@ def _footprint_has_task(
     The footprint is the dst window bounds transformed into source (work-CRS)
     georeferenced space via `transform_bounds` on a densified boundary, then
     converted to work-grid cell ranges rounded OUT (one extra cell of pad on
-    every side). Raster row 0 is at the top edge (g_top), so row indices are
-    derived from the top edge. Against those ranges the task-block cell ranges
-    are tested exactly, so a false "has data" costs one warp, but a false
-    "empty" is not possible: the task blocks are the superset of every
-    non-NoData cell.
+    every side). Raster row 0 is at the top edge (g_top), so the footprint's
+    row range is derived from the top edge, then flipped to bottom-anchored
+    row indices before the block test: task_bids encodes block rows from the
+    bottom (self.tasks convention, by = (y - y.min()) // res // bsize; the
+    raster write flips it via Window(i0, ny - j1)). The padded cell ranges
+    are tested against the task blocks, so a false "has data" costs one warp,
+    but a false "empty" is not possible: the task blocks are the superset of
+    every non-NoData cell.
     """
     sb = rasterio.warp.transform_bounds(dst_crs, src_crs, *w_bounds, densify_pts=257)
     pad = max(g_res_x, g_res_y)
@@ -716,9 +719,15 @@ def _footprint_has_task(
     j1 = min(g_height, math.floor((g_top - ymin) / g_res_y) + 1)
     if i1 <= i0 or j1 <= j0:
         return False
+    # j0/j1 are raster rows from the TOP (row 0 = g_top); task_bids encodes
+    # block rows from the BOTTOM. Top row [j0, j1) is bottom row
+    # [g_height - j1, g_height - j0); flip before deriving block rows, else
+    # top/bottom tiles are falsely skipped whenever nby >= 4 (B1, PR #27).
+    bj0 = g_height - j1
+    bj1 = g_height - j0
     for bx in range(i0 // bsize, (i1 - 1) // bsize + 1):
         base = bx * nby
-        for by in range(j0 // bsize, (j1 - 1) // bsize + 1):
+        for by in range(bj0 // bsize, (bj1 - 1) // bsize + 1):
             if base + by in task_bids:
                 return True
     return False
@@ -827,7 +836,7 @@ def _reproject_band(
             offsets=tuple(src.offsets) if getattr(src, "offsets", None) else None,
             n_threads=n_threads,
         )
-        if skip:
+        if skip and counters["skipped"] > 0:
             print(f"[reproj] skipped {counters['skipped']}/{counters['tiles']} all-NoData tiles")  # ruff: ignore[print]
 
 
