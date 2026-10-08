@@ -7,13 +7,20 @@ capped raster surface, in minutes, on a single machine, with no GPU.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
+import struct
 import sys
+import threading
+import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
+from itertools import starmap
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -22,11 +29,13 @@ import pandas as pd
 import rasterio
 from pyproj import Transformer
 from pyproj.exceptions import CRSError
-from rasterio.transform import from_bounds, from_origin
+from rasterio._io import MemoryDataset
+from rasterio.errors import NotGeoreferencedWarning
+from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 
-from . import __version__
+from . import __version__, _prof, turbop, zstdmt
 from .calibrate import (
     M_PER_KM,
     PERCENTILE_MAX,
@@ -38,14 +47,25 @@ from .calibrate import (
 )
 from .pullpush import (
     _descent_banded,
+    _nohuge,
     _pull_push_descent,
     bin_points,
     bin_points_banded,
     box_count,
     box_count_banded,
+    box_count_mt,
     downsample_sum,
     pull_push,
 )
+
+# rasterio's MemoryDataset.__init__ (used by reproject for ndarray buffers)
+# always warns NotGeoreferencedWarning on the initial transform read of the
+# MEM::: dataset, then sets the real transform immediately after. It normally
+# hides the warning in a nested warnings.catch_warnings, but CPython warning
+# filters are process-global, not thread-safe: with concurrent warps (S3.3)
+# another thread can restore a stale filter snapshot and leak the benign
+# warning. It carries no information here, so ignore the category.
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 WORK_CRS: int = 6933  # Wagner VII — global equal-area, metres are true
 SRC_CRS: int = 4326  # WGS 84 lon/lat (default input)
@@ -105,6 +125,11 @@ _SHARED_MAX_CELLS = int(2.5e8)
 # write the finest descent level to memmap in row bands.
 _SHARED_MEMMAP_CELLS = int(1e8)
 
+# Classic TIFF address space (S3.4 parallel write): the assembled file is
+# built on a classic-TIFF reference head; a total size beyond 0xFFFFFFFF
+# needs the BIGTIFF format, so the band falls back to the serial write.
+_TIFF_CLASSIC_MAX_BYTES: int = 0xFFFFFFFF
+
 # Temp files created in the output dir by a run; all removed on success and
 # on the failure path (issue #15). _val_lvl*.npy / _sup_lvl*.npy are written
 # by pullpush._descent_banded on the banded path.
@@ -115,9 +140,16 @@ _RUN_TEMP_FILES = (
     "_near.npy",
     "_val_full.npy",
     "_sup_full.npy",
+    "_val_dn.npy",
+    "_sup_dn.npy",
     "_val_lvl1.npy",
     "_sup_lvl1.npy",
 )
+
+# Ingest parallelism (S3.5): minimum data rows per CSV chunk for the process
+# pool. Below this the pool overhead exceeds the parse time, so ingest stays
+# on the single serial parse.
+_INGEST_MIN_CHUNK_ROWS = 100_000
 
 
 @dataclass
@@ -314,6 +346,13 @@ def _block_points(cfg: _WorkerConfig, bx: int, by: int) -> np.ndarray:
     return np.concatenate(out, axis=1) if out else np.empty((PTS_NBANDS, 0))
 
 
+# Thread-local f32 scratch for _quantize's support chain (see docstring
+# there). The int16 outputs are owned by the caller - returning scratch
+# raced the worker pool's ex.map prefetch (worker overwrote the buffer
+# before the main thread finished vd.write), corrupting blocks randomly.
+_QUANT_TLS = threading.local()
+
+
 def _quantize(
     cfg: _WorkerConfig,
     v_out: np.ndarray,
@@ -323,29 +362,67 @@ def _quantize(
     """Transform interpolated (value, support) to int16 percentile DN grids.
 
     Shared by the per-block and shared-field paths so the rounding is
-    structurally identical.
+    structurally identical. `r_out` is the support field in METRES (the raw
+    sup slice); the /M_PER_KM division runs into the per-thread f32 scratch
+    (issue #39 pass 3: the old out-of-place division was a fresh 16 MB f32
+    array per block).
 
     Returns:
         Tuple of (value, support) int16 arrays with NODATA where not near data.
+        The arrays are owned by the caller (fresh each call) - the f32 work
+        buffer is per-thread scratch (issue #39 pass 3: returning scratch
+        raced the worker pool's prefetch and corrupted ~10% of blocks).
 
     """
     # Transform: interpolate space -> raw -> percentile
     tf = cfg.tf
     pct = cfg.pct
-    pv = pct.fwd(tf.inv(v_out))
+    s = _QUANT_TLS.__dict__.get("q")
+    if s is None or s[0].shape != v_out.shape:
+        s = (
+            np.empty(v_out.shape, np.float32),
+            np.empty(v_out.shape, np.float64),
+        )
+        _nohuge(s[0], s[1])
+        _QUANT_TLS.q = s
+    w, x64 = s
+    v_in = tf.inv(v_out)
+    # np.interp's C core casts a non-f64 x to a FRESH f64 array (32 MB per
+    # block at full scale). Cast into the per-thread scratch instead: an
+    # exact f32 -> f64 conversion, same bits, no allocation (issue #39 pass
+    # 3). If v_in is already f64 (non-identity transform), reuse it as-is.
+    if v_in.dtype != np.float64:
+        np.copyto(x64, v_in)
+        v_in = x64
+    pv = pct.fwd(v_in)
     if cfg.pct_step is not None:
         # Round to the nearest step (e.g. 5 -> 90/95/100), clamp to 0-100.
-        pv = np.clip(np.round(pv / cfg.pct_step) * cfg.pct_step, 0.0, PERCENTILE_MAX)
-    vq = np.where(near_out, np.round(pv * cfg.scale), NODATA).astype(np.int16)
-    rq = np.where(
-        near_out,
-        np.clip(
-            np.round(np.log2(np.maximum(r_out, SUPPORT_KM_FLOOR)) * SUPPORT_LOG2_SCALE),
-            -SUPPORT_DN_MAX,
-            SUPPORT_DN_MAX,
-        ),
-        NODATA,
-    ).astype(np.int16)
+        # In-place: the out-of-place chain allocated 3 fresh full-size f64
+        # arrays per block; at full-AU scale that was the dominant fault
+        # source of write.dnfill. Same IEEE ops in the same order, so the
+        # bits are identical.
+        np.divide(pv, cfg.pct_step, out=pv)
+        np.round(pv, out=pv)
+        np.multiply(pv, cfg.pct_step, out=pv)
+        np.clip(pv, 0.0, PERCENTILE_MAX, out=pv)
+    vq = np.empty(v_out.shape, np.int16)
+    rq = np.empty(v_out.shape, np.int16)
+    _nohuge(vq, rq)
+    # Integer-valued intermediates (round first, exact int16 cast second), so
+    # fill + copyto(where=) match the old where-then-astype bits (np.where has
+    # no out=; copyto uses the same standard f64/f32 -> int16 cast).
+    np.multiply(pv, cfg.scale, out=pv)
+    np.round(pv, out=pv)
+    vq.fill(NODATA)
+    np.copyto(vq, pv, where=near_out, casting="unsafe")
+    np.divide(r_out, M_PER_KM, out=w)
+    np.maximum(w, SUPPORT_KM_FLOOR, out=w)
+    np.log2(w, out=w)
+    np.multiply(w, SUPPORT_LOG2_SCALE, out=w)
+    np.round(w, out=w)
+    np.clip(w, -SUPPORT_DN_MAX, SUPPORT_DN_MAX, out=w)
+    rq.fill(NODATA)
+    np.copyto(rq, w, where=near_out, casting="unsafe")
     return vq, rq
 
 
@@ -365,7 +442,7 @@ def _block_shared(cfg: _WorkerConfig, bx: int, by: int) -> tuple[np.ndarray, np.
     bsize = cfg.bsize
     i0, j0, i1, j1 = _block_bounds(bx, by, bsize, cfg.nx, cfg.ny)
     sl = (slice(i0, i1), slice(j0, j1))
-    return _quantize(cfg, cfg.val_full[sl], cfg.sup_full[sl] / M_PER_KM, cfg.near_full[sl])
+    return _quantize(cfg, cfg.val_full[sl], cfg.sup_full[sl], cfg.near_full[sl])
 
 
 def _process_block(
@@ -410,7 +487,7 @@ def _process_block(
     a0 = i0 - hi0
     b0 = j0 - hj0
     sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
-    return bx, by, _quantize(cfg, val[sl], sup[sl] / M_PER_KM, near[sl])
+    return bx, by, _quantize(cfg, val[sl], sup[sl], near[sl])
 
 
 def _block_neighbourhood_nonempty(
@@ -424,6 +501,185 @@ def _block_neighbourhood_nonempty(
     return any(starts[bid + 1] > starts[bid] for bid in _neighbour_block_ids(bx, by, nbx, nby))
 
 
+def _warp_dst_tile(
+    src_path: str,
+    i0: int,
+    j0: int,
+    band_h: int,
+    warp_tile: int,
+    dst_width: int,
+    dst_transform: Any,
+    dst_crs: str,
+) -> tuple[int, np.ndarray]:
+    """Nearest-neighbour warp of one coarse 2048px dst tile.
+
+    Pure per-pixel function of the dst grid with no state shared between
+    tiles, so the tile can be warped from any thread and the result is
+    identical to the serial loop. The source is opened per tile: GDAL
+    dataset handles are not thread-safe, and opening is cheap relative to
+    the warp (S3.3).
+
+    Returns:
+        Tuple of (tile column origin i0, warped int16 tile buffer).
+
+    """
+    band_w = min(warp_tile, dst_width - i0)
+    with rasterio.open(src_path) as src:
+        w = Window(i0, j0, band_w, band_h)
+        w_bounds = rasterio.windows.bounds(w, dst_transform)
+        local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
+        buf = np.zeros((band_h, band_w), dtype=np.int16)
+        _nohuge(buf)
+        reproject(
+            rasterio.band(src, 1),
+            buf,
+            src_transform=src.transform,
+            dst_transform=local_dst_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+            nodata=NODATA,
+        )
+    return i0, buf
+
+
+def _warp_dst_tile_arr(
+    src_arr: np.ndarray,
+    src_transform: Any,
+    src_crs: str,
+    i0: int,
+    j0: int,
+    band_h: int,
+    warp_tile: int,
+    dst_width: int,
+    dst_transform: Any,
+    dst_crs: str,
+    src_ds: Any | None = None,
+) -> tuple[int, np.ndarray]:
+    """Nearest-neighbour warp of one coarse 2048px dst tile.
+
+    Sourced from an in-RAM work-CRS int16 array (S3.4a turbo write). Same
+    per-tile math as _warp_dst_tile, but the source is the array itself
+    (reproject wraps it in an internal MemoryDataset) instead of the
+    work-CRS intermediate file. The array is read-only shared state;
+    reproject builds a fresh dataset handle per call, so tiles are
+    thread-safe.
+
+    Args:
+        src_arr: Work-CRS int16 array, shape (ny, nx), north-up raster order.
+        src_transform: Geotransform of the work-CRS raster.
+        src_crs: Work-CRS string.
+        i0: Left column of the coarse tile in the dst raster.
+        j0: Top row of the coarse tile in the dst raster.
+        band_h: Height of the current warp row band (<= warp_tile).
+        warp_tile: Width of the coarse tile.
+        dst_width: Full dst width.
+        dst_transform: Geotransform of the target raster.
+        dst_crs: Target CRS.
+        src_ds: Optional prewrapped MemoryDataset over src_arr (copy=False).
+            Uses reproject's MultiBand tuple form, which consumes the
+            dataset's GDAL handle directly; the ndarray form copies the
+            whole band into a fresh MEM dataset on every call (3 GB per
+            block at full-AU scale, issue #39 pass 3). Must stay alive for
+            the duration of the warp.
+
+    Returns:
+        (i0, buf) - buf shape (band_h, band_w).
+
+    """
+    band_w = min(warp_tile, dst_width - i0)
+    w = Window(i0, j0, band_w, band_h)
+    w_bounds = rasterio.windows.bounds(w, dst_transform)
+    local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
+    buf = np.zeros((band_h, band_w), dtype=np.int16)
+    _nohuge(buf)
+    src = src_arr if src_ds is None else (src_ds, 1, src_arr.dtype, src_arr.shape)
+    reproject(
+        src,
+        buf,
+        src_transform=src_transform,
+        dst_transform=local_dst_transform,
+        src_crs=src_crs,
+        dst_crs=dst_crs,
+        resampling=Resampling.nearest,
+        nodata=NODATA,
+    )
+    return i0, buf
+
+
+def _reproject_core(
+    make_warp: Callable[[int, int], Callable[[int], tuple[int, np.ndarray]]],
+    dst_path: str,
+    profile: dict[str, Any],
+    dst_crs: str,
+    dst_transform: Any,
+    dst_width: int,
+    dst_height: int,
+    tags: dict[str, str],
+    scales: tuple[float, ...] | None,
+    offsets: tuple[float, ...] | None,
+    n_threads: int = 1,
+) -> None:
+    """Warp one dst row band and flush it to the output GeoTIFF.
+
+    Shared core for the file-source (_reproject_band) and array-source
+    (_reproject_band_array) reprojections. make_warp(j0, band_h) returns
+    the warp function for one 2048px dst row band: fn(i0) -> (i0, buf).
+    Warp: the 2048px tiles of a row band are independent (pure per-pixel
+    function of the dst grid), so n_threads > 1 overlaps them in a pool.
+    Flush: TILE_PX blocks in serial raster-scan order, because the file
+    bytes depend on the tile write order (GDAL GTiff appends tiles in
+    write order).
+
+    Args:
+        make_warp: Builds the per-band warp function (source already bound).
+        dst_path: Destination GeoTIFF path.
+        profile: Base write profile (driver, compress, tiled, block size).
+        dst_crs: Target CRS string.
+        dst_transform: Geotransform of the target raster.
+        dst_width: Target raster width.
+        dst_height: Target raster height.
+        tags: Dataset tags to copy onto the output (work-file parity).
+        scales: Band scales to set, or None to leave unset.
+        offsets: Band offsets to set, or None to leave unset.
+        n_threads: Warp threads. 1 = fully serial (A8 path).
+
+    """
+    dst_profile = dict(
+        profile,
+        width=dst_width,
+        height=dst_height,
+        transform=dst_transform,
+        crs=dst_crs,
+    )
+    with rasterio.open(dst_path, "w", **dst_profile) as dst:
+        dst.update_tags(**tags)
+        if scales:
+            dst.scales = scales
+        if offsets:
+            dst.offsets = offsets
+        warp_tile = 2048
+        for j0 in range(0, dst_height, warp_tile):
+            band_h = min(warp_tile, dst_height - j0)
+            warp_i0 = make_warp(j0, band_h)
+            coarse: dict[int, np.ndarray] = {}
+            if n_threads > 1:
+                with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                    coarse.update(ex.map(warp_i0, range(0, dst_width, warp_tile)))
+            else:
+                for i0 in range(0, dst_width, warp_tile):
+                    _, buf = warp_i0(i0)
+                    coarse[i0] = buf
+            # Flush TILE_PX blocks in raster-scan order (serial: the file
+            # bytes depend on the tile write order).
+            for j in range(j0, j0 + band_h, TILE_PX):
+                w_h = min(TILE_PX, j0 + band_h - j)
+                for i in range(0, dst_width, TILE_PX):
+                    w_w = min(TILE_PX, dst_width - i)
+                    i0 = (i // warp_tile) * warp_tile
+                    sub = coarse[i0][j - j0 : j - j0 + w_h, i - i0 : i - i0 + w_w]
+                    dst.write(sub, 1, window=Window(i, j, w_w, w_h))
+
+
 def _reproject_band(
     src_path: str,
     dst_path: str,
@@ -432,6 +688,7 @@ def _reproject_band(
     dst_transform: Any,
     dst_width: int,
     dst_height: int,
+    n_threads: int = 1,
 ) -> None:
     """Nearest-neighbour reproject one band into a fresh output-CRS GeoTIFF.
 
@@ -442,50 +699,703 @@ def _reproject_band(
     calls -> ~15% faster) but flush TILE_PX blocks in raster-scan order,
     exactly as the 512px baseline does. The result is byte-identical to the
     baseline.
+
+    n_threads > 1 (S3.3) warps the 2048px tiles of each row band in a thread
+    pool: reproject releases the GIL (2.88x at 4 threads, design A.4) and the
+    tiles are independent, so the pool changes wall time only, never bytes.
+    The 512px flush loop stays serial, raster-scan: the file bytes depend on
+    the tile write order. n_threads == 1 keeps the exact serial code path (A8);
+    the outer src handle is still read by the main thread for profile, tags,
+    scales and offsets.
     """
     with rasterio.open(src_path) as src:
-        dst_profile = dict(
+
+        def make_warp(j0: int, band_h: int) -> Callable[[int], tuple[int, np.ndarray]]:
+            return partial(
+                _warp_dst_tile,
+                src_path,
+                j0=j0,
+                band_h=band_h,
+                warp_tile=2048,
+                dst_width=dst_width,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+            )
+
+        _reproject_core(
+            make_warp,
+            dst_path,
             profile,
-            width=dst_width,
-            height=dst_height,
-            transform=dst_transform,
-            crs=dst_crs,
+            dst_crs,
+            dst_transform,
+            dst_width,
+            dst_height,
+            tags=dict(src.tags()),
+            scales=tuple(src.scales) if getattr(src, "scales", None) else None,
+            offsets=tuple(src.offsets) if getattr(src, "offsets", None) else None,
+            n_threads=n_threads,
         )
-        with rasterio.open(dst_path, "w", **dst_profile) as dst:
-            dst.update_tags(**src.tags())
-            if hasattr(src, "scales") and src.scales:
-                dst.scales = src.scales
-            if hasattr(src, "offsets") and src.offsets:
-                dst.offsets = src.offsets
-            warp_tile = 2048
-            for j0 in range(0, dst_height, warp_tile):
-                band_h = min(warp_tile, dst_height - j0)
-                # Warp the coarse tiles across this row band.
-                coarse: dict[int, np.ndarray] = {}
-                for i0 in range(0, dst_width, warp_tile):
-                    band_w = min(warp_tile, dst_width - i0)
-                    w = Window(i0, j0, band_w, band_h)
-                    w_bounds = rasterio.windows.bounds(w, dst_transform)
-                    local_dst_transform = from_bounds(*w_bounds, band_w, band_h)
-                    buf = np.zeros((band_h, band_w), dtype=np.int16)
-                    reproject(
-                        rasterio.band(src, 1),
-                        buf,
-                        src_transform=src.transform,
-                        dst_transform=local_dst_transform,
-                        dst_crs=dst_crs,
-                        resampling=Resampling.nearest,
-                        nodata=NODATA,
-                    )
-                    coarse[i0] = buf
-                # Flush TILE_PX blocks in raster-scan order.
-                for j in range(j0, j0 + band_h, TILE_PX):
-                    w_h = min(TILE_PX, j0 + band_h - j)
-                    for i in range(0, dst_width, TILE_PX):
-                        w_w = min(TILE_PX, dst_width - i)
-                        i0 = (i // warp_tile) * warp_tile
-                        sub = coarse[i0][j - j0 : j - j0 + w_h, i - i0 : i - i0 + w_w]
-                        dst.write(sub, 1, window=Window(i, j, w_w, w_h))
+
+
+def _reproject_band_array(
+    src_arr: np.ndarray,
+    src_transform: Any,
+    src_crs: str,
+    dst_path: str,
+    profile: dict[str, Any],
+    dst_crs: str,
+    dst_transform: Any,
+    dst_width: int,
+    dst_height: int,
+    tags: dict[str, str],
+    scales: tuple[float, ...] | None = None,
+    offsets: tuple[float, ...] | None = None,
+    n_threads: int = 1,
+) -> None:
+    """Reproject an in-RAM work-CRS int16 array.
+
+    Target: a fresh output-CRS GeoTIFF (S3.4a turbo write, serial
+    strategy). Byte-identical to writing the same array to the work-CRS
+    intermediate file and running _reproject_band on it: same GDAL warp
+    kernel per tile, same serial raster-scan flush order, same
+    tags/scales/offsets.
+
+    Args:
+        src_arr: Work-CRS int16 array, shape (ny, nx), north-up raster order.
+        src_transform: Geotransform of the work-CRS raster.
+        src_crs: Work-CRS string.
+        dst_path: Destination GeoTIFF path.
+        profile: Base write profile (driver, compress, tiled, block size).
+        dst_crs: Target CRS string.
+        dst_transform: Geotransform of the target raster.
+        dst_width: Target raster width.
+        dst_height: Target raster height.
+        tags: Dataset tags for the output (work-file parity).
+        scales: Band scales to set, or None.
+        offsets: Band offsets to set, or None.
+        n_threads: Warp threads. 1 = fully serial (A8 path).
+
+    """
+
+    def make_warp(j0: int, band_h: int) -> Callable[[int], tuple[int, np.ndarray]]:
+        return partial(
+            _warp_dst_tile_arr,
+            src_arr,
+            src_transform,
+            src_crs,
+            j0=j0,
+            band_h=band_h,
+            warp_tile=2048,
+            dst_width=dst_width,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+        )
+
+    _reproject_core(
+        make_warp,
+        dst_path,
+        profile,
+        dst_crs,
+        dst_transform,
+        dst_width,
+        dst_height,
+        tags=tags,
+        scales=scales,
+        offsets=offsets,
+        n_threads=n_threads,
+    )
+
+
+# TIFF base type -> bytes per element (Y-1). The parser and the head-
+# overlap guard share it so a type can never be sized in one place and
+# mis-sized in the other. 16/17/18 = the BigTIFF 64-bit types (LONG8,
+# SLONG8, IFD8).
+_TIFF_TYPE_SIZES = {
+    1: 1,
+    2: 1,
+    3: 2,
+    4: 4,
+    5: 8,
+    6: 8,
+    7: 8,
+    8: 1,
+    9: 2,
+    10: 4,
+    11: 4,
+    12: 8,
+    16: 8,
+    17: 8,
+    18: 8,
+}
+
+
+def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
+    """Parse the first IFD of a single-band classic or BigTIFF tiled raster.
+
+    Args:
+        data: Full file bytes.
+
+    Returns:
+        Dict: e (struct endian), big (bool), off_fmt (offset width name),
+        tags {tag: (typ, count, value-or-inline offset)}, t324/t325
+        (tag 324/325 entries), n_tiles, first (offset of the first stored
+        tile), sz324/sz325 (per-tag slot bytes: classic 4/4, BigTIFF
+        324=8 (LONG8) / 325=4 (LONG)) and the matching fmt324/fmt325
+        struct formats.
+
+    Raises:
+        ValueError: On unknown endian/magic, missing 324/325, an unknown
+            TIFF type, a non-LONG/LONG8 tile array type, inline tile
+            arrays, or a count mismatch.
+
+    """
+    if data[:2] == b"II":
+        e = "<"
+    elif data[:2] == b"MM":
+        e = ">"
+    else:
+        msg = f"not a little/big-endian TIFF: {data[:2]!r}"
+        raise ValueError(msg)
+    magic = struct.unpack_from(e + "H", data, 2)[0]
+    big = magic == 43
+    if not big and magic != 42:
+        msg = f"unexpected TIFF magic {magic}"
+        raise ValueError(msg)
+    if not big:
+        ifd = struct.unpack_from(e + "I", data, 4)[0]
+        cnt = struct.unpack_from(e + "H", data, ifd)[0]
+        # 12-byte entries: tag(2) type(2) count(4) value-or-offset(4).
+        ent_size, count_fmt, off_fmt, entry_off, val_at, inline = 12, "I", "I", 2, 8, 4
+    else:
+        # 16-byte BigTIFF header: first-IFD offset (8) at bytes 8-15; the
+        # IFD count is followed by 6 pad bytes; 20-byte entries: tag(2)
+        # type(2) count(8) value-or-offset(8, inline capacity 12).
+        ifd = struct.unpack_from(e + "Q", data, 8)[0]
+        cnt = struct.unpack_from(e + "H", data, ifd)[0]
+        ent_size, count_fmt, off_fmt, entry_off, val_at, inline = 20, "Q", "Q", 8, 12, 12
+    per_typ = _TIFF_TYPE_SIZES
+    tags: dict[int, tuple[int, int, int]] = {}
+    for i in range(cnt):
+        off = ifd + entry_off + i * ent_size
+        tag, typ = struct.unpack_from(e + "HH", data, off)
+        count = struct.unpack_from(e + count_fmt, data, off + 4)[0]
+        sz = per_typ.get(typ)
+        if sz is None:
+            msg = f"unsupported TIFF type {typ} for tag {tag}"
+            raise ValueError(msg)
+        total = sz * count
+        if total <= inline:
+            tags[tag] = (typ, count, off + val_at)
+        else:
+            voff = struct.unpack_from(e + off_fmt, data, off + val_at)[0]
+            tags[tag] = (typ, count, voff)
+    if 324 not in tags or 325 not in tags:
+        msg = "missing TileOffsets/TileByteCounts"
+        raise ValueError(msg)
+    t324, t325 = tags[324], tags[325]
+    if t324[1] != t325[1]:
+        msg = "TileOffsets/TileByteCounts count mismatch"
+        raise ValueError(msg)
+    if t324[0] not in (4, 16) or t325[0] not in (4, 16):
+        msg = f"unexpected tile array types (324: {t324[0]}, 325: {t325[0]})"
+        raise ValueError(msg)
+    n_tiles = t324[1]
+    # Slot width is per tag (Y-1): BigTIFF stores 324 as LONG8 (8-byte
+    # slots) but 325 as LONG (4-byte slots); classic stores both as LONG.
+    sz324, sz325 = per_typ[t324[0]], per_typ[t325[0]]
+    fmt324 = e + ("Q" if sz324 == 8 else "I")
+    fmt325 = e + ("Q" if sz325 == 8 else "I")
+    if t324[2] + sz324 * n_tiles > len(data) or t325[2] + sz325 * n_tiles > len(data):
+        msg = "tile value arrays stored inline or beyond EOF"
+        raise ValueError(msg)
+    first = struct.unpack_from(fmt324, data, t324[2])[0]
+    return {
+        "e": e,
+        "big": big,
+        "off_fmt": off_fmt,
+        "inline": inline,
+        "tags": tags,
+        "t324": t324,
+        "t325": t325,
+        "n_tiles": n_tiles,
+        "first": first,
+        "sz324": sz324,
+        "sz325": sz325,
+        "fmt324": fmt324,
+        "fmt325": fmt325,
+    }
+
+
+def _turbo_write_parallel(
+    arr: np.ndarray,
+    src_transform: Any,
+    src_crs: str,
+    dst_path: str,
+    profile: dict[str, Any],
+    dst_crs: str,
+    dst_transform: Any,
+    dst_width: int,
+    dst_height: int,
+    tags: dict[str, str],
+    scales: tuple[float, ...],
+    offsets: tuple[float, ...] | None,
+    n_threads: int,
+) -> bool:
+    """Assemble the output-CRS GeoTIFF from an in-RAM array.
+
+    Parallel ZSTD strategy (S3.4a, S3.6.3). Only called when the A.7 oracle
+    passed (i.e. zstdmt.compress_tiles reproduces the stock codec bytes
+    exactly).
+
+    1. Warp the full output raster from the work-CRS array (2048px tiles
+       in a thread pool - same kernel as the serial path).
+    2. Compress every 512^2 tile in parallel (predictor 2 + zstdmt).
+    3. Write a zero-filled reference raster with the identical profile;
+       GDAL serialises the exact head (IFD + external tag arrays).
+    4. Assemble: reference head with the TileOffsets/TileByteCounts arrays
+       patched to the real frames, then the frames appended in raster-scan
+       order.
+
+    Returns:
+        True if the file was written, False if the caller must fall back
+        to the serial array reproject (layout guard: value arrays not all
+        before the first tile, tile count mismatch, or classic head with a
+        >= 4 GiB assembled file).
+
+    """
+    warp_tile = 2048
+    tiles: list[bytes] = []
+    band_tiles: list[np.ndarray] = []
+    coarse: dict[int, np.ndarray] = {}
+    for j0 in range(0, dst_height, warp_tile):
+        band_h = min(warp_tile, dst_height - j0)
+        warp_i0 = partial(
+            _warp_dst_tile_arr,
+            arr,
+            src_transform,
+            src_crs,
+            j0=j0,
+            band_h=band_h,
+            warp_tile=warp_tile,
+            dst_width=dst_width,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+        )
+        coarse = {}
+        if n_threads > 1:
+            with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                coarse.update(ex.map(warp_i0, range(0, dst_width, warp_tile)))
+        else:
+            for i0 in range(0, dst_width, warp_tile):
+                _, buf = warp_i0(i0)
+                coarse[i0] = buf
+        band_tiles = []
+        for j in range(j0, j0 + band_h, TILE_PX):
+            h = min(TILE_PX, j0 + band_h - j)
+            for i in range(0, dst_width, TILE_PX):
+                w = min(TILE_PX, dst_width - i)
+                i0 = (i // warp_tile) * warp_tile
+                band_tiles.append(coarse[i0][j - j0 : j - j0 + h, i - i0 : i - i0 + w])
+        # Predictor 2 must be applied before compression: the stock codec
+        # (and the oracle) compress the predicted bytes, not the raw tiles.
+        band_tiles = [zstdmt.predictor2(t) for t in band_tiles]
+        tiles.extend(zstdmt.compress_tiles(band_tiles, n_threads=n_threads))
+    del coarse, band_tiles
+
+    ref_path = Path(dst_path + ".refhead.tif")
+    try:
+        zero = np.zeros((dst_height, dst_width), dtype=np.int16)
+        with rasterio.open(
+            ref_path,
+            "w",
+            **dict(
+                profile,
+                width=dst_width,
+                height=dst_height,
+                transform=dst_transform,
+                crs=dst_crs,
+            ),
+        ) as dst:
+            dst.update_tags(**tags)
+            if scales:
+                dst.scales = scales
+            if offsets:
+                dst.offsets = offsets
+            dst.write(zero, 1)
+        data = ref_path.read_bytes()
+    finally:
+        ref_path.unlink(missing_ok=True)
+
+    try:
+        info = _tif_parse_ifd(data)
+    except ValueError as e:
+        print(f"[warn] turbo zstd head parse: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+    t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
+    if n_tiles != len(tiles):
+        print(f"[warn] turbo zstd head: tile count {n_tiles} != {len(tiles)}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+    # All external value arrays must end before the first stored tile, so
+    # the head cut keeps every array and drops every reference tile.
+    head_end = info["first"]
+    for typ, count, voff in info["tags"].values():
+        total = _TIFF_TYPE_SIZES[typ] * count
+        if total > info["inline"] and voff + total > info["first"]:
+            print("[warn] turbo zstd head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
+            return False
+    if not info["big"] and head_end + sum(len(t) for t in tiles) > _TIFF_CLASSIC_MAX_BYTES:
+        print("[warn] turbo zstd head: assembled file beyond classic 4 GiB; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+
+    head = bytearray(data[:head_end])
+    # Patch stride is per tag (Y-1): BigTIFF 324 slots are 8 bytes, 325
+    # slots 4; patching both at one width corrupts the 325 array region.
+    sz324, sz325 = info["sz324"], info["sz325"]
+    fmt324, fmt325 = info["fmt324"], info["fmt325"]
+    pos = 0
+    for i, t in enumerate(tiles):
+        struct.pack_into(fmt324, head, t324[2] + i * sz324, head_end + pos)
+        struct.pack_into(fmt325, head, t325[2] + i * sz325, len(t))
+        pos += len(t)
+    with Path(dst_path).open("wb") as f:
+        f.write(bytes(head))
+        f.writelines(tiles)
+    return True
+
+
+def _stock_band_frames(
+    buf: np.ndarray,
+    i0: int,
+    j0: int,
+    bw: int,
+    bh: int,
+    dst_transform: Any,
+    out_crs: str,
+    profile: dict[str, Any],
+    scratch: Path,
+) -> list[bytes]:
+    """Compress one warp band's 512^2 tiles with the stock GTiff zstd codec.
+
+    A per-band scratch dataset carries the identical codec profile (zstd,
+    tiled, predictor 2, same tile windows, same nodata), so libtiff's
+    streaming Ctx compresses each tile exactly as the serial full-raster
+    write would: the frames are byte-equal to the serial path by
+    construction, on any GDAL/libtiff stack (issue #39). GDAL writes tiles
+    in the order requested, so the frames come back in raster-scan order.
+
+    Args:
+        buf: Warped band, shape (bh, bw), int16.
+        i0: Band origin column in the dst raster (the transform keeps the
+            scratch a valid GeoTIFF; frames are codec-only).
+        j0: Band origin row in the dst raster.
+        bw: Band size (px, columns).
+        bh: Band size (px, rows).
+        dst_transform: Geotransform of the full dst raster.
+        out_crs: CRS string for the scratch.
+        profile: The final raster's profile (width/height/transform/crs are
+            overridden to the band's).
+        scratch: Scratch path (reused per thread across bands).
+
+    Returns:
+        One zstd frame per tile, raster-scan order.
+
+    """
+    t = dst_transform * Affine(1, 0, i0, 0, 1, -j0)
+    prof = dict(profile, width=bw, height=bh, transform=t, crs=out_crs)
+    with rasterio.open(scratch, "w", **prof) as dst:
+        for j in range(0, bh, TILE_PX):
+            h = min(TILE_PX, bh - j)
+            for i in range(0, bw, TILE_PX):
+                w = min(TILE_PX, bw - i)
+                dst.write(buf[j : j + h, i : i + w], 1, window=Window(i, j, w, h))
+    data = scratch.read_bytes()
+    info = _tif_parse_ifd(data)
+    n = info["n_tiles"]
+    offs = [struct.unpack_from(info["fmt324"], data, info["t324"][2] + k * info["sz324"])[0] for k in range(n)]
+    szs = [struct.unpack_from(info["fmt325"], data, info["t325"][2] + k * info["sz325"])[0] for k in range(n)]
+    return [data[o : o + s] for o, s in zip(offs, szs, strict=True)]
+
+
+def _turbo_write_stock_parallel(
+    arr: np.ndarray,
+    src_transform: Any,
+    src_crs: str,
+    dst_path: str,
+    profile: dict[str, Any],
+    dst_crs: str,
+    dst_transform: Any,
+    dst_width: int,
+    dst_height: int,
+    tags: dict[str, str],
+    scales: tuple[float, ...],
+    offsets: tuple[float, ...] | None,
+    n_threads: int,
+    scratch_dir: str,
+) -> bool:
+    """Assemble the output-CRS GeoTIFF with parallel stock-codec compression.
+
+    Fallback for stacks where the CPL zstd pfn drifts from libtiff's
+    streaming codec (the A.7 oracle mismatches - e.g. the bundled GDAL
+    3.12.4 / libtiff 6.2 stack, whose pfn emits a different frame header:
+    single-segment flag + 8-byte FCS + a different windowLog, and which
+    ignores every zstd option). Strategy (S3.4a, issue #39):
+
+    1. Warp 2048^2 blocks in a thread pool (same kernel and windows as the
+       serial path).
+    2. Each block's 512^2 tiles are compressed with the stock codec via a
+       per-thread scratch raster with the identical profile - frames are
+       byte-equal to the serial flush by construction.
+    3. The head comes from a zero-filled reference raster with the identical
+       profile + tags + scales (layout matches by construction); the
+       TileOffsets/TileByteCounts arrays are patched and the frames
+       appended in raster-scan order.
+
+    Returns:
+        True if the file was written, False if the caller must fall back to
+        the serial array reproject (layout guards).
+
+    """
+    warp_tile = 2048
+    # 1. Reference raster: stock GDAL head + exact tag layout. The head
+    # (IFD + tag arrays) is sized from the raster dimensions at creation,
+    # so ONE 512^2 tile write yields the byte-identical head a full-band
+    # zero write would (verified: BigTIFF IFD is complete on close, tag
+    # layout and first-tile offset match a full NODATA write). The full
+    # zero write touched a dst_height*dst_width int16 array (~3 GB at
+    # full-AU) plus the whole file; under memory pressure that was the
+    # write phase's dominant cost (issue #39 pass 3).
+    ref_path = Path(str(dst_path) + ".refhead.tif")
+    try:
+        th = min(TILE_PX, dst_height)
+        tw = min(TILE_PX, dst_width)
+        zero = np.zeros((th, tw), dtype=np.int16)
+        with rasterio.open(
+            ref_path,
+            "w",
+            **dict(
+                profile,
+                width=dst_width,
+                height=dst_height,
+                transform=dst_transform,
+                crs=dst_crs,
+            ),
+        ) as dst:
+            dst.update_tags(**tags)
+            if scales:
+                dst.scales = scales
+            if offsets:
+                dst.offsets = offsets
+            dst.write(zero, 1, window=Window(0, 0, tw, th))
+        data = ref_path.read_bytes()
+    finally:
+        ref_path.unlink(missing_ok=True)
+        del zero
+    try:
+        info = _tif_parse_ifd(data)
+    except ValueError as e:
+        print(f"[warn] turbo stock head parse: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+    t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
+    head_end = info["first"]
+    for typ, count, voff in info["tags"].values():
+        total = _TIFF_TYPE_SIZES[typ] * count
+        if total > info["inline"] and voff + total > info["first"]:
+            print("[warn] turbo stock head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
+            return False
+    # Compressed frames are never longer than the raw band, so raw size is
+    # a sound classic-4GiB upper bound.
+    if not info["big"] and head_end + arr.nbytes > _TIFF_CLASSIC_MAX_BYTES:
+        print("[warn] turbo stock head: assembled file may exceed classic 4 GiB; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+
+    # 2. Warp blocks in parallel; each block compresses through its thread's
+    #    scratch raster. band_jobs is block raster-scan (j0 outer, i0 inner):
+    #    flat index br*n_bcols + bc.
+    n_brows = -(-dst_height // warp_tile)
+    n_bcols = -(-dst_width // warp_tile)
+    band_jobs = [(bc * warp_tile, br * warp_tile) for br in range(n_brows) for bc in range(n_bcols)]
+    scratch_local = threading.local()
+    # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
+    # pass 3): reproject's ndarray source form copies the whole band into
+    # a fresh MEM dataset per warp call (3 GB per 2048^2 block at full-AU
+    # scale; 8 such copies in flight OOM-killed the run). The tuple form
+    # reads the shared handle; val_dn/sup_dn are not mutated during the
+    # warp, so concurrent read-only access is safe.
+    src_ds = MemoryDataset(arr, transform=src_transform, crs=src_crs, copy=False)
+    prog = [0, 0.0, 0.0, 0]  # done, warp_s, frames_s, t0 (issue #39 pass 3 progress)
+    prog[3] = time.monotonic()
+    prog_lock = threading.Lock()
+
+    def _block(i0: int, j0: int) -> list[bytes]:
+        bw = min(warp_tile, dst_width - i0)
+        bh = min(warp_tile, dst_height - j0)
+        scratch: Path | None = getattr(scratch_local, "path", None)
+        if scratch is None:
+            # Full TID (no mask): two live threads can collide on the low
+            # 16 bits of the kernel TID (observed on hydrogen, 2026-10-07);
+            # a shared path made one thread truncate the other's scratch
+            # mid-write (issue #39, pass 3).
+            scratch = Path(scratch_dir) / f"_stock_scratch_{threading.get_ident()}.tif"
+            scratch_local.path = scratch
+        tw0 = time.monotonic()
+        _, buf = _warp_dst_tile_arr(
+            arr, src_transform, src_crs, i0, j0, bh, warp_tile, dst_width, dst_transform, dst_crs, src_ds=src_ds
+        )
+        tw1 = time.monotonic()
+        frames = _stock_band_frames(buf, i0, j0, bw, bh, dst_transform, dst_crs, profile, scratch)
+        tf1 = time.monotonic()
+        with prog_lock:
+            prog[0] += 1
+            prog[1] += tw1 - tw0
+            prog[2] += tf1 - tw1
+            if prog[0] % 20 == 0 and _prof.enabled():
+                print(  # ruff: ignore[print]
+                    f"[reproj-prog] blocks={prog[0]}/{len(band_jobs)} "
+                    f"warp={prog[1]:.1f}s frames={prog[2]:.1f}s "
+                    f"elapsed={time.monotonic() - prog[3]:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return frames
+
+    if n_threads > 1:
+        with ThreadPoolExecutor(max_workers=n_threads) as ex:
+            block_frames = list(ex.map(lambda jb: _block(*jb), band_jobs))
+    else:
+        block_frames = list(starmap(_block, band_jobs))
+
+    # Reassemble into global 512 raster-scan (the serial/CPL order). A block's
+    # frames are block-local raster-scan, so block-major concatenation would
+    # interleave tile rows wrongly; expand each block row/col into its 512
+    # tile rows/cols and index frames by (trow_local * tcols + tcol_local).
+    bh_by_br = [min(warp_tile, dst_height - br * warp_tile) for br in range(n_brows)]
+    bw_by_bc = [min(warp_tile, dst_width - bc * warp_tile) for bc in range(n_bcols)]
+    trows_by_br = [-(-bh // TILE_PX) for bh in bh_by_br]
+    tcols_by_bc = [-(-bw // TILE_PX) for bw in bw_by_bc]
+    row_map = [(br, tl) for br in range(n_brows) for tl in range(trows_by_br[br])]
+    col_map = [(bc, cl) for bc in range(n_bcols) for cl in range(tcols_by_bc[bc])]
+    tiles: list[bytes] = []
+    for br, tl in row_map:
+        for bc, cl in col_map:
+            tiles.append(block_frames[br * n_bcols + bc][tl * tcols_by_bc[bc] + cl])
+    if len(tiles) != n_tiles:
+        print(f"[warn] turbo stock: tile count {len(tiles)} != {n_tiles}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        return False
+
+    # 3. Patch the head and assemble: head + frames in raster-scan order.
+    head = bytearray(data[:head_end])
+    sz324, sz325 = info["sz324"], info["sz325"]
+    fmt324, fmt325 = info["fmt324"], info["fmt325"]
+    pos = 0
+    for i, t in enumerate(tiles):
+        struct.pack_into(fmt324, head, t324[2] + i * sz324, head_end + pos)
+        struct.pack_into(fmt325, head, t325[2] + i * sz325, len(t))
+        pos += len(t)
+    with Path(dst_path).open("wb") as f:
+        f.write(bytes(head))
+        f.writelines(tiles)
+    return True
+
+
+def _read_csv_chunk(
+    task: tuple[str, int, int, bool, list[str], list[str]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Parse one CSV row chunk in a worker process (S3.5).
+
+    The parent split the file into complete records at newline offsets and
+    this worker seeks its byte range. The wanted columns parse with explicit
+    float64 dtypes and the per-chunk dtype equality is asserted (review F3):
+    a single whole-file parse infers per column, and per-chunk inference can
+    disagree on edge rows (int64 vs float64, divergent doubles for
+    |x| >= 2**53).
+
+    Args:
+        task: Tuple of (path, byte_start, byte_end, has_header, wanted, all_names).
+
+    Returns:
+        Tuple of (value, lon, lat) float64 arrays in original row order.
+
+    Raises:
+        RuntimeError: If a wanted column does not parse as float64 (schema pin).
+
+    """
+    path, start, end, has_header, wanted, all_names = task
+    with Path(path).open("rb") as f:
+        f.seek(start)
+        raw = f.read(end - start)
+    dtype = dict.fromkeys(wanted, np.float64)
+    if has_header:
+        df = pd.read_csv(io.BytesIO(raw), usecols=wanted, dtype=dtype)
+    else:
+        df = pd.read_csv(io.BytesIO(raw), header=None, names=all_names, usecols=wanted, dtype=dtype)
+    for c in wanted:
+        if df[c].dtype != np.dtype(np.float64):
+            msg = f"ingest chunk dtype mismatch for column {c!r}: {df[c].dtype}"
+            raise RuntimeError(msg)
+    out = df[wanted].to_numpy(dtype=np.float64)
+    return out[:, 0], out[:, 1], out[:, 2]
+
+
+def _csv_chunk_tasks(
+    path: str,
+    wanted: list[str],
+    n_threads: int,
+) -> tuple[list[tuple[str, int, int, bool, list[str], list[str]]], int] | None:
+    """Plan the parallel CSV read (S3.5): split the file into row chunks.
+
+    Reads the file once and finds record boundaries at newline offsets. The
+    split is used only when every chunk is a set of complete CSV records:
+    an even quote parity per chunk (a boundary inside a quoted field leaves
+    an unbalanced quote) and a single-line header. Any doubt returns None
+    and the caller keeps the single serial parse, so the parallel path can
+    never change values, only wall time.
+
+    Returns:
+        Tuple of (chunk tasks, expected data rows) or None for the serial
+        parse. Each task is (path, byte_start, byte_end, has_header,
+        wanted, all_names); byte ranges are half-open and include the row
+        terminator.
+
+    """
+    try:
+        data = Path(path).read_bytes()
+        if not data:
+            return None
+        nl = np.flatnonzero(np.frombuffer(data, dtype=np.uint8) == 10)
+        n_nl = int(nl.size)
+        # One physical line per row, the header is the first line; a file
+        # without a final newline has one extra unterminated row.
+        data_rows = n_nl - 1 if data[-1] == 10 else n_nl
+        if n_nl == 0 or data_rows < 2 * _INGEST_MIN_CHUNK_ROWS:
+            return None
+        # n_threads >= 2 and the data_rows guard above make this >= 2.
+        n_chunks = min(n_threads, data_rows // _INGEST_MIN_CHUNK_ROWS)
+
+        # Header via pandas so the names match exactly what a serial parse
+        # would see (BOM, quoting, coercion included).
+        hdr = pd.read_csv(path, nrows=0)
+        all_names = [str(c) for c in hdr.columns]
+        if data[: int(nl[0])].count(b'"') % 2 != 0 or any(all_names.count(w) != 1 for w in wanted):
+            return None  # embedded-newline header, or missing/duplicated column
+
+        tasks: list[tuple[str, int, int, bool, list[str], list[str]]] = []
+        lo = np.linspace(0, data_rows, n_chunks + 1).astype(np.int64)
+        for k in range(n_chunks):
+            r0, r1 = int(lo[k]), int(lo[k + 1])
+            # Data row r (0-based) is physical line r + 1: the bytes after
+            # newline nl[r], up to and including newline nl[r + 1].
+            start = 0 if r0 == 0 else int(nl[r0]) + 1
+            end = len(data) if r1 >= n_nl else int(nl[r1]) + 1
+            if data[start:end].count(b'"') % 2 != 0:
+                return None  # chunk boundary splits a quoted field
+            tasks.append((path, start, end, r0 == 0, list(wanted), list(all_names)))
+    except (OSError, ValueError, IndexError):
+        # Planning is best effort: any surprise (odd encoding, ragged
+        # header, ...) falls back to the serial parse, which has the
+        # historical behaviour.
+        return None
+    else:
+        return tasks, data_rows
 
 
 class Pipeline:
@@ -514,6 +1424,10 @@ class Pipeline:
         work_crs: int = WORK_CRS,
         out_crs: int = OUT_CRS,
         skip_calibration: bool = False,
+        n_threads: int = 1,
+        turbo: bool = False,
+        turbo_cap_gb: float | None = None,
+        turbo_strict: bool = False,
     ) -> None:
         """Initialise the interpolation pipeline.
 
@@ -521,6 +1435,8 @@ class Pipeline:
             ValueError: If scale * PERCENTILE_MAX exceeds int16 max.
             ValueError: If percentile_step is outside (0, PERCENTILE_MAX].
             ValueError: If saturation is not > 0.
+            ValueError: If n_threads is not >= 1.
+            ValueError: If turbo_cap_gb is not > 0.
 
         """
         self.input_path = input_path
@@ -549,6 +1465,20 @@ class Pipeline:
         self.work_crs = work_crs
         self.out_crs = out_crs
         self.skip_calibration = skip_calibration
+        if n_threads < 1:
+            msg = f"n_threads must be >= 1: {n_threads}"
+            raise ValueError(msg)
+        self.n_threads = n_threads
+        if turbo_cap_gb is not None and turbo_cap_gb <= 0:
+            msg = f"turbo_cap_gb must be > 0: {turbo_cap_gb}"
+            raise ValueError(msg)
+        self.turbo = turbo
+        self.turbo_cap_gb = turbo_cap_gb
+        self.turbo_strict = turbo_strict
+        # Set by _turbo_precheck() (run(), after grid()).
+        self._turbo_plan: turbop.TurboPlan | None = None
+        self._turbo_decision: turbop.PrecheckDecision | None = None
+        self._turbo_budget_bytes: float | None = None
 
         if self.scale * PERCENTILE_MAX > INT16_MAX:
             msg = (
@@ -593,24 +1523,34 @@ class Pipeline:
     def ingest(self) -> None:
         """Read input, filter, project to working CRS.
 
+        CSV input with n_threads > 1 and enough rows is split into complete
+        row records and parsed in a process pool (S3.5): read_csv holds the
+        GIL, so threads cannot overlap the parse. Every chunk parses the
+        wanted columns with explicit float64 dtypes, asserts per-chunk dtype
+        equality, and the chunks are concatenated in original row order. Any
+        split uncertainty (small file, blank lines, quoted newlines, header
+        quirks) falls back to the single serial parse, so n_threads == 1
+        (the default) is byte-identical to before (A8).
+
         Raises:
             ValueError: If no valid points remain after filtering.
             ImportError: If pyarrow is missing for Parquet input.
 
         """
+        wanted = [self.value_col, self.lng_col, self.lat_col]
         if self.input_path.endswith((".parquet", ".pq")):
             try:
                 import pyarrow as pa  # ruff: ignore[unused-import]
             except ImportError:
                 msg = "pyarrow is required for Parquet files. Install with: pip install ppgrid[parquet]"
                 raise ImportError(msg) from None
-            df = pd.read_parquet(self.input_path, columns=[self.value_col, self.lng_col, self.lat_col])
+            df = pd.read_parquet(self.input_path, columns=wanted)
+            v = df[self.value_col].to_numpy(dtype=np.float64)
+            lon = df[self.lng_col].to_numpy(dtype=np.float64)
+            lat = df[self.lat_col].to_numpy(dtype=np.float64)
         else:
-            df = pd.read_csv(self.input_path, usecols=[self.value_col, self.lng_col, self.lat_col])
-
-        v = df[self.value_col].to_numpy(dtype=np.float64)
-        lon = df[self.lng_col].to_numpy(dtype=np.float64)
-        lat = df[self.lat_col].to_numpy(dtype=np.float64)
+            with _prof.phase("ingest.csv"):
+                v, lon, lat = self._read_points(wanted)
 
         good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
         v, lon, lat = v[good], lon[good], lat[good]
@@ -620,11 +1560,47 @@ class Pipeline:
             msg = "No valid points found in input. Check columns and data."
             raise ValueError(msg)
 
-        tr = Transformer.from_crs(self.src_crs, self.work_crs, always_xy=True)
-        x, y = tr.transform(lon, lat)
-        self.x = np.asarray(x)
-        self.y = np.asarray(y)
-        self.v = v
+        with _prof.phase("ingest.proj"):
+            tr = Transformer.from_crs(self.src_crs, self.work_crs, always_xy=True)
+            x, y = tr.transform(lon, lat)
+            self.x = np.asarray(x)
+            self.y = np.asarray(y)
+            self.v = v
+
+    def _read_points(self, wanted: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read (value, lon, lat) float64 arrays from the CSV input.
+
+        Single serial parse by default. With n_threads > 1 and a file large
+        enough, a process pool parses row chunks in original order (see
+        ingest). A row-count mismatch after the parallel read (e.g. blank
+        lines, which pandas skips but the newline scan counts) re-runs the
+        serial parse.
+
+        Returns:
+            Tuple of (value, lon, lat) float64 arrays in original row order.
+
+        """
+
+        def serial() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            df = pd.read_csv(self.input_path, usecols=wanted)
+            return (
+                df[self.value_col].to_numpy(dtype=np.float64),
+                df[self.lng_col].to_numpy(dtype=np.float64),
+                df[self.lat_col].to_numpy(dtype=np.float64),
+            )
+
+        tasks = _csv_chunk_tasks(self.input_path, wanted, self.n_threads) if self.n_threads > 1 else None
+        if tasks is None:
+            return serial()
+        task_list, expected = tasks
+        with ProcessPoolExecutor(max_workers=len(task_list)) as ex:
+            chunks = list(ex.map(_read_csv_chunk, task_list))
+        v = np.concatenate([c[0] for c in chunks])
+        lon = np.concatenate([c[1] for c in chunks])
+        lat = np.concatenate([c[2] for c in chunks])
+        if v.size != expected:
+            return serial()
+        return v, lon, lat
 
     def calibrate(self) -> None:
         """Load or run calibration. Sets transform, percentile, cap.
@@ -845,10 +1821,14 @@ class Pipeline:
 
         """
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
-        self.ingest()
-        self.calibrate()
+        with _prof.phase("ingest"):
+            self.ingest()
+        with _prof.phase("calibrate"):
+            self.calibrate()
         try:
-            self.grid()
+            with _prof.phase("grid"):
+                self.grid()
+            self._turbo_precheck()
             return self._write_rasters()
         finally:
             # Temp cleanup on every path: grid failure, mid-run worker error,
@@ -860,6 +1840,142 @@ class Pipeline:
         """Remove every run temp file in out_dir (idempotent, best effort)."""
         for fname in _RUN_TEMP_FILES:
             (Path(self.out_dir) / fname).unlink(missing_ok=True)
+
+    def _resolve_turbo_cap(self) -> tuple[float, str]:
+        """Resolve the turbo RAM cap with the cgroup-aware preset clamp (M-2).
+
+        Passes both physical RAM and the cgroup ceiling so a --turbo /
+        --max-ram preset at/above the process-visible memory clamps to
+        available - 8 GB instead of planning against RAM the process
+        cannot see (a capped slice OOMs at its own limit).
+
+        PPGRID_CAP_GB (debug/test only, not a CLI flag): forces the cap,
+        skipping detection and the clamp. Used to exercise a regime on a
+        capped slice without matching the slice to the box.
+
+        """
+        override = os.environ.get("PPGRID_CAP_GB")
+        if override is not None:
+            return max(float(override), turbop.CAP_FLOOR_GB), f"PPGRID_CAP_GB override {override:g} GB"
+        return turbop.resolve_cap(
+            self.turbo_cap_gb,
+            physical_gb=turbop._read_physical_gb(),  # ruff: ignore[private-member-access]
+            cgroup_gb=turbop._read_cgroup_max_gb(),  # ruff: ignore[private-member-access]
+        )
+
+    def _per_box_peak_bytes(self) -> int | None:
+        """Worst-case per-box fallback peak, or None pre-grid (M-3).
+
+        The per-box block loop runs up to `workers` boxes in flight, each
+        holding a snapped (bsize + 2*halo) grid; on the turbo write the
+        4 B/cell DN field is also alive when the output is reprojected.
+        Used to announce a per-box OOM risk instead of promising exit-0
+        correct output into an OOM.
+
+        """
+        if not all(hasattr(self, attr) for attr in ("bsize", "halo", "step", "nx", "ny", "tasks", "n")):
+            return None
+        worst_dim = -(-(self.bsize + 2 * self.halo) // self.step) * self.step
+        extra = self.n * 32  # x/y/tv/v float64 points arrays, alive all run
+        if self.out_crs != self.work_crs:
+            extra += self.nx * self.ny * 4  # in-RAM DN field (turbo write)
+        return turbop.per_box_peak_bytes(
+            worst_dim * worst_dim,
+            in_flight=min(self.workers, len(self.tasks)),
+            extra_bytes=extra,
+        )
+
+    def _turbo_precheck(self) -> None:
+        """Size the turbo plan against the RAM budget before heavy allocation (3.5).
+
+        Runs after grid() (which knows n, cells, levels) and before
+        _prepare_shared's first big allocation. Prints the budget value
+        actually used. Shared infeasible: strict -> stderr error + exit 3;
+        non-strict -> [warn] + continue on the per-box path (exit 0, correct
+        output, turbo warp/write still apply). When the per-box est peak
+        itself exceeds the budget the warning is explicit: best-effort,
+        OOM risk, output may be partial (M-3).
+
+        Raises:
+            SystemExit: code 3 when --turbo-strict and the shared path does
+                not fit under the budget.
+
+        """
+        if not self.turbo:
+            self._turbo_plan = None
+            self._turbo_decision = None
+            self._turbo_budget_bytes = None
+            return
+        n_cells = self.nx_padded * self.ny_padded
+        radius = round(self.cap_km_val * M_PER_KM / self.res)
+        cap_gb, cap_source = self._resolve_turbo_cap()
+        plan = turbop.plan(cap_gb, n_cells, self.nx_padded, radius)
+        decision = turbop.precheck(
+            plan,
+            strict=self.turbo_strict,
+            cap_source=cap_source,
+            per_box_peak_bytes=self._per_box_peak_bytes(),
+        )
+        self._turbo_plan = plan
+        self._turbo_decision = decision
+        self._turbo_budget_bytes = plan.budget_bytes
+        print(decision.summary)  # ruff: ignore[print]
+        if decision.message:
+            print(decision.message, file=sys.stderr)  # ruff: ignore[print]
+        if decision.exit_code == 3:
+            raise SystemExit(3)
+
+    def _turbo_zstd_ok(self) -> bool:
+        """A.7 calibration oracle gate for the parallel ZSTD write.
+
+        Writes one deterministic 512^2 int16 tile with the stock codec
+        settings, then asks zstdmt whether the turbo-compressed frame is
+        byte-equal to the bytes GDAL stored. Mismatch (or unavailable) ->
+        False: the serial GDAL write is byte-exact by construction.
+        """
+        if not zstdmt.available():
+            print("[warn] turbo zstd oracle: CPL zstd unavailable; serial write", file=sys.stderr)  # ruff: ignore[print]
+            return False
+        # Deterministic compressible content: both axes differ to small
+        # values, so predictor 2 output is near-zero structured data.
+        gx = np.arange(512, dtype=np.int16) * 13
+        gy = np.arange(512, dtype=np.int16) * 7
+        tile = (gx[None, :] + gy[:, None]).astype(np.int16)
+        probe = Path(self.out_dir) / "_zstd_oracle.tif"
+        try:
+            with rasterio.open(
+                probe,
+                "w",
+                driver="GTiff",
+                dtype="int16",
+                width=512,
+                height=512,
+                count=1,
+                nodata=NODATA,
+                crs=f"EPSG:{self.work_crs}",
+                transform=from_origin(0, 512 * self.res, self.res, self.res),
+                compress=self.compress,
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
+                predictor=2,
+                BIGTIFF="IF_SAFER",
+            ) as dst:
+                dst.write(tile, 1)
+            verdict = zstdmt.oracle_check(probe, tile=0)
+            if verdict.ok:
+                return True
+            print(f"[warn] {verdict.detail}", file=sys.stderr)  # ruff: ignore[print]
+        except Exception as e:  # ruff: ignore[blind-except] - any probe failure means "serial"
+            print(f"[warn] turbo zstd oracle: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        finally:
+            probe.unlink(missing_ok=True)
+        return False
+
+    def _is_regime_a(self) -> bool:
+        """Return True when the pre-check selected regime A (full in-RAM)."""
+        d = self._turbo_decision
+        return d is not None and d.regime == "A"
 
     def _prepare_shared(self) -> bool:
         """Prebuild the full-grid pull-push field shared by all blocks (bit-exact).
@@ -878,8 +1994,17 @@ class Pipeline:
         Returns False (per-block path) when the geometry or size check fails.
 
         """
-        if self.nx_padded * self.ny_padded > _SHARED_MAX_CELLS:
-            return False
+        if self.turbo:
+            # S3.3: the shared/per-box decision comes from the pre-check
+            # (3.5), not the hard 2.5e8 cap; the thread count comes from
+            # the turbo plan (in-flight units are budgeted, see turbop.plan).
+            if self._turbo_decision is None or self._turbo_decision.path != "shared":
+                return False
+            n_threads = self._turbo_plan.workers if self._turbo_plan is not None else 1
+        else:
+            if self.nx_padded * self.ny_padded > _SHARED_MAX_CELLS:
+                return False
+            n_threads = 1
         step = self.step
         bsize = self.bsize
         halo = self.halo
@@ -894,32 +2019,99 @@ class Pipeline:
                     return False
 
         pts = np.load(self.pts_path, mmap_mode="r")
-        ix = ((pts[PTS_X][:] - self.x0) // self.res).astype(np.int64)
-        iy = ((pts[PTS_Y][:] - self.y0) // self.res).astype(np.int64)
+        with _prof.phase("shared.ix"):
+            ix = ((pts[PTS_X][:] - self.x0) // self.res).astype(np.int64)
+            iy = ((pts[PTS_Y][:] - self.y0) // self.res).astype(np.int64)
         cap_cells = round(self.cap_km_val * M_PER_KM / self.res)
         out_dir = Path(self.out_dir)
-        if self.nx_padded * self.ny_padded > _SHARED_MEMMAP_CELLS:
+        force_memmap = os.environ.get("PPGRID_FORCE_MEMMAP") == "1"
+        # Regime A = "full in-RAM, all workers" (SIZING table): keep the
+        # shared grids in anonymous RAM even past the 1e8 memmap threshold
+        # (issue #39: on a box under memory pressure the tmpfs memmap pages
+        # self-evict and the run pays a 46 us/fault re-fault storm).
+        use_memmap = (
+            self.nx_padded * self.ny_padded > _SHARED_MEMMAP_CELLS and not (self.turbo and self._is_regime_a())
+        ) or force_memmap
+        if use_memmap:
             # Keep the finest grids off the RAM budget: memmap + row banded
             # bin/near (bit-identical to the in-RAM pass, see pullpush).
             shape = (self.nx_padded, self.ny_padded)
             s0 = _open_fresh_memmap(out_dir / "_s0.npy", np.float32, shape)
             c0 = _open_fresh_memmap(out_dir / "_c0.npy", np.float32, shape)
-            bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
+            _nohuge(s0, c0)
+            with _prof.phase("shared.bin"):
+                bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
             near_full = _open_fresh_memmap(out_dir / "_near.npy", bool, shape)
-            box_count_banded(c0, cap_cells, near_full)
+            _nohuge(near_full)
+            with _prof.phase("shared.boxcount"):
+                box_count_banded(c0, cap_cells, near_full, n_threads=n_threads)
         else:
-            s0, c0 = bin_points(ix, iy, pts[PTS_TV][:], self.nx_padded, self.ny_padded)
-            near_full = box_count(c0, cap_cells) > 0
+            if self.nx_padded * self.ny_padded > _SHARED_MEMMAP_CELLS:
+                # Regime A scale (issue #39): the flat f64 bincount
+                # intermediates of bin_points (two 8 B/cell arrays plus two
+                # astype copies) are the single largest first-touch churn in
+                # the run. The banded scatter is bit-identical (same per-cell
+                # f64 accumulation order) and fills preallocated f32 grids.
+                with _prof.phase("shared.bin"):
+                    s0 = np.empty((self.nx_padded, self.ny_padded), np.float32)
+                    c0 = np.empty((self.nx_padded, self.ny_padded), np.float32)
+                    _nohuge(s0, c0)
+                    # rows without points are never written by bin_points_banded
+                    s0.fill(0)
+                    c0.fill(0)
+                    bin_points_banded(s0, c0, ix, iy, pts[PTS_TV][:], self.ny_padded)
+            else:
+                with _prof.phase("shared.bin"):
+                    s0, c0 = bin_points(ix, iy, pts[PTS_TV][:], self.nx_padded, self.ny_padded)
+            if n_threads > 1:
+                with _prof.phase("shared.boxcount"):
+                    near_full = box_count_mt(c0, cap_cells, n_threads=n_threads) > 0
+            else:
+                with _prof.phase("shared.boxcount"):
+                    near_full = box_count(c0, cap_cells) > 0
 
-        sums: list[np.ndarray] = [s0]
-        for _ in range(self.levels):
-            sums.append(downsample_sum(sums[-1]))
-        counts: list[np.ndarray] = [c0]
-        for _ in range(self.levels):
-            counts.append(downsample_sum(counts[-1]))
+        with _prof.phase("shared.pyramid"):
+            sums: list[np.ndarray] = [s0]
+            for _ in range(self.levels):
+                sums.append(downsample_sum(sums[-1]))
+            counts: list[np.ndarray] = [c0]
+            for _ in range(self.levels):
+                counts.append(downsample_sum(counts[-1]))
 
-        if self.nx_padded * self.ny_padded <= _SHARED_MEMMAP_CELLS:
-            val_full, sup_full = _pull_push_descent(sums, counts, self.res, self.levels, saturation=self.cfg.sat)
+        if not use_memmap:
+            out_val = out_sup = None
+            if self.turbo and self._is_regime_a():
+                # Regime A (issue #39 pass 3): back the output fields with
+                # tmpfs instead of anon RAM. The dnfill pass re-reads every
+                # field cell once; on this box external ~15 GB memory hogs
+                # (qemu CI runners) push anon field pages into swap
+                # (100 us+/fault - the 110 s sys in write.dnfill). tmpfs
+                # pages reclaim as clean file cache; a re-fault is a tmpfs
+                # read. Descent writes the final level into these memmaps.
+                shape = (self.nx_padded, self.ny_padded)
+                val_full = _open_fresh_memmap(out_dir / "_val_full.npy", np.float32, shape)
+                sup_full = _open_fresh_memmap(out_dir / "_sup_full.npy", np.float32, shape)
+                _nohuge(val_full, sup_full)
+                out_val, out_sup = val_full, sup_full
+            with _prof.phase("shared.descent"):
+                val_full, sup_full = _pull_push_descent(
+                    sums,
+                    counts,
+                    self.res,
+                    self.levels,
+                    saturation=self.cfg.sat,
+                    free_levels=True,
+                    n_threads=n_threads,
+                    out_val=out_val,
+                    out_sup=out_sup,
+                )
+            # Level 0 is dead after the descent: free the finest grids
+            # (two f32 full arrays, ~12 GB at full-AU scale) before the
+            # dnfill block loop (issue #39).
+            sums[0] = None  # type: ignore[index]
+            counts[0] = None  # type: ignore[index]
+            s0 = c0 = None  # type: ignore[assignment]
+            del ix, iy
         else:
             # Full descent to level 2 (small arrays), then band levels 2 -> 1
             # -> 0 through memmap to bound RAM on multi-billion-cell grids.
@@ -928,22 +2120,31 @@ class Pipeline:
             # level-1 local with a level-2 upsample and broadcast-crashes.
             lvl2 = min(2, self.levels)
             val2, sup2 = _pull_push_descent(
-                sums, counts, self.res, self.levels, saturation=self.cfg.sat, stop_level=lvl2, free_levels=True
-            )
-            val_full = _open_fresh_memmap(Path(self.out_dir) / "_val_full.npy", np.float32, s0.shape)
-            sup_full = _open_fresh_memmap(Path(self.out_dir) / "_sup_full.npy", np.float32, s0.shape)
-            _descent_banded(
                 sums,
                 counts,
                 self.res,
-                self.cfg.sat,
-                start_level=lvl2,
-                val_in=val2,
-                sup_in=sup2,
-                out_val=val_full,
-                out_sup=sup_full,
-                level_dir=Path(self.out_dir),
+                self.levels,
+                saturation=self.cfg.sat,
+                stop_level=lvl2,
+                free_levels=True,
+                n_threads=n_threads,
             )
+            val_full = _open_fresh_memmap(Path(self.out_dir) / "_val_full.npy", np.float32, s0.shape)
+            sup_full = _open_fresh_memmap(Path(self.out_dir) / "_sup_full.npy", np.float32, s0.shape)
+            with _prof.phase("shared.descent_banded"):
+                _descent_banded(
+                    sums,
+                    counts,
+                    self.res,
+                    self.cfg.sat,
+                    start_level=lvl2,
+                    val_in=val2,
+                    sup_in=sup2,
+                    out_val=val_full,
+                    out_sup=sup_full,
+                    level_dir=Path(self.out_dir),
+                    n_threads=n_threads,
+                )
             for k in range(min(3, self.levels + 1)):
                 sums[k] = None  # type: ignore[assignment]
                 counts[k] = None  # type: ignore[assignment]
@@ -983,24 +2184,53 @@ class Pipeline:
         vpath = Path(self.out_dir) / "value.tif"
         spath = Path(self.out_dir) / "support_km.tif"
 
+        vtags: dict[str, str] = {
+            "transform": self.tname,
+            "cap_km": str(self.cap_km_val),
+            "res_m": str(self.res),
+            "scale": str(self.scale),
+            "units": "percentile",
+            "decode": f"percentile = DN/{self.scale:g}",
+        }
+        if self.percentile_step is not None:
+            vtags["percentile_step"] = str(self.percentile_step)
+        stags = {"decode": f"support_km = 2**(DN/{SUPPORT_LOG2_SCALE})"}
+
+        # Turbo write (S3.4a): skip the work-CRS intermediate file, keep the
+        # quantised int16 DN field in RAM, write the output CRS directly.
+        # Only applies when the output is reprojected (out_crs != work_crs):
+        # when the two match, the block-write file IS the final file.
+        if self.turbo and self.out_crs != self.work_crs:
+            self._write_rasters_turbo(vprof, sprof, vpath, spath, vtags, stags, xform)
+        else:
+            self._write_rasters_serial(vprof, sprof, vpath, spath, vtags, stags)
+        return str(vpath), str(spath)
+
+    def _write_rasters_serial(
+        self,
+        vprof: dict[str, Any],
+        sprof: dict[str, Any],
+        vpath: Path,
+        spath: Path,
+        vtags: dict[str, str],
+        stags: dict[str, str],
+    ) -> None:
+        """Write block outputs to work-CRS GeoTIFFs.
+
+        Serial path (non-turbo, A8: byte-identical reference) and the turbo
+        fallback when the in-RAM DN field does not fit the planning budget.
+        When the output CRS differs, the work-CRS rasters are renamed to
+        intermediates and reprojected through _reproject_band.
+        """
         partial = False
         try:
             with (
                 rasterio.open(vpath, "w", **vprof) as vd,
                 rasterio.open(spath, "w", **sprof) as sd,
             ):
-                vd.update_tags(
-                    transform=self.tname,
-                    cap_km=str(self.cap_km_val),
-                    res_m=str(self.res),
-                    scale=str(self.scale),
-                    units="percentile",
-                    decode=f"percentile = DN/{self.scale:g}",
-                )
-                if self.percentile_step is not None:
-                    vd.update_tags(percentile_step=str(self.percentile_step))
+                vd.update_tags(**vtags)
                 vd.scales = (1.0 / self.scale,)
-                sd.update_tags(decode=f"support_km = 2**(DN/{SUPPORT_LOG2_SCALE})")
+                sd.update_tags(**stags)
 
                 # Write empty blocks as nodata
                 for bx, by in self.empty_blocks:
@@ -1023,7 +2253,7 @@ class Pipeline:
                     _CTX["cfg"] = cfg
                     if self._prepare_shared():
                         cfg.shared = True
-                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                    with ThreadPoolExecutor(max_workers=self.workers) as ex, _prof.phase("write.serial"):
                         for bx, by, out in ex.map(_process_block, self.tasks):
                             w = _block_window(bx, by, self.cfg)
 
@@ -1070,8 +2300,28 @@ class Pipeline:
                     )
 
                 out_crs = f"EPSG:{self.out_crs}"
-                _reproject_band(str(tmp_v), str(vpath), vprof, out_crs, dst_transform, dst_width, dst_height)
-                _reproject_band(str(tmp_s), str(spath), sprof, out_crs, dst_transform, dst_width, dst_height)
+                with _prof.phase("write.reproj_value"):
+                    _reproject_band(
+                        str(tmp_v),
+                        str(vpath),
+                        vprof,
+                        out_crs,
+                        dst_transform,
+                        dst_width,
+                        dst_height,
+                        n_threads=self.n_threads,
+                    )
+                with _prof.phase("write.reproj_support"):
+                    _reproject_band(
+                        str(tmp_s),
+                        str(spath),
+                        sprof,
+                        out_crs,
+                        dst_transform,
+                        dst_width,
+                        dst_height,
+                        n_threads=self.n_threads,
+                    )
             except Exception:
                 if tmp_v.exists():
                     tmp_v.rename(vpath)
@@ -1083,7 +2333,186 @@ class Pipeline:
             if tmp_s.exists():
                 tmp_s.unlink()
 
-        return str(vpath), str(spath)
+    def _write_rasters_turbo(
+        self,
+        vprof: dict[str, Any],
+        sprof: dict[str, Any],
+        vpath: Path,
+        spath: Path,
+        vtags: dict[str, str],
+        stags: dict[str, str],
+        xform: Any,
+    ) -> None:
+        """Write block outputs to the output-CRS GeoTIFFs from in-RAM arrays.
+
+        S3.4a turbo write: skip the work-CRS intermediate file, keep the
+        quantised int16 DN field in RAM, write the output CRS directly.
+
+        Budget gate: the DN field is 4 B/cell (two int16 bands). Above half
+        of the 0.85*C pre-check budget the serial write (work file + MT
+        reproject) is the safe path (10 m full-AU DN field: ~626 GB).
+
+        Serial strategy (final fallback, byte-identical reference): warp the
+        output raster tile-by-tile from the in-RAM arrays through the same
+        GDAL warp kernel and flush in serial raster-scan order, byte-identical
+        to _reproject_band on the work-CRS file.
+        Parallel strategies (issue #39): when the A.7 zstd oracle passes, warp
+        + compress every 512^2 tile in parallel through the CPL zstd pfn and
+        assemble the file from the stock GDAL head with the
+        TileOffsets/TileByteCounts arrays patched (_turbo_write_parallel).
+        When the oracle mismatches (the pfn drifts from libtiff's streaming
+        codec, as on the bundled GDAL 3.12.4 stack), the stock codec runs
+        per 2048^2 warp block through a per-thread scratch raster with the
+        identical profile - frames byte-equal to the serial flush by
+        construction on any stack (_turbo_write_stock_parallel).
+        """
+        budget = self._turbo_budget_bytes
+        if budget is not None and self.nx * self.ny * 4 > budget // 2:
+            self._write_rasters_serial(vprof, sprof, vpath, spath, vtags, stags)
+            return
+
+        partial = False
+        try:
+            with _prof.phase("write.dnfill"):
+                # File-backed (tmpfs) DN fields, not anon RAM (issue #39
+                # pass 3): the warp pass re-reads every 2048^2 block once,
+                # and external ~15 GB memory hogs swap anon pages out of the
+                # 3 GB fields (30 s/warp block observed vs 0.35 s resident).
+                # tmpfs pages reclaim as clean file cache; a re-fault is a
+                # tmpfs read, never swap I/O.
+                val_dn = np.memmap(
+                    Path(self.out_dir) / "_val_dn.npy", dtype=np.int16, shape=(self.ny, self.nx), mode="w+"
+                )
+                sup_dn = np.memmap(
+                    Path(self.out_dir) / "_sup_dn.npy", dtype=np.int16, shape=(self.ny, self.nx), mode="w+"
+                )
+                _nohuge(val_dn, sup_dn)
+                val_dn.fill(NODATA)
+                sup_dn.fill(NODATA)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
+                    # One shared config object for all worker threads (no
+                    # per-field dict copy). Rebuilt fresh each run: stale state
+                    # from a previous run in this process is dropped.
+                    _CTX.clear()
+                    cfg = self.cfg
+                    cfg.pts = np.load(cfg.pts_path, mmap_mode="r")
+                    cfg.tf = make_transform(cfg.transform_state)
+                    cfg.pct = PercentileTransform(cfg.pct_quantiles)
+                    _CTX["cfg"] = cfg
+                    if self._prepare_shared():
+                        cfg.shared = True
+                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                        for bx, by, out in ex.map(_process_block, self.tasks):
+                            w = _block_window(bx, by, self.cfg)
+                            if out is None:
+                                continue  # already NODATA
+                            rows = slice(w.row_off, w.row_off + w.height)
+                            cols = slice(w.col_off, w.col_off + w.width)
+                            vq, rq = out
+                            val_dn[rows, cols] = vq.T[::-1, :]
+                            sup_dn[rows, cols] = rq.T[::-1, :]
+                    # The shared field is dead after the block loop: free it
+                    # before the reproject/write (val/sup f32 + near bool,
+                    # ~13.7 GB at full-AU scale) (issue #39).
+                    cfg.val_full = cfg.sup_full = cfg.near_full = None
+        finally:
+            self._remove_run_temps()
+            if partial:
+                print(  # ruff: ignore[print]
+                    f"warning: run failed; output rasters are partial: {vpath}, {spath}",
+                    file=sys.stderr,
+                )
+
+        # Both bands share the same work-CRS source grid (identical
+        # bounds/size), so the output grid is identical too: compute the
+        # default transform once instead of per band.
+        work_crs = f"EPSG:{self.work_crs}"
+        out_crs = f"EPSG:{self.out_crs}"
+        dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
+            work_crs,
+            out_crs,
+            self.nx,
+            self.ny,
+            self.x0,
+            self.y0,
+            self.x0 + self.nx * self.res,
+            self.y0 + self.ny * self.res,
+        )
+        # Budgeted MT thread count from the turbo plan drives the warp pool;
+        # the n_threads kwarg stays the explicit non-turbo knob.
+        warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
+        out_dir = Path(self.out_dir)
+        with _prof.phase("write.oracle"):
+            cpl = self._turbo_zstd_ok()
+        try:
+            for band, arr, prof, path, tags, scales in (
+                ("value", val_dn, vprof, vpath, vtags, (1.0 / self.scale,)),
+                ("support", sup_dn, sprof, spath, stags, (1.0,)),
+            ):
+                with _prof.phase(f"write.reproj_{band}"):
+                    wrote = False
+                    if cpl:
+                        try:
+                            wrote = _turbo_write_parallel(
+                                arr,
+                                xform,
+                                work_crs,
+                                str(path),
+                                prof,
+                                out_crs,
+                                dst_transform,
+                                dst_width,
+                                dst_height,
+                                tags=tags,
+                                scales=scales,
+                                offsets=(0.0,),
+                                n_threads=warp_threads,
+                            )
+                        except Exception as e:  # ruff: ignore[blind-except] - layout surprise: fall back
+                            print(f"[warn] turbo zstd parallel: {e}; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
+                    if not wrote:
+                        try:
+                            wrote = _turbo_write_stock_parallel(
+                                arr,
+                                xform,
+                                work_crs,
+                                str(path),
+                                prof,
+                                out_crs,
+                                dst_transform,
+                                dst_width,
+                                dst_height,
+                                tags=tags,
+                                scales=scales,
+                                offsets=(0.0,),
+                                n_threads=warp_threads,
+                                scratch_dir=str(out_dir),
+                            )
+                        except Exception as e:  # ruff: ignore[blind-except] - any surprise: serial
+                            print(f"[warn] turbo stock parallel: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+                    if not wrote:
+                        # Layout guard tripped (see the parallel writers): the
+                        # serial array reproject is byte-identical by
+                        # construction.
+                        _reproject_band_array(
+                            arr,
+                            xform,
+                            work_crs,
+                            str(path),
+                            prof,
+                            out_crs,
+                            dst_transform,
+                            dst_width,
+                            dst_height,
+                            tags=tags,
+                            scales=scales,
+                            offsets=(0.0,),
+                            n_threads=warp_threads,
+                        )
+        finally:
+            for p in out_dir.glob("_stock_scratch_*.tif"):
+                p.unlink(missing_ok=True)
 
 
 def run(
@@ -1111,13 +2540,8 @@ def run(
     return p.run()
 
 
-def main() -> None:
-    """Parse CLI arguments and run the pipeline.
-
-    Raises:
-        SystemExit: On invalid arguments or a pipeline error (exit code 2).
-
-    """
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (tests exercise the flags here)."""
     parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
     parser.add_argument("--version", action="version", version=f"ppgrid {__version__}")
     parser.add_argument("input", help="CSV or Parquet input path")
@@ -1159,7 +2583,43 @@ def main() -> None:
     )
     parser.add_argument("--out-crs", type=int, default=OUT_CRS, help=f"Output CRS (default {OUT_CRS})")
     parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--turbo",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="GB",
+        help="Turbo mode: parallel phases + RAM-budgeted shared cap (S3.3). "
+        "Optional RAM cap preset 16|32|64|128; bare --turbo = auto-detect.",
+    )
+    parser.add_argument(
+        "--max-ram",
+        type=_pos_float,
+        default=None,
+        metavar="GB",
+        help="Explicit RAM cap in GB (overrides the --turbo preset). Implies --turbo.",
+    )
+    parser.add_argument("--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram.")
+    parser.add_argument(
+        "--turbo-strict",
+        action="store_true",
+        help="Shared path infeasible under the budget: error + exit 3 instead of [warn] + per-box fallback (exit 0).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Parse CLI arguments and run the pipeline.
+
+    Args:
+        argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
+
+    Raises:
+        SystemExit: On invalid arguments or a pipeline error (exit code 2).
+
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
@@ -1172,6 +2632,21 @@ def main() -> None:
     for flag, val in (("--src-crs", args.src_crs), ("--work-crs", args.work_crs), ("--out-crs", args.out_crs)):
         if val <= 0:
             parser.error(f"{flag} must be a positive EPSG code")
+    if args.turbo is not None and args.turbo not in ("auto", "16", "32", "64", "128"):
+        parser.error(f"--turbo preset must be auto|16|32|64|128: {args.turbo}")
+    if args.max_ram is None:
+        args.max_ram = args.ram_gb
+    if args.ram_gb is not None and args.max_ram != args.ram_gb:
+        parser.error("--max-ram and --ram-gb are aliases and must match")
+    if args.turbo_strict and args.turbo is None and args.max_ram is None:
+        parser.error("--turbo-strict requires --turbo or --max-ram")
+    turbo = args.turbo is not None or args.max_ram is not None
+    if args.max_ram is not None:
+        turbo_cap_gb: float | None = args.max_ram
+    elif args.turbo not in (None, "auto"):
+        turbo_cap_gb = float(args.turbo)
+    else:
+        turbo_cap_gb = None
 
     out = Path(args.out)
     if out.exists() and not out.is_dir():
@@ -1202,6 +2677,9 @@ def main() -> None:
             work_crs=args.work_crs,
             out_crs=args.out_crs,
             skip_calibration=args.skip_calibration,
+            turbo=turbo,
+            turbo_cap_gb=turbo_cap_gb,
+            turbo_strict=args.turbo_strict,
         )
     except CRSError as e:
         # Invalid --src-crs / --work-crs / --out-crs (proj_create failure).
