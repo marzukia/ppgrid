@@ -681,6 +681,58 @@ def _reproject_core(
                     dst.write(sub, 1, window=Window(i, j, w_w, w_h))
 
 
+def _footprint_has_task(
+    w_bounds: tuple[float, float, float, float],
+    dst_crs: Any,
+    src_crs: Any,
+    g_left: float,
+    g_bottom: float,
+    g_res_x: float,
+    g_res_y: float,
+    g_width: int,
+    g_height: int,
+    bsize: int,
+    nby: int,
+    task_bids: set[int],
+) -> bool:
+    """Return True when the source footprint of a dst window intersects any task block.
+
+    The footprint is the dst window bounds transformed into source (work-CRS)
+    georeferenced space via `transform_bounds` on a densified boundary, then
+    converted to work-grid cell ranges rounded OUT (one extra cell of pad on
+    every side). Raster row 0 is at the top edge (g_top), so the footprint's
+    row range is derived from the top edge, then flipped to bottom-anchored
+    row indices before the block test: task_bids encodes block rows from the
+    bottom (self.tasks convention, by = (y - y.min()) // res // bsize; the
+    raster write flips it via Window(i0, ny - j1)). The padded cell ranges
+    are tested against the task blocks, so a false "has data" costs one warp,
+    but a false "empty" is not possible: the task blocks are the superset of
+    every non-NoData cell.
+    """
+    sb = rasterio.warp.transform_bounds(dst_crs, src_crs, *w_bounds, densify_pts=257)
+    pad = max(g_res_x, g_res_y)
+    xmin, ymin, xmax, ymax = sb[0] - pad, sb[1] - pad, sb[2] + pad, sb[3] + pad
+    i0 = max(0, math.floor((xmin - g_left) / g_res_x))
+    i1 = min(g_width, math.ceil((xmax - g_left) / g_res_x))
+    g_top = g_bottom + g_height * g_res_y
+    j0 = max(0, math.floor((g_top - ymax) / g_res_y))
+    j1 = min(g_height, math.floor((g_top - ymin) / g_res_y) + 1)
+    if i1 <= i0 or j1 <= j0:
+        return False
+    # j0/j1 are raster rows from the TOP (row 0 = g_top); task_bids encodes
+    # block rows from the BOTTOM. Top row [j0, j1) is bottom row
+    # [g_height - j1, g_height - j0); flip before deriving block rows, else
+    # top/bottom tiles are falsely skipped whenever nby >= 4 (B1, PR #27).
+    bj0 = g_height - j1
+    bj1 = g_height - j0
+    for bx in range(i0 // bsize, (i1 - 1) // bsize + 1):
+        base = bx * nby
+        for by in range(bj0 // bsize, (bj1 - 1) // bsize + 1):
+            if base + by in task_bids:
+                return True
+    return False
+
+
 def _reproject_band(
     src_path: str,
     dst_path: str,
@@ -689,6 +741,7 @@ def _reproject_band(
     dst_transform: Any,
     dst_width: int,
     dst_height: int,
+    task_info: dict[str, Any] | None = None,
     n_threads: int = 1,
 ) -> None:
     """Nearest-neighbour reproject one band into a fresh output-CRS GeoTIFF.
@@ -708,11 +761,34 @@ def _reproject_band(
     the tile write order. n_threads == 1 keeps the exact serial code path (A8);
     the outer src handle is still read by the main thread for profile, tags,
     scales and offsets.
+
+    NoData-tile skip (C(ii), PR #27): when `task_info` is provided (work-grid
+    block geometry + the populated-block superset from grid()), a coarse dst
+    tile whose source footprint intersects no task block cannot contain data
+    (empty blocks are written NoData, and data cells exist only inside task
+    blocks). Its warp is skipped and a plain NoData buffer is written to the
+    tile instead. The footprint is conservatively rounded out, so the skip
+    is safe: at worst one tile that is all-NoData gets warped anyway. When
+    no tile is skippable (or task_info is None) the output is identical to
+    the unskipped path.
     """
     with rasterio.open(src_path) as src:
+        skip = task_info is not None
+        if skip:
+            bsize = task_info["bsize"]
+            nby = task_info["nby"]
+            task_bids: set[int] = task_info["task_bids"]
+            g_left, g_bottom, g_right, g_top = src.bounds
+            g_res_x = (g_right - g_left) / src.width
+            g_res_y = (g_top - g_bottom) / src.height
+            src_crs = src.crs
+        # Tile counters are shared with the warp pool (n_threads > 1); the
+        # count feeds a log line only, but keep it exact under the GIL anyway.
+        counters = {"tiles": 0, "skipped": 0}
+        count_lock = threading.Lock()
 
         def make_warp(j0: int, band_h: int) -> Callable[[int], tuple[int, np.ndarray]]:
-            return partial(
+            warp = partial(
                 _warp_dst_tile,
                 src_path,
                 j0=j0,
@@ -722,6 +798,30 @@ def _reproject_band(
                 dst_transform=dst_transform,
                 dst_crs=dst_crs,
             )
+
+            def warp_tile(i0: int) -> tuple[int, np.ndarray]:
+                with count_lock:
+                    counters["tiles"] += 1
+                    if skip and not _footprint_has_task(
+                        rasterio.windows.bounds(Window(i0, j0, min(2048, dst_width - i0), band_h), dst_transform),
+                        dst_crs,
+                        src_crs,
+                        g_left,
+                        g_bottom,
+                        g_res_x,
+                        g_res_y,
+                        src.width,
+                        src.height,
+                        bsize,
+                        nby,
+                        task_bids,
+                    ):
+                        # All-NoData tile: no warp, plain NoData buffer.
+                        counters["skipped"] += 1
+                        return i0, np.full((band_h, min(2048, dst_width - i0)), NODATA, np.int16)
+                return warp(i0)
+
+            return warp_tile
 
         _reproject_core(
             make_warp,
@@ -736,6 +836,8 @@ def _reproject_band(
             offsets=tuple(src.offsets) if getattr(src, "offsets", None) else None,
             n_threads=n_threads,
         )
+        if skip and counters["skipped"] > 0:
+            print(f"[reproj] skipped {counters['skipped']}/{counters['tiles']} all-NoData tiles")  # ruff: ignore[print]
 
 
 def _reproject_band_array(
@@ -1425,6 +1527,7 @@ class Pipeline:
         work_crs: int = WORK_CRS,
         out_crs: int = OUT_CRS,
         skip_calibration: bool = False,
+        max_band_parallel: int | None = None,
         n_threads: int = 1,
         turbo: bool = False,
         turbo_cap_gb: float | None = None,
@@ -1437,6 +1540,7 @@ class Pipeline:
             ValueError: If percentile_step is outside (0, PERCENTILE_MAX].
             ValueError: If saturation is not > 0.
             ValueError: If n_threads is not >= 1.
+            ValueError: If max_band_parallel is not >= 1.
             ValueError: If turbo_cap_gb is not > 0.
 
         """
@@ -1466,6 +1570,10 @@ class Pipeline:
         self.work_crs = work_crs
         self.out_crs = out_crs
         self.skip_calibration = skip_calibration
+        if max_band_parallel is not None and max_band_parallel < 1:
+            msg = f"max_band_parallel must be >= 1: {max_band_parallel}"
+            raise ValueError(msg)
+        self.max_band_parallel = max_band_parallel
         if n_threads < 1:
             msg = f"n_threads must be >= 1: {n_threads}"
             raise ValueError(msg)
@@ -2007,7 +2115,13 @@ class Pipeline:
         else:
             if self.nx_padded * self.ny_padded > _SHARED_MAX_CELLS:
                 return False
-            n_threads = 1
+            # PR #27 (low-RAM path): the shared descent runs parallel
+            # row-banded. --max-band-parallel caps the per-level pool; without
+            # the flag the read-side worker count is used (main's baseline
+            # for this path was serial, n_threads = 1). Bit-identical at any
+            # thread count (S3), and _descent_banded's RAM gate drops to
+            # single-thread when available memory is tight.
+            n_threads = self.max_band_parallel if self.max_band_parallel is not None else self.workers
         step = self.step
         bsize = self.bsize
         halo = self.halo
@@ -2295,6 +2409,17 @@ class Pipeline:
                     )
 
                 out_crs = f"EPSG:{self.out_crs}"
+                # NoData-tile skip (C(ii), PR #27): the task blocks are the
+                # superset of all non-NoData cells in the work rasters, so a
+                # dst tile whose source footprint touches no task block can
+                # be written as plain NoData without warping.
+                task_info = None
+                if self.tasks:
+                    task_info = {
+                        "bsize": self.bsize,
+                        "nby": self.nby,
+                        "task_bids": {bx * self.nby + by for bx, by in self.tasks},
+                    }
                 with _prof.phase("write.reproj_value"):
                     _reproject_band(
                         str(wtmp_v),
@@ -2304,6 +2429,7 @@ class Pipeline:
                         dst_transform,
                         dst_width,
                         dst_height,
+                        task_info=task_info,
                         n_threads=self.n_threads,
                     )
                 with _prof.phase("write.reproj_support"):
@@ -2315,6 +2441,7 @@ class Pipeline:
                         dst_transform,
                         dst_width,
                         dst_height,
+                        task_info=task_info,
                         n_threads=self.n_threads,
                     )
             # Publish: the finals only ever change via atomic rename.
@@ -2605,6 +2732,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-crs", type=int, default=OUT_CRS, help=f"Output CRS (default {OUT_CRS})")
     parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
     parser.add_argument(
+        "--max-band-parallel",
+        type=int,
+        default=None,
+        help="Cap parallel row-band workers for the low-RAM shared descent (default: --workers).",
+    )
+    parser.add_argument(
         "--turbo",
         nargs="?",
         const="auto",
@@ -2650,6 +2783,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"--percentile-step must be in (0, {PERCENTILE_MAX:g}]")
     if args.block < 1:
         parser.error("--block must be at least 1")
+    if args.max_band_parallel is not None and args.max_band_parallel < 1:
+        parser.error("--max-band-parallel must be at least 1")
     if args.calib_max_points < 1:
         parser.error("--calib-max-points must be at least 1")
     for flag, val in (("--src-crs", args.src_crs), ("--work-crs", args.work_crs), ("--out-crs", args.out_crs)):
@@ -2701,6 +2836,7 @@ def main(argv: list[str] | None = None) -> None:
                 work_crs=args.work_crs,
                 out_crs=args.out_crs,
                 skip_calibration=args.skip_calibration,
+                max_band_parallel=args.max_band_parallel,
                 turbo=turbo,
                 turbo_cap_gb=turbo_cap_gb,
                 turbo_strict=args.turbo_strict,

@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Performance (sparse output, low-RAM scope): `_reproject_band` skips the reproject warp for coarse output tiles whose work-CRS source footprint (conservatively rounded out) intersects no task block, writing a plain NoData buffer instead — RAM-free, and a no-op when no tile is skippable (the auto-cap case). `_descent_banded` row-bands within a level now run on a thread pool (levels stay sequential): bit-identical output, `--max-band-parallel` flag (default `min(workers, nbands, 8)`), and a per-level `/proc/meminfo` gate that falls back to single-threaded when available RAM is below peak RSS plus two bands of float32 buffers.
 
 ## [0.3.0] - 2026-10-08
 - Full-AU (16M points, `--res 100`): 30:45 (quiet) to 50:46 (loaded) with the same pre-PR turbo code, load-dependent -> 2:33 wall time (~12-20x) with sha256-identical outputs (marzuki-hydrogen, `--turbo 64`, regime A).

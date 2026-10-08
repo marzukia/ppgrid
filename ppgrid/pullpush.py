@@ -731,6 +731,28 @@ def _pull_push_descent(
     return val, sup
 
 
+def _mem_available_bytes() -> int | None:
+    """Return available system RAM from /proc/meminfo in bytes, or None if unknown."""
+    try:
+        with Path("/proc/meminfo").open(encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _peak_rss_bytes() -> int:
+    """Return the current peak RSS of this process in bytes, 0 if unavailable."""
+    try:
+        import resource
+
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+    except (ImportError, OSError, ValueError):
+        return 0
+
+
 def _descent_banded(
     sums: list[np.ndarray],
     counts: list[np.ndarray],
@@ -744,6 +766,7 @@ def _descent_banded(
     level_dir: Path,
     band_rows: int = 1024,
     n_threads: int = 1,
+    nworkers: int | None = None,
 ) -> None:
     """Compute the descent from level start_level down to level 0, row-banded.
 
@@ -757,9 +780,21 @@ def _descent_banded(
     n_threads > 1 runs the band loop in a thread pool (S3.2): bands write
     disjoint output rows and read the parent level read-only, so they are
     independent and the result stays bit-identical to the serial loop
-    (n_threads=1).
+    (n_threads=1). ``nworkers`` is an alias for ``n_threads`` (PR #27 naming,
+    kept for its tests); when given it overrides ``n_threads``.
 
+    Low-RAM guard (PR #27): the per-level pool is clamped to
+    min(n_threads, nbands, 8), and each concurrent band holds its own
+    intermediate buffers (a, local, pv, ps). When /proc/meminfo reports
+    less available memory than the current peak RSS plus two bands' worth of
+    float32 buffers, the level falls back to single-threaded (nw=1), where
+    peak RSS cannot exceed the sequential path. The reserve covers only two
+    bands against up to eight concurrent, so the gate is a headroom
+    heuristic, not a memory bound: it trades wall time under memory
+    pressure and never changes the output.
     """
+    if nworkers is not None:
+        n_threads = nworkers
     val = val_in
     sup = sup_in
     for k in range(start_level - 1, -1, -1):
@@ -787,7 +822,14 @@ def _descent_banded(
         ) -> None:
             _descent_band_body(_sums_k, _counts_k, _val, _sup, res, saturation, _k, r0, r1, _out, _outs)
 
-        _thread_bands(bands, _band, n_threads)
+        # Per-level pool bound + RAM gate (see docstring).
+        nw = max(1, min(n_threads, len(bands), 8))
+        if nw > 1:
+            avail = _mem_available_bytes()
+            need = _peak_rss_bytes() + 2 * band_rows * n0 * 4 * 2
+            if avail is not None and avail < need:
+                nw = 1
+        _thread_bands(bands, _band, nw)
         if k > 0:
             val, sup = out, outs
 
