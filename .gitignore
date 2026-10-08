@@ -8,3 +8,5 @@ __pycache__/
 .DS_Store
 **/.DS_Store
 out/
+# Full-AU sparse point set (53 MB, generated; not shipped in the sdist either)
+data/au_gcc_sparse.csv

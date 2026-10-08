@@ -189,7 +189,7 @@ def test_oracle_forced_mismatch_returns_fallback_signal() -> None:
     assert verdict.turbo_size == len(stock) + 1
     assert verdict.stock_size == len(stock)
     assert "mismatch" in verdict.detail
-    assert "serial" in verdict.detail
+    assert "stock parallel" in verdict.detail  # fallback is the stock parallel writer, not serial (issue #40 m10)
 
 
 def test_oracle_real_cpl_pfn_consistent_with_byte_comparison() -> None:
@@ -210,7 +210,7 @@ def test_oracle_real_cpl_pfn_consistent_with_byte_comparison() -> None:
     assert verdict.stock_size == len(stock)
     if turbo != stock:
         assert "mismatch" in verdict.detail
-        assert "serial" in verdict.detail
+        assert "stock parallel" in verdict.detail  # fallback is the stock parallel writer, not serial (issue #40 m10)
 
 
 def test_oracle_tile_out_of_range() -> None:
@@ -345,7 +345,7 @@ def test_oracle_runs_on_bigtiff(tmp_path: Path) -> None:
     assert "oracle" in verdict.detail
     if not verdict.ok:
         assert "mismatch" in verdict.detail
-        assert "serial" in verdict.detail
+        assert "stock parallel" in verdict.detail  # fallback is the stock parallel writer, not serial (issue #40 m10)
 
 
 def test_tif_info_corrupt_body_raises_zstdmterror(tmp_path: Path) -> None:
