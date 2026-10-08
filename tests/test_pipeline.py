@@ -541,9 +541,11 @@ def test_constant_value_cal_file_is_strict_json(
 def test_midrun_worker_failure_cleans_temps_and_warns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """#15: a mid-run worker error must warn about partial rasters.
+    """#15: a mid-run worker error must warn about the failed write.
 
-    Every temp file is removed (the write loop is wrapped in try/finally).
+    Every temp file is removed (the write loop is wrapped in try/finally),
+    and no final is left behind: the finals are only published via atomic
+    rename on success (issue #40).
     """
     import ppgrid.pipeline as ig
 
@@ -574,11 +576,12 @@ def test_midrun_worker_failure_cleans_temps_and_warns(
     with pytest.raises(RuntimeError, match="simulated worker OOM"):
         p.run()
     err = capsys.readouterr().err
-    assert "partial" in err
+    assert "failed during write" in err
     for fname in ig._RUN_TEMP_FILES:  # ruff: ignore[private-member-access]
         assert not (out / fname).exists(), f"temp left behind: {fname}"
-    assert (out / "value.tif").exists()  # partial rasters are left, with a warning
-    assert (out / "support_km.tif").exists()
+    # Issue #40 (d): a mid-write crash no longer leaves truncated finals.
+    assert not (out / "value.tif").exists()
+    assert not (out / "support_km.tif").exists()
     assert observed.get("mode") == 0o600, f"temp was {oct(observed.get('mode'))}, expected 0600"
 
 
