@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [0.3.0] - 2026-10-08
+- Full-AU (16M points, `--res 100`): 50:46 -> 2:33 wall time with sha256-identical outputs (marzuki-hydrogen, `--turbo 64`, regime A).
+- Turbo: write path + budget cap + CLI (issue #33):
+  - `--turbo` (optional preset `16|32|64|128`; bare = auto `min(physical, cgroup) - 8 GB`), `--max-ram <GB>` (implies turbo), `--ram-gb` alias, `--turbo-strict`.
+  - Pre-check after `grid()`: prints the cap/budget/regime actually used; shared infeasible (per-box regime) -> strict: error + exit 3, else `[warn]` + continue on the per-box path with turbo warp/write (exit 0, correct output).
+  - `_write_rasters` turbo: skips the work-CRS intermediate files, keeps the quantised int16 DN fields in RAM, and reprojects tile-by-tile from arrays through the same GDAL warp kernel (byte-identical to the file-based path, sha256-tested). Optional parallel per-tile ZSTD via `zstdmt.compress_tiles`, gated by the compression oracle (mismatch -> serial GDAL write, byte-exact). In-RAM DN is budget-gated; oversized grids fall back to the file-based reproject path with MT warp.
+  - Budget-derived shared cap (S3.3) replaces the hard 2.5e8 cell cap in turbo mode; non-turbo keeps 2.5e8; the 1e8 in-RAM/memmap tier is unchanged.
+  - `_prepare_shared` / `box_count_banded` run threaded under the budgeted worker count when turbo (serial at `n_threads == 1`, A8 preserved).
+  - Fixed `turbop._read_cgroup_max_gb`: now walks the process cgroup hierarchy to the root and takes the smallest finite `memory.max` (a slice limit above the service cgroup binds; previously only the root cgroup was read, so capped user slices saw the full physical RAM and the auto cap could plan a regime that OOMs the slice).
+  - Regenerated stale anchor `examples/melb/10m/value.tif` (byte-identical to current `main` output; the committed file predated a pipeline change).
+  - RAM budget `Bt = 0.85 * C - 4 GB` (`C` = effective RAM cap) drives regime selection: A = full in-RAM shared, B = input in RAM + banded val/sup memmap, C = per-box warp/write with an 8 GB page-cache floor, per_box = below the 8 GB cap floor.
+- Turbo: speed pass 3 — regime-A in-RAM shared path + byte-exact parallel writer (issue #39):
+  - Regime A keeps the shared full fields (val_full/sup_full) and the quantised DN fields (val_dn/sup_dn) on tmpfs memmaps (reclaimable as clean file cache) instead of anon RAM; `_pull_push_descent` gained optional `out_val/out_sup` and writes the final descent level straight into the shared fields (bit-exact in both the threaded and serial branches).
+  - Byte-exact parallel tile writer: full-thread-id TID scratch paths (low-16-bit id collisions truncated a live scratch file mid-run), tile frames reassembled into global 512 raster-scan (block-major assembly was wrong), reference head written as one 512^2 tile. sha256-identical to the committed serial anchors.
+  - Reproject: the source band is wrapped once in a no-copy `MemoryDataset` — rasterio's ndarray source form copied the whole band into a fresh MEM dataset per warp call (3 GB per 2048^2 block at full-AU; 8 in-flight copies OOM-killed the run).
+  - `_quantize` rewritten in-place (same IEEE ops/order, bit-identical) with per-thread f32+f64 scratch; the int16 outputs are owned per call (thread-local scratch raced the `ex.map` prefetch and corrupted ~10% of blocks).
+  - Fixed the support blend reusing the value `om` buffer across blends; `MADV_NOHUGEPAGE` on large fresh arrays (THP=always with sync defrag made first-touch faults 20-40 us/page).
+- Turbo: pipeline read-side MT (issue #32) behind a new `Pipeline(n_threads=...)` kwarg (default `1`: the serial code path, byte-identical output):
+  - `_reproject_band`: the 2048px warp tiles of each row band run on a `ThreadPoolExecutor` (the GDAL warp runs under `nogil`; each tile opens its own source handle, GDAL dataset handles are not thread-safe). The 512px flush loop stays serial raster-scan, so the on-disk bytes never change (sha256-equal to the serial run is test-covered).
+  - `ingest`: CSVs with enough rows (>= 100k per chunk) are split into complete-record byte ranges (newline scan with quote-parity guards; any doubt falls back to the serial parse) and parsed in a `ProcessPoolExecutor` (`read_csv` holds the GIL, so threads cannot overlap the parse). Each chunk parses the wanted columns with explicit float64 dtypes and asserts per-chunk dtype equality; chunks concatenate in original row order (`bin_points` is order-sensitive). A row-count mismatch re-runs the serial parse.
+  - New `tests/test_turbo.py` (6 tests): MT reproject sha256-equality vs serial, MT ingest bit-identity vs the single whole-file parse on a 500k-row edge-row fixture (2**53 +/- 1, empty/inf rows, int-only column, quoted fields, non-adjacent columns), serial-parse fallbacks (small file, quoted embedded newline), end-to-end full-run sha256 equality `n_threads=1` vs `4`, and `n_threads` validation.
+  - Ignores rasterio's benign `NotGeoreferencedWarning` (MemoryDataset initial transform read): CPython warning filters are process-global and not thread-safe, so the library's nested suppression can leak under concurrent warps.
+  - Bench harnesses: `bench/turbo_bench.py` (full paths), `bench/turbo_decomp.py` (parallelisable part in isolation).
+
 ## [0.2.2] - 2026-09-25
 - Code hygiene (no behavior change; output rasters remain byte-identical) — issues #4/#5:
   - Renamed `ppgrid/idwgrid.py` -> `ppgrid/pipeline.py`; `ppgrid/idwgrid` is now a thin backwards-compat shim, `ppgrid.Pipeline` is exported from the package root, and the `ppgrid` console script points at `ppgrid.pipeline:main`.
