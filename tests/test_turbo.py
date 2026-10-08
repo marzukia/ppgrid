@@ -12,7 +12,10 @@
 
 import hashlib
 import math
+import multiprocessing as mp
 import struct
+from concurrent.futures import ProcessPoolExecutor as _ProcessPoolExecutor
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -147,8 +150,17 @@ def _write_edge_csv(path: Path, n: int) -> None:
     ).to_csv(path, index=False)
 
 
-def test_ingest_mt_matches_single_parse(tmp_path: Path) -> None:
+def test_ingest_mt_matches_single_parse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Parallel ingest must be bit-identical to the single whole-file parse."""
+    # Pin the pool start method to forkserver (review m11): the pytest parent
+    # is multithreaded, and fork() from a multithreaded process raises
+    # DeprecationWarning on Python 3.13+. forkserver parses identically
+    # (same _read_csv_chunk function, same dtypes) with zero warnings.
+    monkeypatch.setattr(
+        pipeline_mod,
+        "ProcessPoolExecutor",
+        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+    )
     csv = tmp_path / "edge.csv"
     n = 500_000
     _write_edge_csv(csv, n)
@@ -875,3 +887,144 @@ def test_cli_turbo_wiring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
             ]
         )
     assert ei.value.code == 3
+
+
+# ---------------------------------------------------------------------------
+# Issue #40 (M1): partial/stale output handling
+# ---------------------------------------------------------------------------
+
+
+def _small_csv(tmp_path: Path, n: int = 400, seed: int = 7) -> Path:
+    """Write a small deterministic CSV around Melbourne (fast e2e runs)."""
+    rng = np.random.default_rng(seed)
+    lon = 144.9 + rng.random(n) * 0.1
+    lat = -37.8 - rng.random(n) * 0.1
+    v = rng.integers(100_000, 2_000_000, n).astype(float)
+    p = tmp_path / "small.csv"
+    pd.DataFrame({"value": v, "longitude": lon, "latitude": lat}).to_csv(p, index=False)
+    return p
+
+
+def _staging_leftovers(out: Path) -> list[str]:
+    """List non-final .tif names in an output dir (staging that survived)."""
+    return sorted(p.name for p in out.iterdir() if p.suffix == ".tif" and p.name not in ("value.tif", "support_km.tif"))
+
+
+def _cli_base(out: Path, *extra: str) -> list[str]:
+    """CLI args for a small-CSV run (value col 'value')."""
+    args = [
+        "--value-col",
+        "value",
+        "--lng-col",
+        "longitude",
+        "--lat-col",
+        "latitude",
+        "-o",
+        str(out),
+        "--skip-calibration",
+    ]
+    args.extend(extra)
+    return args
+
+
+def test_stale_outputs_warning_after_failed_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Reviewer repro (#40): earlier run's value.tif + failed new run -> warn.
+
+    A run that fails before the write phase (bad --value-col) must exit
+    non-zero AND warn that the rasters in the out dir are from an earlier
+    run; the earlier files stay byte-identical.
+    """
+    csv = _small_csv(tmp_path)
+    out = tmp_path / "out"
+    pipeline_mod.main([str(csv), *_cli_base(out)])
+    capsys.readouterr()
+    assert _staging_leftovers(out) == []  # success leaves no .tmp / _tmp staging
+    sha_v = _sha(out / "value.tif")
+    sha_s = _sha(out / "support_km.tif")
+
+    with pytest.raises(SystemExit) as ei:
+        pipeline_mod.main([str(csv), *_cli_base(out, "--value-col", "nonexistent")])
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert "failed before writing outputs" in err
+    assert "value.tif" in err
+    assert "support_km.tif" in err
+    assert _sha(out / "value.tif") == sha_v
+    assert _sha(out / "support_km.tif") == sha_s
+
+
+def _boom(*_args: object, **_kwargs: object) -> None:
+    """Raise a mid-write crash (signature matches the writer callables).
+
+    Raises:
+        RuntimeError: Always, to simulate the mid-write failure.
+
+    """
+    msg = "simulated mid-write crash"
+    raise RuntimeError(msg)
+
+
+def test_midwrite_failure_keeps_finals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Gate (d): a crash during the serial write leaves finals untouched.
+
+    The finals are only ever published via atomic rename after the band
+    completes; a mid-reproject crash must leave the earlier run's
+    value.tif / support_km.tif byte-identical, warn, and clean up all
+    staging files.
+    """
+    csv = _small_csv(tmp_path)
+    out = tmp_path / "out"
+    pipeline_mod.main([str(csv), *_cli_base(out)])
+    capsys.readouterr()
+    sha_v = _sha(out / "value.tif")
+    sha_s = _sha(out / "support_km.tif")
+
+    monkeypatch.setattr(pipeline_mod, "_reproject_band", _boom)
+    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+        pipeline_mod.main([str(csv), *_cli_base(out)])
+    err = capsys.readouterr().err
+    assert "failed during write" in err
+    assert "failed before writing outputs" in err
+    assert _sha(out / "value.tif") == sha_v
+    assert _sha(out / "support_km.tif") == sha_s
+    assert _staging_leftovers(out) == []
+
+
+def test_turbo_midwrite_failure_keeps_finals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """M1(b): a crash in the turbo final-write phase leaves finals untouched.
+
+    The turbo dnfill + write loop is covered by the same
+    except BaseException as the serial path: the rename publish is the last
+    step, so a mid-write crash keeps the earlier run's finals
+    byte-identical, warns, and cleans up staging + scratch.
+    """
+    csv = _small_csv(tmp_path)
+    out = tmp_path / "out"
+    pipeline_mod.main([str(csv), *_cli_base(out, "--turbo", "32")])
+    capsys.readouterr()
+    assert _staging_leftovers(out) == []
+    sha_v = _sha(out / "value.tif")
+    sha_s = _sha(out / "support_km.tif")
+
+    # Whichever writer the stack picks (zstd parallel, stock parallel, or
+    # the serial array reproject), make it fail mid-write.
+    monkeypatch.setattr(pipeline_mod, "_turbo_write_parallel", _boom)
+    monkeypatch.setattr(pipeline_mod, "_turbo_write_stock_parallel", _boom)
+    monkeypatch.setattr(pipeline_mod, "_reproject_band_array", _boom)
+    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+        pipeline_mod.main([str(csv), *_cli_base(out, "--turbo", "32")])
+    err = capsys.readouterr().err
+    assert "failed during write" in err
+    assert "failed before writing outputs" in err
+    assert _sha(out / "value.tif") == sha_v
+    assert _sha(out / "support_km.tif") == sha_s
+    assert _staging_leftovers(out) == []
+    assert not list(out.glob("_stock_scratch_*.tif"))

@@ -36,6 +36,7 @@ from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 
 from . import __version__, _prof, turbop, zstdmt
+from ._tempfiles import _open_fresh_memmap
 from .calibrate import (
     M_PER_KM,
     PERCENTILE_MAX,
@@ -144,6 +145,13 @@ _RUN_TEMP_FILES = (
     "_sup_dn.npy",
     "_val_lvl1.npy",
     "_sup_lvl1.npy",
+    # Write-phase staging files (issue #40): the final rasters are written
+    # to these names and os.replace()'d over value.tif / support_km.tif
+    # only on success, so a mid-write crash never truncates the finals.
+    "_value_tmp.tif",
+    "_support_tmp.tif",
+    "value.tif.tmp",
+    "support_km.tif.tmp",
 )
 
 # Ingest parallelism (S3.5): minimum data rows per CSV chunk for the process
@@ -214,6 +222,26 @@ def _die(msg: str) -> NoReturn:
     raise SystemExit(1)
 
 
+def _warn_stale_outputs(out: Path) -> None:
+    """Warn when a failed run leaves an earlier run's rasters behind (issue #40).
+
+    On any non-zero exit, if value.tif / support_km.tif already exist in the
+    output dir, they are from an earlier run: this run failed before writing,
+    and the old files are untouched (the write phase only publishes via
+    os.replace() on success, so a failed run never truncates them).
+    """
+    if not out.is_dir():
+        return
+    existing = [name for name in ("value.tif", "support_km.tif") if (out / name).is_file()]
+    if not existing:
+        return
+    print(  # ruff: ignore[print]
+        f"warning: this run failed before writing outputs; {', '.join(existing)} in {out} "
+        "are from an earlier run and were left untouched",
+        file=sys.stderr,
+    )
+
+
 def _pos_float(text: str) -> float:
     """Argparse type: a finite, strictly positive float (issue #13).
 
@@ -255,33 +283,6 @@ def _cap_km_arg(text: str) -> float | str:
     if text == "auto":
         return "auto"
     return _pos_float(text)
-
-
-def _open_fresh_memmap(
-    path: Path,
-    dtype: type | np.dtype[Any],
-    shape: tuple[int, ...],
-) -> np.memmap:
-    """Create `path` as a fresh 0600 regular file, then open it for memmap write.
-
-    The path is unlinked first so a pre-planted symlink is replaced, never
-    followed (its target must not be overwritten); O_EXCL guards the race
-    (issue #15). Mode 0600: temps hold raw coordinates + values and should
-    not be world-readable (the default 0644 leaked them).
-
-    Args:
-        path: Destination path in the output dir.
-        dtype: Memmap element type.
-        shape: Memmap shape.
-
-    Returns:
-        Writable memmap over the fresh file.
-
-    """
-    path.unlink(missing_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-    os.close(fd)
-    return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
 
 
 def _neighbour_block_ids(bx: int, by: int, nbx: int, nby: int) -> list[int]:
@@ -1931,10 +1932,12 @@ class Pipeline:
         Writes one deterministic 512^2 int16 tile with the stock codec
         settings, then asks zstdmt whether the turbo-compressed frame is
         byte-equal to the bytes GDAL stored. Mismatch (or unavailable) ->
-        False: the serial GDAL write is byte-exact by construction.
+        False: the caller writes with the stock-codec parallel path
+        (_turbo_write_stock_parallel); the serial per-band write runs only if
+        that writer's layout guards fail. Either way the output is byte-exact.
         """
         if not zstdmt.available():
-            print("[warn] turbo zstd oracle: CPL zstd unavailable; serial write", file=sys.stderr)  # ruff: ignore[print]
+            print("[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
             return False
         # Deterministic compressible content: both axes differ to small
         # values, so predictor 2 output is near-zero structured data.
@@ -1966,8 +1969,8 @@ class Pipeline:
             if verdict.ok:
                 return True
             print(f"[warn] {verdict.detail}", file=sys.stderr)  # ruff: ignore[print]
-        except Exception as e:  # ruff: ignore[blind-except] - any probe failure means "serial"
-            print(f"[warn] turbo zstd oracle: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        except Exception as e:  # ruff: ignore[blind-except] - any probe failure means the stock parallel writer runs
+            print(f"[warn] turbo zstd oracle: {e}; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
         finally:
             probe.unlink(missing_ok=True)
         return False
@@ -2222,11 +2225,23 @@ class Pipeline:
         When the output CRS differs, the work-CRS rasters are renamed to
         intermediates and reprojected through _reproject_band.
         """
+        # Staging names (issue #40): the finals (value.tif / support_km.tif)
+        # are only ever published via os.replace() on success, so a mid-write
+        # crash leaves .tmp / _tmp files instead of truncating them.
+        ftmp_v = Path(self.out_dir) / (vpath.name + ".tmp")
+        ftmp_s = Path(self.out_dir) / (spath.name + ".tmp")
+        if self.out_crs != self.work_crs:
+            wtmp_v = Path(self.out_dir) / "_value_tmp.tif"
+            wtmp_s = Path(self.out_dir) / "_support_tmp.tif"
+        else:
+            wtmp_v, wtmp_s = ftmp_v, ftmp_s
         partial = False
         try:
+            for p in (wtmp_v, wtmp_s, ftmp_v, ftmp_s):
+                p.unlink(missing_ok=True)  # never follow a pre-planted symlink (issue #15)
             with (
-                rasterio.open(vpath, "w", **vprof) as vd,
-                rasterio.open(spath, "w", **sprof) as sd,
+                rasterio.open(wtmp_v, "w", **vprof) as vd,
+                rasterio.open(wtmp_s, "w", **sprof) as sd,
             ):
                 vd.update_tags(**vtags)
                 vd.scales = (1.0 / self.scale,)
@@ -2266,31 +2281,11 @@ class Pipeline:
                             vq, rq = out
                             vd.write(vq.T[::-1, :], 1, window=w)
                             sd.write(rq.T[::-1, :], 1, window=w)
-        except BaseException:
-            # Mid-run failure (worker error, OOM, disk full): the rasters on
-            # disk are partial. Warn so nobody consumes them (issue #15).
-            partial = True
-            raise
-        finally:
-            self._remove_run_temps()
-            if partial:
-                print(  # ruff: ignore[print]
-                    f"warning: run failed; output rasters are partial: {vpath}, {spath}",
-                    file=sys.stderr,
-                )
-
-        if self.out_crs != self.work_crs:
-            tmp_v = Path(self.out_dir) / "_value_tmp.tif"
-            tmp_s = Path(self.out_dir) / "_support_tmp.tif"
-            tmp_v.unlink(missing_ok=True)  # never follow a pre-planted symlink (issue #15)
-            tmp_s.unlink(missing_ok=True)
-            vpath.rename(tmp_v)
-            spath.rename(tmp_s)
-            try:
+            if self.out_crs != self.work_crs:
                 # Both bands share the same work-CRS source grid (identical
                 # bounds/size), so the output grid is identical too: compute
                 # the default transform once instead of per band.
-                with rasterio.open(tmp_v) as grid_src:
+                with rasterio.open(wtmp_v) as grid_src:
                     dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
                         grid_src.crs,
                         f"EPSG:{self.out_crs}",
@@ -2302,8 +2297,8 @@ class Pipeline:
                 out_crs = f"EPSG:{self.out_crs}"
                 with _prof.phase("write.reproj_value"):
                     _reproject_band(
-                        str(tmp_v),
-                        str(vpath),
+                        str(wtmp_v),
+                        str(ftmp_v),
                         vprof,
                         out_crs,
                         dst_transform,
@@ -2313,8 +2308,8 @@ class Pipeline:
                     )
                 with _prof.phase("write.reproj_support"):
                     _reproject_band(
-                        str(tmp_s),
-                        str(spath),
+                        str(wtmp_s),
+                        str(ftmp_s),
                         sprof,
                         out_crs,
                         dst_transform,
@@ -2322,16 +2317,26 @@ class Pipeline:
                         dst_height,
                         n_threads=self.n_threads,
                     )
-            except Exception:
-                if tmp_v.exists():
-                    tmp_v.rename(vpath)
-                if tmp_s.exists():
-                    tmp_s.rename(spath)
-                raise
-            if tmp_v.exists():
-                tmp_v.unlink()
-            if tmp_s.exists():
-                tmp_s.unlink()
+            # Publish: the finals only ever change via atomic rename.
+            ftmp_v.replace(vpath)
+            ftmp_s.replace(spath)
+            if wtmp_v is not ftmp_v:
+                wtmp_v.unlink(missing_ok=True)
+                wtmp_s.unlink(missing_ok=True)
+        except BaseException:
+            # Mid-run failure (worker error, OOM, disk full): the finals were
+            # not reached (os.replace is last). Warn so nobody consumes an
+            # earlier run's files as this run's output (issues #15, #40).
+            partial = True
+            raise
+        finally:
+            self._remove_run_temps()
+            if partial:
+                print(  # ruff: ignore[print]
+                    f"warning: run failed during write; {vpath}, {spath} were not fully written "
+                    "(any existing files are from an earlier run, left untouched)",
+                    file=sys.stderr,
+                )
 
     def _write_rasters_turbo(
         self,
@@ -2371,6 +2376,13 @@ class Pipeline:
             self._write_rasters_serial(vprof, sprof, vpath, spath, vtags, stags)
             return
 
+        # Staging names (issue #40): the finals are only ever published via
+        # os.replace() on success, so a mid-write crash leaves .tmp files
+        # instead of truncating value.tif / support_km.tif.
+        ftmp_v = Path(self.out_dir) / (vpath.name + ".tmp")
+        ftmp_s = Path(self.out_dir) / (spath.name + ".tmp")
+        out_dir = Path(self.out_dir)
+
         partial = False
         try:
             with _prof.phase("write.dnfill"):
@@ -2380,12 +2392,8 @@ class Pipeline:
                 # 3 GB fields (30 s/warp block observed vs 0.35 s resident).
                 # tmpfs pages reclaim as clean file cache; a re-fault is a
                 # tmpfs read, never swap I/O.
-                val_dn = np.memmap(
-                    Path(self.out_dir) / "_val_dn.npy", dtype=np.int16, shape=(self.ny, self.nx), mode="w+"
-                )
-                sup_dn = np.memmap(
-                    Path(self.out_dir) / "_sup_dn.npy", dtype=np.int16, shape=(self.ny, self.nx), mode="w+"
-                )
+                val_dn = _open_fresh_memmap(Path(self.out_dir) / "_val_dn.npy", np.int16, (self.ny, self.nx))
+                sup_dn = _open_fresh_memmap(Path(self.out_dir) / "_sup_dn.npy", np.int16, (self.ny, self.nx))
                 _nohuge(val_dn, sup_dn)
                 val_dn.fill(NODATA)
                 sup_dn.fill(NODATA)
@@ -2416,39 +2424,36 @@ class Pipeline:
                     # before the reproject/write (val/sup f32 + near bool,
                     # ~13.7 GB at full-AU scale) (issue #39).
                     cfg.val_full = cfg.sup_full = cfg.near_full = None
-        finally:
+            # Same position as before the restructure: the DN fields are
+            # still open memmaps (the inode outlives the unlink), but the
+            # tmpfs space is freed while the write phase runs.
             self._remove_run_temps()
-            if partial:
-                print(  # ruff: ignore[print]
-                    f"warning: run failed; output rasters are partial: {vpath}, {spath}",
-                    file=sys.stderr,
-                )
 
-        # Both bands share the same work-CRS source grid (identical
-        # bounds/size), so the output grid is identical too: compute the
-        # default transform once instead of per band.
-        work_crs = f"EPSG:{self.work_crs}"
-        out_crs = f"EPSG:{self.out_crs}"
-        dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
-            work_crs,
-            out_crs,
-            self.nx,
-            self.ny,
-            self.x0,
-            self.y0,
-            self.x0 + self.nx * self.res,
-            self.y0 + self.ny * self.res,
-        )
-        # Budgeted MT thread count from the turbo plan drives the warp pool;
-        # the n_threads kwarg stays the explicit non-turbo knob.
-        warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
-        out_dir = Path(self.out_dir)
-        with _prof.phase("write.oracle"):
-            cpl = self._turbo_zstd_ok()
-        try:
+            # Both bands share the same work-CRS source grid (identical
+            # bounds/size), so the output grid is identical too: compute the
+            # default transform once instead of per band.
+            work_crs = f"EPSG:{self.work_crs}"
+            out_crs = f"EPSG:{self.out_crs}"
+            dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
+                work_crs,
+                out_crs,
+                self.nx,
+                self.ny,
+                self.x0,
+                self.y0,
+                self.x0 + self.nx * self.res,
+                self.y0 + self.ny * self.res,
+            )
+            # Budgeted MT thread count from the turbo plan drives the warp pool;
+            # the n_threads kwarg stays the explicit non-turbo knob.
+            warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
+            with _prof.phase("write.oracle"):
+                cpl = self._turbo_zstd_ok()
+            for p in (ftmp_v, ftmp_s):
+                p.unlink(missing_ok=True)  # never follow a pre-planted symlink (issue #15)
             for band, arr, prof, path, tags, scales in (
-                ("value", val_dn, vprof, vpath, vtags, (1.0 / self.scale,)),
-                ("support", sup_dn, sprof, spath, stags, (1.0,)),
+                ("value", val_dn, vprof, ftmp_v, vtags, (1.0 / self.scale,)),
+                ("support", sup_dn, sprof, ftmp_s, stags, (1.0,)),
             ):
                 with _prof.phase(f"write.reproj_{band}"):
                     wrote = False
@@ -2510,9 +2515,25 @@ class Pipeline:
                             offsets=(0.0,),
                             n_threads=warp_threads,
                         )
+            # Publish: the finals only ever change via atomic rename.
+            ftmp_v.replace(vpath)
+            ftmp_s.replace(spath)
+        except BaseException:
+            # Mid-run failure (worker error, OOM, disk full): the finals were
+            # not reached (os.replace is last). Warn so nobody consumes an
+            # earlier run's files as this run's output (issues #15, #40).
+            partial = True
+            raise
         finally:
+            self._remove_run_temps()
             for p in out_dir.glob("_stock_scratch_*.tif"):
                 p.unlink(missing_ok=True)
+            if partial:
+                print(  # ruff: ignore[print]
+                    f"warning: run failed during write; {vpath}, {spath} were not fully written "
+                    "(any existing files are from an earlier run, left untouched)",
+                    file=sys.stderr,
+                )
 
 
 def run(
@@ -2615,7 +2636,9 @@ def main(argv: list[str] | None = None) -> None:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
 
     Raises:
-        SystemExit: On invalid arguments or a pipeline error (exit code 2).
+        SystemExit: exit 1 for pipeline/IO errors (`_die`), exit 2 for
+        value validation errors, exit 3 for `--turbo-strict` shared-path
+        infeasibility.
 
     """
     parser = _build_parser()
@@ -2656,47 +2679,57 @@ def main(argv: list[str] | None = None) -> None:
     except OSError as e:
         _die(f"cannot create output directory {args.out}: {e}")
     try:
-        run(
-            args.input,
-            args.value_col,
-            args.lng_col,
-            args.lat_col,
-            args.out,
-            res=args.res,
-            cap_km=args.cap_km,
-            transform=args.transform,
-            saturation=args.saturation,
-            block_size=args.block,
-            workers=args.workers,
-            calib_path=args.calibration,
-            scale=args.scale,
-            percentile_step=args.percentile_step,
-            compress=args.compress,
-            calib_max_points=args.calib_max_points,
-            src_crs=args.src_crs,
-            work_crs=args.work_crs,
-            out_crs=args.out_crs,
-            skip_calibration=args.skip_calibration,
-            turbo=turbo,
-            turbo_cap_gb=turbo_cap_gb,
-            turbo_strict=args.turbo_strict,
-        )
-    except CRSError as e:
-        # Invalid --src-crs / --work-crs / --out-crs (proj_create failure).
-        _die(str(e))
-    except ImportError as e:
-        # e.g. parquet input without the optional pyarrow extra.
-        _die(str(e))
-    except FileNotFoundError as e:
-        _die(f"input file not found: {e.filename or args.input}")
-    except pd.errors.ParserError as e:
-        _die(f"malformed input file: {e}")
-    except (KeyError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
-        raise SystemExit(2) from None
-    except OSError as e:
-        # NotADirectoryError, disk full, etc.
-        _die(str(e))
+        try:
+            run(
+                args.input,
+                args.value_col,
+                args.lng_col,
+                args.lat_col,
+                args.out,
+                res=args.res,
+                cap_km=args.cap_km,
+                transform=args.transform,
+                saturation=args.saturation,
+                block_size=args.block,
+                workers=args.workers,
+                calib_path=args.calibration,
+                scale=args.scale,
+                percentile_step=args.percentile_step,
+                compress=args.compress,
+                calib_max_points=args.calib_max_points,
+                src_crs=args.src_crs,
+                work_crs=args.work_crs,
+                out_crs=args.out_crs,
+                skip_calibration=args.skip_calibration,
+                turbo=turbo,
+                turbo_cap_gb=turbo_cap_gb,
+                turbo_strict=args.turbo_strict,
+            )
+        except CRSError as e:
+            # Invalid --src-crs / --work-crs / --out-crs (proj_create failure).
+            _die(str(e))
+        except ImportError as e:
+            # e.g. parquet input without the optional pyarrow extra.
+            _die(str(e))
+        except FileNotFoundError as e:
+            _die(f"input file not found: {e.filename or args.input}")
+        except pd.errors.ParserError as e:
+            _die(f"malformed input file: {e}")
+        except (KeyError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
+            raise SystemExit(2) from None
+        except OSError as e:
+            # NotADirectoryError, disk full, etc.
+            _die(str(e))
+    except SystemExit as e:
+        # Any non-zero exit with an earlier run's rasters in place: warn
+        # instead of staying silent (issue #40).
+        if e.code not in (0, None):
+            _warn_stale_outputs(out)
+        raise
+    except BaseException:
+        _warn_stale_outputs(out)
+        raise
 
 
 if __name__ == "__main__":
