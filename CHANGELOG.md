@@ -2,8 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
-- Performance (sparse output, low-RAM scope): `_reproject_band` skips the reproject warp for coarse output tiles whose work-CRS source footprint (conservatively rounded out) intersects no task block, writing a plain NoData buffer instead — RAM-free, and a no-op when no tile is skippable (the auto-cap case). `_descent_banded` row-bands within a level now run on a thread pool (levels stay sequential): bit-identical output, `--max-band-parallel` flag (default `min(workers, nbands, 8)`), and a per-level `/proc/meminfo` gate that falls back to single-threaded when available RAM is below peak RSS plus two bands of float32 buffers.
+## [0.4.0] - 2026-10-08
+- Performance (sparse output, low-RAM scope): `_reproject_band` skips the reproject warp for coarse output tiles whose work-CRS source footprint (conservatively rounded out) intersects no task block, writing a plain NoData buffer instead — RAM-free, and a no-op when no tile is skippable (the auto-cap case). The skip is guarded end-to-end against a no-skip reference with vertically asymmetric tasks (bit-identical; `tests/test_reproject_skip.py`). `_descent_banded` row-bands within a level now run on a thread pool (levels stay sequential): bit-identical output, `--max-band-parallel` flag (default `min(workers, nbands, 8)`), and a per-level `/proc/meminfo` gate that falls back to single-threaded when available RAM is below peak RSS plus two bands of float32 buffers.
+- Write-path hardening (production polish round):
+  - Atomic finals: `value.tif`/`support_km.tif` publish only via `.tif.tmp` rename (serial + turbo) — a mid-write crash leaves the previous run's finals byte-identical and warns (#40).
+  - Stale-output warning on any non-zero exit over pre-existing rasters in the out dir; reviewer repro pinned as a test (#40).
+  - All 4 unguarded `w+` memmap sites routed through `_open_fresh_memmap` (new shared `ppgrid/_tempfiles.py`) (#45).
+  - `_pull_push_descent` `_band_bufs` off-by-one for odd `band_rows` (+4 -> +5) with bit-exact MT regression test (#41).
+  - Dead `downsample_sum(out=)` parameter removed (#43).
+  - ZSTD oracle mismatch warning unambiguous ("bytes differ at tile N"), names the stock PARALLEL writer as the fallback.
+- CI: PRs on a pinned 3.11-3.14 matrix (ubuntu-latest); main single leg; publish.yml guard — release tag must match pyproject version before upload; `workflow_dispatch` dry_run input -> `uv publish --dry-run`.
+- Tests: 176 -> 190 (stale/mid-write/odd-band regressions + low-RAM bit-identity guards incl. the end-to-end asymmetric-tasks repro).
 
 ## [0.3.0] - 2026-10-08
 - Full-AU (16M points, `--res 100`): 30:45 (quiet) to 50:46 (loaded) with the same pre-PR turbo code, load-dependent -> 2:33 wall time (~12-20x) with sha256-identical outputs (marzuki-hydrogen, `--turbo 64`, regime A).
