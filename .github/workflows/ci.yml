@@ -7,12 +7,38 @@ on:
     branches: [main]
 
 jobs:
+  # PRs: full interpreter sweep on GitHub-hosted runners, pinned versions
+  # (requires-python >=3.11, classifiers 3.11-3.14; review m6).
   test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --all-extras --locked
+      - run: uv run --extra dev ruff check .
+      - run: uv run --extra dev ruff format --check .
+      - run: uv run pytest
+
+  # Pushes to main: GitHub-hosted, single leg (review m6: matrix is PR-only).
+  # 2026-10-08: was runs-on 'nf' — that label points at the
+  # nestfinderau/nestfinder REPO runners (label 'nestfinder-ci'); nothing
+  # named 'nf' is registered on the marzukia account, so the first main
+  # push (#39 merge) queued 9.5h starved. Wire real self-hosted runners
+  # to this account before switching back.
+  test-main:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: uv sync --all-extras
+      - run: uv sync --all-extras --locked
       - run: uv run --extra dev ruff check .
       - run: uv run --extra dev ruff format --check .
       - run: uv run pytest

@@ -1,6 +1,6 @@
 [project]
 name = "ppgrid"
-version = "0.2.2"
+version = "0.3.0"
 description = "Fast continent-scale raster interpolation for scattered point data using pull-push mipmap algorithms. Turns millions of geolocated points into gapless GeoTIFF in minutes. No GPU required."
 readme = "README.md"
 license = "MIT"
@@ -92,6 +92,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
+# tests/fixtures/*.py are runnable fixture generators; prints are the output.
+"tests/fixtures/*.py" = [
+    "INP001",     # implicit namespace package (script dir)
+    "T201",       # print (generator output)
+]
 # bench/*.py are local perf/repro harnesses (not shipped); relax style rules.
 "bench/*.py" = [
     "INP001",     # implicit namespace package (script dir)
@@ -108,18 +113,26 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# rasterio's MemoryDataset (reproject's ndarray destination) warns NotGeoreferencedWarning
+# on the initial transform read of the MEM::: dataset, then sets the real transform.
+# pipeline.py ignores the category at import, but pytest's per-test
+# warnings.catch_warnings + simplefilter wipes module filters, so restate it here.
+filterwarnings = ["ignore:Dataset has no geotransform:UserWarning"]
 
 [tool.hatch.build]
 # Keep the sdist slim: generated rasters/images are committed for GitHub
 # (the README references them via absolute raw URLs) but do not ship in the
 # package. Regenerate locally with examples/run_melb.py. data/all_equakes.csv
-# (8.3 MB, public-domain sample) is excluded; data/melb_houses.csv (384 KB) ships.
+# (8.3 MB, public-domain sample) and data/au_gcc_sparse.csv (53 MB, full-AU
+# generated point set) are excluded; data/melb_houses.csv (384 KB) ships.
 exclude = [
     "data/all_equakes.csv",
+    "data/au_gcc_sparse.csv",
     "examples/*.jpg",
     "examples/*.png",
     "examples/equakes/**",
     "examples/melb/**",
+    "tests/fixtures/**",
 ]
 
 [tool.hatch.build.targets.wheel]

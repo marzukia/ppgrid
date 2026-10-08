@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check the upload, but do not publish"
+        type: boolean
+        default: false
 
 jobs:
   publish:
@@ -11,5 +16,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+      - run: uv sync --locked -q
+      # Fail fast when a release tag does not match the pyproject version
+      # (before: an opaque uv publish "File already exists", or a
+      # workflow_dispatch publishing whatever version is checked out).
+      - name: Guard release tag matches pyproject version
+        if: github.event_name == 'release'
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          ver=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "$TAG_NAME" != "v$ver" ]; then
+            echo "::error::release tag '$TAG_NAME' does not match pyproject version '$ver' (expected 'v$ver'); aborting before upload"
+            exit 1
+          fi
+          echo "release tag $TAG_NAME matches pyproject version $ver"
       - run: uv build
-      - run: uv publish --token ${{ secrets.PYPI_TOKEN }}
+      - name: Publish
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            uv publish --dry-run --token ${{ secrets.PYPI_TOKEN }}
+          else
+            uv publish --token ${{ secrets.PYPI_TOKEN }}
+          fi
