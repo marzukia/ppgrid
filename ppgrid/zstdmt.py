@@ -16,8 +16,9 @@ This module does not write the raster. It:
 * provides the calibration oracle (design doc A.7): compress one tile the
   way the turbo path would and byte-compare it against the tile bytes
   actually stored in a raster written by the stock GDAL path. On mismatch
-  the caller writes serially with the stock path; the byte delta is the
-  version-drift signal for libtiff/libzstd upgrades.
+  the caller writes with the stock path (parallel; the serial per-band
+  write is the last resort); the byte delta is the version-drift signal
+  for libtiff/libzstd upgrades.
 
 Byte-identity note (measured 2026-10-06, GDAL 3.12.4, libtiff 6.2,
 libzstd 1.5.7, rasterio 1.5.1): the stock GTiff path compresses through
@@ -26,7 +27,7 @@ size in the header) while the CPL pfn uses ZSTD_compress2 at the registry
 default level 13 (frame carries a content size field and a different
 window descriptor). Frames therefore do not compare byte-equal on a
 512px tile in this stack, and the oracle reports mismatch: the designed
-serial-fallback signal.
+stock-fallback signal.
 """
 
 from __future__ import annotations
@@ -92,7 +93,8 @@ class OracleVerdict:
     ok=True means the turbo-compressed bytes are byte-equal to the bytes
     the stock GDAL path stored, so a turbo write of that tile reproduces
     the stock file exactly. ok=False means the caller must write that
-    tile (and every tile) serially with the stock path.
+    tile (and every tile) with the stock path (parallel; the serial
+    per-band write is the last resort).
     """
 
     ok: bool
@@ -587,6 +589,6 @@ def oracle_check(
         return OracleVerdict(ok=True, turbo_size=len(turbo), stock_size=len(stock), detail=detail)
     detail = (
         f"zstd oracle mismatch: turbo {len(turbo)} B != stock {len(stock)} B (tile {tile}); "
-        "write serially with the stock path"
+        "write with the stock path (parallel; serial per-band write is the last resort)"
     )
     return OracleVerdict(ok=False, turbo_size=len(turbo), stock_size=len(stock), detail=detail)

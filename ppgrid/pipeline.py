@@ -1931,10 +1931,12 @@ class Pipeline:
         Writes one deterministic 512^2 int16 tile with the stock codec
         settings, then asks zstdmt whether the turbo-compressed frame is
         byte-equal to the bytes GDAL stored. Mismatch (or unavailable) ->
-        False: the serial GDAL write is byte-exact by construction.
+        False: the caller writes with the stock-codec parallel path
+        (_turbo_write_stock_parallel); the serial per-band write runs only if
+        that writer's layout guards fail. Either way the output is byte-exact.
         """
         if not zstdmt.available():
-            print("[warn] turbo zstd oracle: CPL zstd unavailable; serial write", file=sys.stderr)  # ruff: ignore[print]
+            print("[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
             return False
         # Deterministic compressible content: both axes differ to small
         # values, so predictor 2 output is near-zero structured data.
@@ -1966,8 +1968,8 @@ class Pipeline:
             if verdict.ok:
                 return True
             print(f"[warn] {verdict.detail}", file=sys.stderr)  # ruff: ignore[print]
-        except Exception as e:  # ruff: ignore[blind-except] - any probe failure means "serial"
-            print(f"[warn] turbo zstd oracle: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        except Exception as e:  # ruff: ignore[blind-except] - any probe failure means the stock parallel writer runs
+            print(f"[warn] turbo zstd oracle: {e}; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
         finally:
             probe.unlink(missing_ok=True)
         return False
@@ -2615,7 +2617,9 @@ def main(argv: list[str] | None = None) -> None:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
 
     Raises:
-        SystemExit: On invalid arguments or a pipeline error (exit code 2).
+        SystemExit: exit 1 for pipeline/IO errors (`_die`), exit 2 for
+        value validation errors, exit 3 for `--turbo-strict` shared-path
+        infeasibility.
 
     """
     parser = _build_parser()
