@@ -12,7 +12,7 @@ not downstream calculation).
 
 - Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.pipeline:main`; `ppgrid.idwgrid` is a back-compat shim).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
-- Tests: `uv run pytest` (176 tests). Lint/format: `ruff` (line-length 120).
+- Tests: `uv run pytest` (190 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
@@ -80,6 +80,14 @@ not downstream calculation).
   git push "https://x-access-token:${PAT}@github.com/marzukia/ppgrid" <branch>
   ```
 - Branches go to a PR, not main, per the fleet merge gate.
+
+## What changed recently (2026-10-08, sparse-output branch reconciled onto main post-#50)
+
+- PR #27 (`sparse-output-lowram`) merged `origin/main` (0.3.0, turbo) and reconciled: **main's turbo behaviour is the baseline; #27's low-RAM optimisations layer on top.**
+  - `_reproject_band` gained `task_info` (work-grid block geometry + populated-block set from `grid()`): a coarse 2048px dst tile whose source footprint intersects no task block is written as a plain NoData buffer without a GDAL warp (conservative round-out, so never a false empty). File-source serial reproject only; the turbo array reproject (`_reproject_band_array`) is untouched.
+  - `_descent_banded` (main's structure: `_thread_bands` + `_descent_band_body` per-thread buffers) gained the #27 per-level RAM gate: pool clamped to `min(n_threads, nbands, 8)`, and single-thread when `/proc/meminfo` MemAvailable < peak RSS + two bands of f32 buffers. `nworkers` is an alias of `n_threads` (both test suites call it).
+  - Non-turbo (low-RAM) shared descent is now parallel by design: `--max-band-parallel` caps the pool, default `workers` (main's baseline for this path was serial `n_threads = 1`). Turbo regime A still never calls `_descent_banded` (full in-RAM descent) — unchanged.
+  - Bit-identity holds at every thread count (S3 guarantee; `tests/test_pullpush_mt.py` + the #27 bit-identical/pool/RAM-gate tests all green). 180 (main) + 10 (#27) = 190 tests.
 
 ## What changed recently (2026-10-06→08, turbo speed passes 2/3 + 0.3.0 release)
 

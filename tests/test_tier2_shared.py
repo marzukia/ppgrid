@@ -8,6 +8,7 @@
 """
 
 from pathlib import Path
+from typing import Self
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,7 @@ from rasterio.windows import Window
 from ppgrid.pipeline import M_PER_KM, NODATA, PTS_TV, PTS_X, PTS_Y, Pipeline, _block_points, _quantize
 from ppgrid.pullpush import (
     _descent_banded,
+    _mem_available_bytes,
     _pull_push_descent,
     bin_points,
     bin_points_banded,
@@ -277,3 +279,121 @@ def test_perbox_after_shared_no_stale_ctx(tmp_path: Path, monkeypatch: pytest.Mo
     # and corrupt this raster; per-box must be identical in both orders.
     assert np.array_equal(vb_after_small, vb_alone)
     assert (vb_alone != NODATA).sum() > 1000, "expected real content, got empty raster"
+
+
+# --- banded descent: parallel row-bands --------------------------------------
+
+
+def _band_fixture(nx: int = 1400, ny: int = 2400) -> dict:
+    """Return a random 4-level pyramid (levels 0..3) for _descent_banded tests."""
+    import math
+
+    rng = np.random.default_rng(42)
+    n0 = 1 << math.ceil(math.log2(max(2, nx)))
+    m0 = 1 << math.ceil(math.log2(max(2, ny)))
+    sums: list[np.ndarray] = []
+    counts: list[np.ndarray] = []
+    for k in range(4):
+        h, w = m0 >> k, n0 >> k
+        sums.append(rng.uniform(0.0, 5.0, size=(h, w)).astype(np.float32))
+        counts.append(rng.integers(0, 8, size=(h, w)).astype(np.float32))
+    return {"sums": sums, "counts": counts, "res": 10.0, "n0": n0, "m0": m0}
+
+
+def _run_banded(fx: dict, nworkers: int, level_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Run _descent_banded levels 3..0 into fresh out arrays and return them."""
+    level_dir.mkdir(parents=True, exist_ok=True)
+    out_val = np.zeros((fx["m0"], fx["n0"]), dtype=np.float32)
+    out_sup = np.zeros((fx["m0"], fx["n0"]), dtype=np.float32)
+    _descent_banded(
+        fx["sums"],
+        fx["counts"],
+        fx["res"],
+        saturation=16.0,
+        start_level=3,
+        val_in=fx["sums"][3],
+        sup_in=fx["counts"][3],
+        out_val=out_val,
+        out_sup=out_sup,
+        level_dir=level_dir,
+        nworkers=nworkers,
+    )
+    return out_val, out_sup
+
+
+def test_descent_banded_parallel_bitidentical(tmp_path: Path) -> None:
+    """nworkers=1 vs 4 vs 8 give bit-identical level-0 output (multi-band)."""
+    fx = _band_fixture()
+    a1, s1 = _run_banded(fx, 1, tmp_path / "w1")
+    a4, s4 = _run_banded(fx, 4, tmp_path / "w4")
+    a8, s8 = _run_banded(fx, 8, tmp_path / "w8")
+    assert np.array_equal(a1, a4)
+    assert np.array_equal(a1, a8)
+    assert np.array_equal(s1, s4)
+    assert np.array_equal(s1, s8)
+
+
+def test_descent_banded_ram_gate_falls_back_to_single_thread(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ~0 available RAM the levels run single-threaded (no pool) and stay correct."""
+    import ppgrid.pullpush as pp
+
+    fx = _band_fixture()
+    monkeypatch.setattr(pp, "_mem_available_bytes", lambda: 0)
+    used: list[int] = []
+
+    class _RecordingPool(pp.ThreadPoolExecutor):
+        def __init__(self, *a: int, **kw: int) -> None:
+            used.append(1)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(pp, "ThreadPoolExecutor", _RecordingPool)
+    out_val, out_sup = _run_banded(fx, 8, tmp_path / "gate")
+    assert used == []  # RAM gate dropped every level to nworkers=1
+    ref_val, ref_sup = _run_banded(fx, 1, tmp_path / "ref")
+    assert np.array_equal(out_val, ref_val)
+    assert np.array_equal(out_sup, ref_sup)
+
+
+def test_descent_banded_uses_pool_when_ram_is_plentiful(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With abundant RAM, every multi-band level runs on a bounded pool."""
+    import ppgrid.pullpush as pp
+
+    fx = _band_fixture()
+    monkeypatch.setattr(pp, "_mem_available_bytes", lambda: 1 << 60)
+    monkeypatch.setattr(pp, "_peak_rss_bytes", lambda: 1 << 30)
+    used: list = []
+
+    class _RecordingPool(pp.ThreadPoolExecutor):
+        def __init__(self, *a: int, **kw: int) -> None:
+            used.append(kw.get("max_workers", a[0] if a else None))
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(pp, "ThreadPoolExecutor", _RecordingPool)
+    _run_banded(fx, 4, tmp_path / "pool")
+    # 3 descent levels: level-2 out has 1 band (sequential), levels 1 and 0 use a pool.
+    assert used == [2, 4]
+
+
+def test_mem_available_bytes_parses_meminfo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_mem_available_bytes reads MemAvailable from /proc/meminfo (kB -> bytes)."""
+    import ppgrid.pullpush as pp
+
+    class _FakeFile:
+        def __init__(self, text: str) -> None:
+            self._lines = text.splitlines(keepends=True)
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *a: object) -> bool:
+            return False
+
+        def __iter__(self) -> object:
+            return iter(self._lines)
+
+        def open(self, *_a: object, **_kw: object) -> Self:
+            return self
+
+    content = "MemTotal:       65536 kB\nMemAvailable:     12345 kB\nBuffers:          1 kB\n"
+    monkeypatch.setattr(pp, "Path", lambda _name: _FakeFile(content), raising=False)
+    assert _mem_available_bytes() == 12345 * 1024
