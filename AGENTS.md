@@ -81,6 +81,20 @@ not downstream calculation).
   ```
 - Branches go to a PR, not main, per the fleet merge gate.
 
+## What changed recently (2026-10-06→08, turbo speed passes 2/3 + 0.3.0 release)
+
+- **Speed passes 2/3 (0a6fe90 + 941f4e5, both in the #39 merge history): full-AU 50:46 → 2:33, byte-identical** (regime A, `--turbo 64`, 43 GB; per-box 8.5 GB: 3:20; all outputs sha256-identical to the serial anchors). Pass 2 (0a6fe90) is the dnfill/write-path base; pass 3 (941f4e5) hit the wall target.
+  - Regime A keeps the shared full fields + quantised DN fields on tmpfs memmaps (reclaimable clean file cache) instead of anon RAM; `_pull_push_descent(out_val=/out_sup=)` writes the final descent level straight into the shared fields (bit-exact, threaded and serial branches).
+  - Parallel stock writer (`_turbo_write_stock_parallel`): fixed three silent serial-fallback bugs — TID scratch collision (`get_ident() & 0xFFFF`), block-major vs global 512 raster-scan tile order (608 vs 616 tiles), 3 GB zero-placeholder reference head (now one 512² tile).
+  - Reproject: one no-copy `MemoryDataset(copy=False)` + MultiBand tuple form, shared read-only across warp threads (rasterio's ndarray form copied 3.1 GB per warp call per thread; 8 in-flight copies OOM-killed the run).
+  - `_quantize` in-place (same IEEE ops/order, bit-identical), per-thread f32/f64 scratch, owned int16 outputs (the shared thread-local scratch raced the `ex.map` prefetch and corrupted ~10% of blocks).
+  - Support-blend fix: `om` buffer reused across blends — computed `(1-a)*pv*ps` instead of `(1-a)*ps`. Correctness fix on the default multi-level path: `support_km.tif` for multi-level grids may differ vs 0.2.2 (now correct), `value.tif` unaffected.
+  - `MADV_NOHUGEPAGE` on large fresh arrays (THP=always + sync defrag made first-touch faults 20-40 us/page).
+  - Known state: on this GDAL stack the zstd oracle mismatches libtiff streaming, so turbo runs take the byte-exact stock-parallel write fallback; the parallel ZSTD path is unit-tested and activates where the stack matches.
+- **Budget semantics (measured):** `--ram-gb` caps the shared-field budget, NOT process RSS — regime-C runs peaked at 39.4 GB under a 20 GB budget (write/descent buffers sit outside Bt sizing). per_box is the only genuine low-RAM mode.
+- **0.3.0 released 2026-10-08** (tag v0.3.0 @ f9e0380): CHANGELOG consolidated into one [0.3.0] entry; release notes live on the GitHub release; `publish.yml` publishes to PyPI on `release: published`. Issues #29-#33 closed as landed in #39.
+- Review findings from the #39 adversarial review are filed as #40-#45 (all minor, post-release): stale-output warning gap (#40), odd `band_rows` off-by-one (#41), `_turbo_zstd_ok` docstring (#42), dead `downsample_sum(out=)` param (#43), WIP-labelled 0a6fe90 in history (#44), DN temp-file hygiene vs `_open_fresh_memmap` guard (#45).
+
 ## What changed recently (2026-10-07, PR #39 review fixes: M-1..M-3, Y-1)
 
 - M-1: equakes anchors regenerated under the rasterio 1.5.1 lock (the committed
