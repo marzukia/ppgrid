@@ -12,7 +12,7 @@ not downstream calculation).
 
 - Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.pipeline:main`; `ppgrid.idwgrid` is a back-compat shim).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
-- Tests: `uv run pytest` (93 tests). Lint/format: `ruff` (line-length 120).
+- Tests: `uv run pytest` (176 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
@@ -128,7 +128,7 @@ not downstream calculation).
 
 - CLI: `--turbo` (optional preset `16|32|64|128`; bare = auto cap), `--max-ram <GB>` (implies turbo), `--ram-gb` (alias of `--max-ram`), `--turbo-strict`. Pre-check after `grid()` prints cap/budget/regime used; shared infeasible (per-box regime) -> strict: stderr error + exit 3, else `[warn]` + continue on per-box with turbo warp/write (exit 0, correct output).
 - `_write_rasters` turbo path: no work-CRS intermediate files. Quantised int16 DN fields stay in RAM (budget-gated: `nx*ny*4 > budget//2` -> file-based reproject path with MT warp) and are reprojected tile-by-tile through the same GDAL warp kernel as the serial path (`_reproject_band_array`; same 2048px tiles, same 512px serial flush, same metadata) -> byte-identical output, sha256-tested.
-- Parallel per-tile ZSTD (`_turbo_write_parallel`): GDAL zero-filled reference head serialises the exact IFD/tag layout; the pipeline patches TileOffsets/TileByteCounts + oracle-verified zstd frames. Oracle mismatch (e.g. CPL zstd pfn vs libtiff streaming params differ on a stack) -> serial GDAL write, byte-exact.
+- Parallel per-tile ZSTD (`_turbo_write_parallel`): GDAL zero-filled reference head serialises the exact IFD/tag layout; the pipeline patches TileOffsets/TileByteCounts + oracle-verified zstd frames. Oracle mismatch (e.g. CPL zstd pfn vs libtiff streaming params differ on a stack) -> byte-exact stock-codec parallel write (the serial per-band write is the last resort only if that writer's layout guards fail).
 - Budget-derived shared cap (S3.3): turbo mode derives the cells cap from `Bt = 0.85*C - 4 GB`; non-turbo keeps `_SHARED_MAX_CELLS = 2.5e8`; the `1e8` in-RAM/memmap tier is unchanged.
 - `_prepare_shared` / `box_count_banded` run threaded under the budgeted worker count when turbo (`plan.workers`); `n_threads == 1` keeps the exact serial path (A8).
 - `turbop._read_cgroup_max_gb` fixed: walks the process cgroup hierarchy to the root and takes the smallest finite `memory.max` (a slice limit above the service cgroup binds). Previously only the root cgroup was read, so a memory-capped user slice saw full physical RAM and auto `--turbo` could plan a regime that OOMs the slice.
