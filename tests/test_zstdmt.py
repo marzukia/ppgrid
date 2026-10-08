@@ -197,7 +197,7 @@ def test_oracle_real_cpl_pfn_consistent_with_byte_comparison() -> None:
 
     On the current stack (GDAL 3.12.4 / libtiff 6.2 / libzstd 1.5.7) the
     CPL pfn frames differ from the libtiff streaming frames, so the oracle
-    reports mismatch: the designed serial-fallback signal.
+    reports mismatch: the designed stock-fallback signal.
     """
     info = zstdmt._tif_info(FIXTURE)  # ruff: ignore[private-member-access]
     stock = info.tile_bytes[0]
