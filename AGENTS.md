@@ -12,7 +12,7 @@ not downstream calculation).
 
 - Python 3.11+, `uv` managed. Entry point `ppgrid` (`ppgrid.pipeline:main`; `ppgrid.idwgrid` is a back-compat shim).
 - Deps: numpy, pandas, pyproj, rasterio. Optional `[parquet]` (pyarrow).
-- Tests: `uv run pytest` (93 tests). Lint/format: `ruff` (line-length 120).
+- Tests: `uv run pytest` (176 tests). Lint/format: `ruff` (line-length 120).
 
 ## Repo layout
 
@@ -81,6 +81,20 @@ not downstream calculation).
   ```
 - Branches go to a PR, not main, per the fleet merge gate.
 
+## What changed recently (2026-10-06→08, turbo speed passes 2/3 + 0.3.0 release)
+
+- **Speed passes 2/3 (0a6fe90 + 941f4e5, both in the #39 merge history): full-AU 50:46 → 2:33, byte-identical** (regime A, `--turbo 64`, 43 GB; per-box 8.5 GB: 3:20; all outputs sha256-identical to the serial anchors). Pass 2 (0a6fe90) is the dnfill/write-path base; pass 3 (941f4e5) hit the wall target.
+  - Regime A keeps the shared full fields + quantised DN fields on tmpfs memmaps (reclaimable clean file cache) instead of anon RAM; `_pull_push_descent(out_val=/out_sup=)` writes the final descent level straight into the shared fields (bit-exact, threaded and serial branches).
+  - Parallel stock writer (`_turbo_write_stock_parallel`): fixed three silent serial-fallback bugs — TID scratch collision (`get_ident() & 0xFFFF`), block-major vs global 512 raster-scan tile order (608 vs 616 tiles), 3 GB zero-placeholder reference head (now one 512² tile).
+  - Reproject: one no-copy `MemoryDataset(copy=False)` + MultiBand tuple form, shared read-only across warp threads (rasterio's ndarray form copied 3.1 GB per warp call per thread; 8 in-flight copies OOM-killed the run).
+  - `_quantize` in-place (same IEEE ops/order, bit-identical), per-thread f32/f64 scratch, owned int16 outputs (the shared thread-local scratch raced the `ex.map` prefetch and corrupted ~10% of blocks).
+  - Support-blend fix: `om` buffer reused across blends — computed `(1-a)*pv*ps` instead of `(1-a)*ps`. Correctness fix on the default multi-level path: `support_km.tif` for multi-level grids may differ vs 0.2.2 (now correct), `value.tif` unaffected.
+  - `MADV_NOHUGEPAGE` on large fresh arrays (THP=always + sync defrag made first-touch faults 20-40 us/page).
+  - Known state: on this GDAL stack the zstd oracle mismatches libtiff streaming, so turbo runs take the byte-exact stock-parallel write fallback; the parallel ZSTD path is unit-tested and activates where the stack matches.
+- **Budget semantics (measured):** `--ram-gb` caps the shared-field budget, NOT process RSS — regime-C runs peaked at 39.4 GB under a 20 GB budget (write/descent buffers sit outside Bt sizing). per_box is the only genuine low-RAM mode.
+- **0.3.0 released 2026-10-08** (tag v0.3.0 @ f9e0380): CHANGELOG consolidated into one [0.3.0] entry; release notes live on the GitHub release; `publish.yml` publishes to PyPI on `release: published`. Issues #29-#33 closed as landed in #39.
+- Review findings from the #39 adversarial review are filed as #40-#45 (all minor, post-release): stale-output warning gap (#40), odd `band_rows` off-by-one (#41), `_turbo_zstd_ok` docstring (#42), dead `downsample_sum(out=)` param (#43), WIP-labelled 0a6fe90 in history (#44), DN temp-file hygiene vs `_open_fresh_memmap` guard (#45).
+
 ## What changed recently (2026-10-07, PR #39 review fixes: M-1..M-3, Y-1)
 
 - M-1: equakes anchors regenerated under the rasterio 1.5.1 lock (the committed
@@ -114,7 +128,7 @@ not downstream calculation).
 
 - CLI: `--turbo` (optional preset `16|32|64|128`; bare = auto cap), `--max-ram <GB>` (implies turbo), `--ram-gb` (alias of `--max-ram`), `--turbo-strict`. Pre-check after `grid()` prints cap/budget/regime used; shared infeasible (per-box regime) -> strict: stderr error + exit 3, else `[warn]` + continue on per-box with turbo warp/write (exit 0, correct output).
 - `_write_rasters` turbo path: no work-CRS intermediate files. Quantised int16 DN fields stay in RAM (budget-gated: `nx*ny*4 > budget//2` -> file-based reproject path with MT warp) and are reprojected tile-by-tile through the same GDAL warp kernel as the serial path (`_reproject_band_array`; same 2048px tiles, same 512px serial flush, same metadata) -> byte-identical output, sha256-tested.
-- Parallel per-tile ZSTD (`_turbo_write_parallel`): GDAL zero-filled reference head serialises the exact IFD/tag layout; the pipeline patches TileOffsets/TileByteCounts + oracle-verified zstd frames. Oracle mismatch (e.g. CPL zstd pfn vs libtiff streaming params differ on a stack) -> serial GDAL write, byte-exact.
+- Parallel per-tile ZSTD (`_turbo_write_parallel`): GDAL zero-filled reference head serialises the exact IFD/tag layout; the pipeline patches TileOffsets/TileByteCounts + oracle-verified zstd frames. Oracle mismatch (e.g. CPL zstd pfn vs libtiff streaming params differ on a stack) -> byte-exact stock-codec parallel write (the serial per-band write is the last resort only if that writer's layout guards fail).
 - Budget-derived shared cap (S3.3): turbo mode derives the cells cap from `Bt = 0.85*C - 4 GB`; non-turbo keeps `_SHARED_MAX_CELLS = 2.5e8`; the `1e8` in-RAM/memmap tier is unchanged.
 - `_prepare_shared` / `box_count_banded` run threaded under the budgeted worker count when turbo (`plan.workers`); `n_threads == 1` keeps the exact serial path (A8).
 - `turbop._read_cgroup_max_gb` fixed: walks the process cgroup hierarchy to the root and takes the smallest finite `memory.max` (a slice limit above the service cgroup binds). Previously only the root cgroup was read, so a memory-capped user slice saw full physical RAM and auto `--turbo` could plan a regime that OOMs the slice.

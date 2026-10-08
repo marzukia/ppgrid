@@ -57,9 +57,9 @@ things: the time targets, a RAM ceiling on the big case, byte identity against
 today's output, and the fallback behaviour when the box is too small. Wall
 times are medians of at least three runs, because single runs drift a lot.
 
-The numbers in section 3.6 are derived, not yet measured. The test matrix T0
-through T4 on one machine, at caps from 128 GB down to 16 GB, is what turns
-them into measured values. The open questions (3.6.6) are five items waiting on
+The numbers in section 3.6 are derived, and the test matrix T0
+through T4 on one machine, at caps from 128 GB down to 16 GB, turned them
+into measured values (results in appendix A, PR #39). The open questions (3.6.6) are five items waiting on
 review or on those runs: flag naming, keeping the bare flag, the fixed
 headroom, whether regime C earns its keep, and one size to confirm.
 
@@ -377,8 +377,9 @@ grid, unchanged.
   (0 B on incompressible random tiles, F4). Resolution: a **calibration oracle** at startup
   (appendix A.7): compress one 512² tile through the turbo path, byte-compare
   with a tile written by the stock GDAL path on the same raster; on mismatch
-  fall back to serial GDAL write (byte-exact, just slower). The oracle is the
-  version-drift guard for libtiff/libzstd upgrades.
+  fall back to the stock-codec parallel write (byte-exact; the serial per-band
+  write is the last resort if that writer's layout guards fail). The oracle
+  is the version-drift guard for libtiff/libzstd upgrades.
 
 **S3.5, Parallel ingest** (`pipeline.py:493-527`): process pool over CSV
 row-chunks (pandas `read_csv` holds the GIL; pyproj is already GIL-free).
@@ -520,9 +521,11 @@ so the flag is `--max-ram <GB>`.
 **Not in scope:** GPU memory (VRAM) is not what this knob sizes. ppgrid is
 CPU-only; no phase touches VRAM. The name `--max-ram` is deliberate.
 
-Number convention: every new number in this section is **derived, pending
-A/B validation** (§3.6.5). Measured values are cited by section, not
-restated.
+Number convention: every new number in this section is **derived**; the
+A/B validation (§3.6.5) has run — measured results landed with PR #39
+(appendix A: full-AU 2:33 regime A @ 43 GB, per-box 3:20 @ 8.5 GB, regime
+C 3:08 under `--ram-gb 20`), so the table rows below remain the derived
+estimates to be read against those.
 
 #### 3.6.1 CLI surface
 
@@ -568,7 +571,10 @@ not count it twice.
 
 Clamp rule: when the preset is ≥ physical RAM, `C = physical − 8 GB`
 (preset = whole box, keep OS headroom). Below physical, the preset stands
-as given (explicit user cap on a bigger box).
+as given (explicit user cap on a bigger box). Post M-2 (2026-10-07):
+`resolve_cap` clamps the preset against `min(physical, cgroup)`, so a
+memory-capped slice is clamped to its own cgroup limit, not the physical
+RAM (a slice limit above the service cgroup binds).
 
 The knob sizes five parameters. All are byte-invariant (§3.6.3):
 
@@ -595,8 +601,8 @@ Plain English: the arithmetic that turns a RAM cap into a runnable plan. A few
 named constants (B0, Bt, M_in, and friends) are a price list: how many bytes
 each piece of the map costs per cell. The three regimes are the three answers
 to "what fits?", and the est_peak lines are the plan's predicted worst case.
-Every number here is derived, not yet measured; the T-matrix in §3.6.5 is what
-validates them.
+Every number here is derived; the T-matrix in §3.6.5 validates them
+(measured results landed with PR #39, appendix A).
 
 Inputs: `C` (GB cap), `N` (total padded cells), `Wc` (padded columns),
 `r` (cap radius in cells), `cpu`.
