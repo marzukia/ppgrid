@@ -24,7 +24,7 @@ from typing import Self
 try:
     import resource
 except (ImportError, OSError, ValueError):
-    resource = None  # non-Unix platform: prof degrades to wall/user/sys only
+    resource = None  # non-Unix platform: prof degrades to wall only
 
 __all__ = ["enabled", "phase"]
 
