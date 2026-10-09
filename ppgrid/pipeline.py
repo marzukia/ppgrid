@@ -37,7 +37,7 @@ from pyproj.exceptions import CRSError
 from rasterio._io import MemoryDataset
 from rasterio.crs import CRS
 from rasterio.errors import CRSError as RasterioCRSError
-from rasterio.errors import NotGeoreferencedWarning
+from rasterio.errors import NotGeoreferencedWarning, RasterioIOError
 from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
@@ -202,27 +202,37 @@ _SHARED_MEMMAP_CELLS = int(1e8)
 _TIFF_CLASSIC_MAX_BYTES: int = 0xFFFFFFFF
 
 # Temp files created in the output dir by a run; all removed on success and
-# on the failure path (issue #15). _val_lvl*.npy / _sup_lvl*.npy are written
-# by pullpush._descent_banded on the banded path.
-_RUN_TEMP_FILES = (
-    "_points.npy",
-    "_s0.npy",
-    "_c0.npy",
-    "_near.npy",
-    "_val_full.npy",
-    "_sup_full.npy",
-    "_val_dn.npy",
-    "_sup_dn.npy",
-    "_val_lvl1.npy",
-    "_sup_lvl1.npy",
+# on the failure path (issue #15). The list is generated from the write
+# sites, not hand-maintained (audit #83): _descent_banded (pullpush) writes
+# _val_lvl{k}.npy / _sup_lvl{k}.npy for every intermediate level
+# k = 1 .. levels-1, and the old literal kept only lvl1, so any run with
+# levels >= 3 leaked _val_lvl2.npy and up.
+# 64 covers cells up to 2**64 (levels = ceil(log2(cap_cells)); the shared
+# cell cap is 2.5e8 non-turbo, budget-derived in turbo).
+_RUN_LEVELS_MAX: int = 64
+
+
+def _run_temp_names(n_levels: int = _RUN_LEVELS_MAX) -> tuple[str, ...]:
+    """Names of every per-run temp file for a grid of up to n_levels."""
+    names = [
+        "_points.npy",
+        "_s0.npy",
+        "_c0.npy",
+        "_near.npy",
+        "_val_full.npy",
+        "_sup_full.npy",
+        "_val_dn.npy",
+        "_sup_dn.npy",
+    ]
+    names.extend(f"_{band}_lvl{k}.npy" for k in range(1, n_levels) for band in ("val", "sup"))
     # Write-phase staging files (issue #40): the final rasters are written
     # to these names and os.replace()'d over value.tif / support_km.tif
     # only on success, so a mid-write crash never truncates the finals.
-    "_value_tmp.tif",
-    "_support_tmp.tif",
-    "value.tif.tmp",
-    "support_km.tif.tmp",
-)
+    names.extend(("_value_tmp.tif", "_support_tmp.tif", "value.tif.tmp", "support_km.tif.tmp"))
+    return tuple(names)
+
+
+_RUN_TEMP_FILES = _run_temp_names()
 
 # Ingest parallelism (S3.5): minimum data rows per CSV chunk for the process
 # pool. Below this the pool overhead exceeds the parse time, so ingest stays
@@ -1282,9 +1292,11 @@ def _turbo_write_parallel(
 
     1. Warp the full output raster from the work-CRS array (2048px tiles
        in a thread pool - same kernel as the serial path).
-    2. Compress every 512^2 tile in parallel (predictor 2 + zstdmt).
-    3. Write a zero-filled reference raster with the identical profile;
-       GDAL serialises the exact head (IFD + external tag arrays).
+    2. Compress every TILE_PX^2 tile in parallel (predictor 2 + zstdmt).
+    3. Write a reference raster with the identical profile holding ONE
+       TILE_PX^2 zero tile; GDAL serialises the exact head (IFD + external
+       tag arrays) from the raster dimensions alone, so the single tile
+       avoids a dst_height*dst_width int16 reference array.
     4. Assemble: reference head with the TileOffsets/TileByteCounts arrays
        patched to the real frames, then the frames appended in raster-scan
        order.
@@ -1356,7 +1368,15 @@ def _turbo_write_parallel(
 
     ref_path = Path(dst_path + ".refhead.tif")
     try:
-        zero = np.zeros((dst_height, dst_width), dtype=np.int16)
+        # One TILE_PX^2 reference tile, not a full-raster zero write: the
+        # head (IFD + tag arrays) is sized from the raster dimensions at
+        # creation, so a single tile write yields the byte-identical head a
+        # full-band zero write would, without touching a
+        # dst_height*dst_width int16 array (~3 GB at full-AU) (audit #84
+        # P2-4; same property the stock parallel writer relies on).
+        th = min(TILE_PX, dst_height)
+        tw = min(TILE_PX, dst_width)
+        zero = np.zeros((th, tw), dtype=np.int16)
         with _open_tiff_staging(
             ref_path,
             **dict(
@@ -1372,10 +1392,11 @@ def _turbo_write_parallel(
                 dst.scales = scales
             if offsets:
                 dst.offsets = offsets
-            dst.write(zero, 1)
+            dst.write(zero, 1, window=Window(0, 0, tw, th))
         data = ref_path.read_bytes()
     finally:
         ref_path.unlink(missing_ok=True)
+        del zero
 
     try:
         info = _tif_parse_ifd(data)
@@ -1652,7 +1673,7 @@ def _turbo_write_stock_parallel(
 
 def _read_csv_chunk(
     task: tuple[str, int, int, bool, list[str], list[str]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Parse one CSV row chunk in a worker process (S3.5).
 
     The parent split the file into complete records at newline offsets and
@@ -1666,7 +1687,10 @@ def _read_csv_chunk(
         task: Tuple of (path, byte_start, byte_end, has_header, wanted, all_names).
 
     Returns:
-        Tuple of (value, lon, lat) float64 arrays in original row order.
+        Dict of column name -> float64 array in original row order. The
+        caller indexes by name (audit #83: the chunk arrays used to be
+        returned positionally, so the order of `wanted` was an unspoken
+        value/lng/lat contract shared with the caller).
 
     Raises:
         RuntimeError: If a wanted column does not parse as float64 (schema pin).
@@ -1685,8 +1709,7 @@ def _read_csv_chunk(
         if df[c].dtype != np.dtype(np.float64):
             msg = f"ingest chunk dtype mismatch for column {c!r}: {df[c].dtype}"
             raise RuntimeError(msg)
-    out = df[wanted].to_numpy(dtype=np.float64)
-    return out[:, 0], out[:, 1], out[:, 2]
+    return {c: df[c].to_numpy(dtype=np.float64) for c in wanted}
 
 
 def _csv_chunk_tasks(
@@ -2093,9 +2116,11 @@ class Pipeline:
         task_list, expected = tasks
         with ProcessPoolExecutor(max_workers=len(task_list)) as ex:
             chunks = list(ex.map(_read_csv_chunk, task_list))
-        v = np.concatenate([c[0] for c in chunks])
-        lon = np.concatenate([c[1] for c in chunks])
-        lat = np.concatenate([c[2] for c in chunks])
+        # Index by column name, not position (audit #83): the chunk dicts
+        # carry the same names the serial path uses.
+        v = np.concatenate([c[self.value_col] for c in chunks])
+        lon = np.concatenate([c[self.lng_col] for c in chunks])
+        lat = np.concatenate([c[self.lat_col] for c in chunks])
         if v.size != expected:
             return serial()
         return v, lon, lat
@@ -2142,7 +2167,7 @@ class Pipeline:
                 # discarded anyway, and it dominates run time / memory).
                 cap, detail = float(self.cap_km), {}
             else:
-                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv), seed=self.seed)
+                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv), seed=self.seed, saturation=self.saturation)
 
             cal = {
                 "transform": tf.name,
@@ -3600,6 +3625,17 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         _die(f"input file not found: {e.filename or input_path}")
     except pd.errors.ParserError as e:
         _die(f"malformed input file: {e}")
+    except RasterioIOError as e:
+        # A GDAL I/O failure mid-run (corrupt/short raster, driver error).
+        # Subclass of OSError; named here so the exit-1 group reads as the
+        # full list of pipeline/IO errors (audit #83).
+        _die(str(e))
+    except (IndexError, OverflowError, ZeroDivisionError, RuntimeError) as e:
+        # Invariant-style failures (a bad shape, a div-by-zero in a derived
+        # constant, a worker signalling failure via RuntimeError): pipeline
+        # bugs or a broken run, not user input errors, so exit 1 like the
+        # other pipeline failures rather than exit 2 (audit #83).
+        _die(f"{type(e).__name__}: {e} (input: {input_path})")
     except (KeyError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
         raise SystemExit(2) from None
@@ -3748,7 +3784,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transform",
         default="auto",
-        choices=["auto", "identity", "log10", "sqrt", "percentile"],
+        # Pinned to the calibrate.transforms() factory names (audit #83):
+        # adding a transform there adds its name here, nothing else to update.
+        choices=["auto", *(t.name for t in transforms())],
     )
     parser.add_argument(
         "--saturation",
