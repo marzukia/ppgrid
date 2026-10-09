@@ -54,6 +54,25 @@ def test_bin_points_banded_bit_equal() -> None:
         assert np.array_equal(c_ref, c)
 
 
+def test_bin_points_banded_empty_fills_zero() -> None:
+    """#82: zero points -> s_out/c_out filled with 0 (contract: fills in place).
+
+    A caller that skips its own pre-fill must never read an uninitialised
+    grid as data.
+    """
+    s = np.full((8, 8), -1.0, np.float32)
+    c = np.full((8, 8), -1.0, np.float32)
+    bin_points_banded(s, c, np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float64), 8)
+    np.testing.assert_array_equal(s, np.zeros((8, 8), np.float32))
+    np.testing.assert_array_equal(c, np.zeros((8, 8), np.float32))
+
+
+def test_bin_points_empty_raises() -> None:
+    """#82: the flat twin still raises on empty input (its message is fine)."""
+    with pytest.raises(ValueError, match="zero-size array"):
+        bin_points(np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float64), 8, 8)
+
+
 def test_box_count_banded_bit_equal() -> None:
     """Row-banded box counting must equal the full SAT pass exactly."""
     rng = np.random.default_rng(7)
