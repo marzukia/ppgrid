@@ -2,7 +2,7 @@
 
 Set PPGRID_PROFILE=1 to print one line per phase to stderr:
 
-    [prof] <label> wall=<s> user=<s> sys=<s> faults=<M> rss=<peak GB>
+    [prof] <label> wall=<s>s user=<s>s sys=<s>s faults=<M>M rss_peak=<GB>GB
 
 The line breaks wall into user (CPU in the process) and sys (kernel:
 page faults, mmap/munmap, cgroup charge) so a fault storm is visible as
@@ -17,10 +17,14 @@ pair of attribute reads, and the module imports only stdlib at import.
 from __future__ import annotations
 
 import os
-import resource
 import sys
 import time
 from typing import Self
+
+try:
+    import resource
+except (ImportError, OSError, ValueError):
+    resource = None  # non-Unix platform: prof degrades to wall/user/sys only
 
 __all__ = ["enabled", "phase"]
 
@@ -40,16 +44,26 @@ class _Phase:
         self.f0 = 0
 
     def __enter__(self) -> Self:
-        if self.enabled:
+        if self.enabled and resource is not None:
             ru = resource.getrusage(resource.RUSAGE_SELF)
             self.t0 = time.perf_counter()
             self.u0 = ru.ru_utime
             self.s0 = ru.ru_stime
             self.f0 = ru.ru_minflt
+        elif self.enabled:
+            # resource unavailable (non-Unix): time only
+            self.t0 = time.perf_counter()
         return self
 
     def __exit__(self, *exc: object) -> bool:
         if not self.enabled:
+            return False
+        if resource is None:
+            wall = time.perf_counter() - self.t0
+            print(  # ruff: ignore[print]
+                f"[prof] {self.label} wall={wall:.2f}s (rss/faults unavailable)",
+                file=sys.stderr,
+            )
             return False
         ru = resource.getrusage(resource.RUSAGE_SELF)
         wall = time.perf_counter() - self.t0

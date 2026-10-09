@@ -1,7 +1,8 @@
 # ppgrid `--turbo` mode, design
 
 Repo: `~/projects/ppgrid` @ `74d9db8` (v0.2.2, worktree `~/.pi-bg-wt/ppgrid/20260929-063203-1812974`). Provenance note (review F5): that worktree is at d29210a = 74d9db8 + an unpushed partial 'parallel banded descent' implementation, and it holds the UNTRACKED `docs/DESIGN-sparse-output.md` (the 479.6 s anchor, measured on a different 64 GB machine). All appendix runs used `~/projects/ppgrid` @ 74d9db8 (clean).
-Design only, no code, no PR. All claims cite code (`file:line`) or a run output (appendix A).
+LANDED — `--turbo` shipped in 0.3.0 and the design's accepted criteria (A4–A8) are
+ci-pinned in `tests/test_turbo.py`. All claims cite code (`file:line`) or a run output (appendix A).
 
 **Operator intent:** sacrifice the low-RAM constraint and parallelise the bottleneck
 phase. Target deployment: 64 GB box.

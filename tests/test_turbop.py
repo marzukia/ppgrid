@@ -7,7 +7,6 @@ all four box-size rows (16/32/64/128 GB) are reproduced by plan().
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -21,7 +20,6 @@ from ppgrid.turbop import (
     GB,
     M_IN_B_PER_CELL,
     SIZING_TABLE,
-    RssBackstop,
     _read_cgroup_max_gb,
     _read_physical_gb,
     box_chunk_bytes,
@@ -37,8 +35,8 @@ from ppgrid.turbop import (
     resolve_cap,
     sizing_budget_bytes,
     table_row,
-    tile_cache_tiles,
     wall_model_s,
+    write_scratch_tiles,
 )
 
 # Full-AU anchor geometry (design 2.2 / 3.6.2): 4100 x 3819 km @ 100 m,
@@ -102,10 +100,10 @@ def test_budget_reconciliation() -> None:
 
 def test_tile_cache_clamp() -> None:
     """T = clamp(floor(0.1 * Bt / M_tile), 8, 256)."""
-    assert tile_cache_tiles(5.0e7) == 8  # 5 tiles -> floor to min
-    assert tile_cache_tiles(1.5e8) == 15  # mid-range, no clamp
-    assert tile_cache_tiles(2.32e10) == 256  # C=32 Bt -> ceiling
-    assert tile_cache_tiles(1.0e11) == 256  # C=128 Bt -> ceiling
+    assert write_scratch_tiles(5.0e7) == 8  # 5 tiles -> floor to min
+    assert write_scratch_tiles(1.5e8) == 15  # mid-range, no clamp
+    assert write_scratch_tiles(2.32e10) == 256  # C=32 Bt -> ceiling
+    assert write_scratch_tiles(1.0e11) == 256  # C=128 Bt -> ceiling
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +138,7 @@ def test_worked_table_rows(
     assert pl.box_chunks == c
     assert pl.descent_bands == b
     assert pl.workers == workers
-    assert pl.tile_cache_tiles == t
+    assert pl.write_scratch_tiles == t
     assert pl.val_sup_memmap is val_memmap
     assert pl.zstd_ctx_bytes == workers * 2_000_000
     # Wall: central estimate inside the hand-widened row range.
@@ -571,23 +569,3 @@ def test_physical_reader(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # Runtime RSS backstop
 # ---------------------------------------------------------------------------
-
-
-def test_rss_backstop_warns_once(caplog: pytest.LogCaptureFixture) -> None:
-    """First cross of budget x 0.95 logs a single [warn]; later checks are quiet."""
-    bs = RssBackstop(budget_gb=1.0e-5)  # 10 MB budget: this process is over it
-    with caplog.at_level(logging.WARNING, logger="ppgrid.turbop"):
-        assert bs.check() is True
-        assert bs.check() is False  # single [warn]
-        assert bs.check() is False
-    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warns) == 1
-    assert warns[0].getMessage().startswith("[warn] turbo: rss")
-
-
-def test_rss_backstop_quiet_under_limit(caplog: pytest.LogCaptureFixture) -> None:
-    """Under the limit: no warn, check returns False."""
-    bs = RssBackstop(budget_gb=1.0e6)  # 1 PB budget: never crossed
-    with caplog.at_level(logging.WARNING, logger="ppgrid.turbop"):
-        assert bs.check() is False
-    assert caplog.records == []

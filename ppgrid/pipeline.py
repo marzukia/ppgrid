@@ -285,6 +285,9 @@ class _WorkerConfig:
 # Worker state, shared by all worker threads in this process (one
 # ThreadPoolExecutor, one object — not local to each process). Holds the
 # _WorkerConfig as-is under "cfg"; workers read attributes off it.
+# Single-run scope: the ONLY key is "cfg", and both writers clear() it before
+# repopulating, so a second Pipeline.run in the same process never sees stale
+# state (re-runs with varied configs are exercised across the test suite).
 _CTX: dict[str, Any] = {}
 
 
@@ -584,6 +587,8 @@ def _block_points(cfg: _WorkerConfig, bx: int, by: int) -> np.ndarray:
 # there). The int16 outputs are owned by the caller - returning scratch
 # raced the worker pool's ex.map prefetch (worker overwrote the buffer
 # before the main thread finished vd.write), corrupting blocks randomly.
+# Re-allocation when a block's shape differs (right/bottom raster edges) is
+# expected and perf-only: at most one realloc per thread per distinct shape.
 _QUANT_TLS = threading.local()
 
 
@@ -1153,27 +1158,12 @@ def _reproject_band_array(
 # overlap guard share it so a type can never be sized in one place and
 # mis-sized in the other. 16/17/18 = the BigTIFF 64-bit types (LONG8,
 # SLONG8, IFD8).
-_TIFF_TYPE_SIZES = {
-    1: 1,
-    2: 1,
-    3: 2,
-    4: 4,
-    5: 8,
-    6: 8,
-    7: 8,
-    8: 1,
-    9: 2,
-    10: 4,
-    11: 4,
-    12: 8,
-    16: 8,
-    17: 8,
-    18: 8,
-}
-
-
 def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
     """Parse the first IFD of a single-band classic or BigTIFF tiled raster.
+
+    Built on the shared zstdmt primitives (parse_tiff_header +
+    parse_ifd_tags) so there is exactly one IFD parser rule in the repo
+    (audit #83: this used to be an independent, subtly divergent copy).
 
     Args:
         data: Full file bytes.
@@ -1187,51 +1177,22 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
         struct formats.
 
     Raises:
-        ValueError: On unknown endian/magic, missing 324/325, an unknown
-            TIFF type, a non-LONG/LONG8 tile array type, inline tile
-            arrays, or a count mismatch.
+        ValueError: On unknown endian/magic, missing 324/325, a
+            non-LONG/LONG8 tile array type, inline tile arrays, or a
+            count mismatch. (Tags with a type the shared parser does not
+            size are now skipped rather than a hard error: the caller only
+            needs 324/325 and the head-overlap guard. Previously:
+            "unsupported TIFF type" ValueError.)
 
     """
-    if data[:2] == b"II":
-        e = "<"
-    elif data[:2] == b"MM":
-        e = ">"
-    else:
-        msg = f"not a little/big-endian TIFF: {data[:2]!r}"
-        raise ValueError(msg)
-    magic = struct.unpack_from(e + "H", data, 2)[0]
-    big = magic == 43
-    if not big and magic != 42:
-        msg = f"unexpected TIFF magic {magic}"
-        raise ValueError(msg)
-    if not big:
-        ifd = struct.unpack_from(e + "I", data, 4)[0]
-        cnt = struct.unpack_from(e + "H", data, ifd)[0]
-        # 12-byte entries: tag(2) type(2) count(4) value-or-offset(4).
-        ent_size, count_fmt, off_fmt, entry_off, val_at, inline = 12, "I", "I", 2, 8, 4
-    else:
-        # 16-byte BigTIFF header: first-IFD offset (8) at bytes 8-15; the
-        # IFD count is followed by 6 pad bytes; 20-byte entries: tag(2)
-        # type(2) count(8) value-or-offset(8, inline capacity 12).
-        ifd = struct.unpack_from(e + "Q", data, 8)[0]
-        cnt = struct.unpack_from(e + "H", data, ifd)[0]
-        ent_size, count_fmt, off_fmt, entry_off, val_at, inline = 20, "Q", "Q", 8, 12, 12
-    per_typ = _TIFF_TYPE_SIZES
-    tags: dict[int, tuple[int, int, int]] = {}
-    for i in range(cnt):
-        off = ifd + entry_off + i * ent_size
-        tag, typ = struct.unpack_from(e + "HH", data, off)
-        count = struct.unpack_from(e + count_fmt, data, off + 4)[0]
-        sz = per_typ.get(typ)
-        if sz is None:
-            msg = f"unsupported TIFF type {typ} for tag {tag}"
-            raise ValueError(msg)
-        total = sz * count
-        if total <= inline:
-            tags[tag] = (typ, count, off + val_at)
-        else:
-            voff = struct.unpack_from(e + off_fmt, data, off + val_at)[0]
-            tags[tag] = (typ, count, voff)
+    e, big, off_fmt, entry_size, cnt_size, inline, ifd = zstdmt.parse_tiff_header(data)
+    try:
+        tags: dict[int, tuple[int, int, int]] = zstdmt.parse_ifd_tags(
+            data, e, ifd, off_fmt, cnt_size, entry_size, inline
+        )
+    except struct.error as exc:
+        msg = f"corrupt TIFF structure: {exc}"
+        raise ValueError(msg) from exc
     if 324 not in tags or 325 not in tags:
         msg = "missing TileOffsets/TileByteCounts"
         raise ValueError(msg)
@@ -1245,6 +1206,7 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
     n_tiles = t324[1]
     # Slot width is per tag (Y-1): BigTIFF stores 324 as LONG8 (8-byte
     # slots) but 325 as LONG (4-byte slots); classic stores both as LONG.
+    per_typ = zstdmt.TIFF_TYPE_SIZES
     sz324, sz325 = per_typ[t324[0]], per_typ[t325[0]]
     fmt324 = e + ("Q" if sz324 == 8 else "I")
     fmt325 = e + ("Q" if sz325 == 8 else "I")
@@ -1411,7 +1373,7 @@ def _turbo_write_parallel(
     # the head cut keeps every array and drops every reference tile.
     head_end = info["first"]
     for typ, count, voff in info["tags"].values():
-        total = _TIFF_TYPE_SIZES[typ] * count
+        total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
             print("[warn] turbo zstd head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
             return False
@@ -1572,7 +1534,7 @@ def _turbo_write_stock_parallel(
     t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
     head_end = info["first"]
     for typ, count, voff in info["tags"].values():
-        total = _TIFF_TYPE_SIZES[typ] * count
+        total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
             print("[warn] turbo stock head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
             return False
@@ -2792,7 +2754,7 @@ class Pipeline:
         # Deterministic compressible content: both axes differ to small
         # values, so predictor 2 output is near-zero structured data.
         gx = np.arange(500, dtype=np.int16) * 13
-        gy = np.arange(512, dtype=np.int16) * 7
+        gy = np.arange(TILE_PX, dtype=np.int16) * 7
         tile = (gx[None, :] + gy[:, None]).astype(np.int16)
         probe = Path(self.out_dir) / "_zstd_oracle.tif"
         try:
@@ -2807,15 +2769,15 @@ class Pipeline:
                 driver="GTiff",
                 dtype="int16",
                 width=500,
-                height=512,
+                height=TILE_PX,
                 count=1,
                 nodata=NODATA,
                 crs=f"EPSG:{self.work_crs}",
-                transform=from_origin(0, 512 * self.res, self.res, self.res),
+                transform=from_origin(0, TILE_PX * self.res, self.res, self.res),
                 compress=self.compress,
                 tiled=True,
-                blockxsize=512,
-                blockysize=512,
+                blockxsize=TILE_PX,
+                blockysize=TILE_PX,
                 predictor=2,
                 BIGTIFF="IF_SAFER",
             ) as dst:

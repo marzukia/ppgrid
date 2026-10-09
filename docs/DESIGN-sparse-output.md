@@ -1,6 +1,8 @@
 # Design: sparse tiled output for large-area rasters
 
-Status: design only (no pipeline code changed). Date: 2026-09-29. Author: monky worker.
+Status: LANDED — the recommended Option C items shipped in 0.3.0–0.4.x (reproject
+NoData-tile skip, `tests/test_reproject_skip.py`; non-turbo shared descent parallel by
+design with `--max-band-parallel`; per-level RAM gate). Date: 2026-09-29. Author: monky worker.
 
 Dataset: `data/au_gcc_sparse.csv` (949,809 WGS84 points, Australia/GCC).
 Resolution target: ~100 m (>= 1 B cells) with `out_crs != work_crs`.
@@ -391,7 +393,8 @@ Follow-ups (separate work items, not part of this fix):
 
 ## 11. Benchmark harness spec
 
-`bench/sparse_bench.py` (created for this design; no pipeline code modified —
+`bench/sparse_bench.py` (created for this design; not committed to the repo —
+the harness lives on the author's box; no pipeline code modified —
 instrumentation is monkey-patching).
 
 ```
