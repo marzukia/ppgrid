@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import errno
 import io
 import json
 import logging
@@ -34,6 +35,7 @@ import rasterio
 from pyproj import Transformer
 from pyproj.exceptions import CRSError
 from rasterio._io import MemoryDataset
+from rasterio.errors import CRSError as RasterioCRSError
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
@@ -288,17 +290,28 @@ def _die(msg: str) -> NoReturn:
     raise SystemExit(1)
 
 
-def _warn_stale_outputs(out: Path) -> None:
-    """Warn when a failed run leaves an earlier run's rasters behind (issue #40).
+def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
+    """Warn when a failed run leaves an earlier run's rasters behind (issues #40, #77).
 
-    On any non-zero exit, if value.tif / support_km.tif already exist in the
-    output dir, they are from an earlier run: this run failed before writing,
-    and the old files are untouched (the write phase only publishes via
-    os.replace() on success, so a failed run never truncates them).
+    On a non-zero exit, if value.tif / support_km.tif exist in the output dir
+    AND were not published by this run, they are from an earlier run: this
+    run failed without (fully) writing its outputs, and the old files are
+    untouched (the write phase only publishes via os.replace() on success,
+    so a failed run never truncates them). `published` carries the finals
+    this run already published, so a post-publish failure (e.g. a --json
+    write error) does not report the just-written rasters as "left
+    untouched". The overwrite guard (#54) exits 2 on its own message, so it
+    does not call this.
+
+    Args:
+        out: Output directory to check.
+        published: Final-output names published by this run (None = none).
+
     """
     if not out.is_dir():
         return
-    existing = [name for name in ("value.tif", "support_km.tif") if (out / name).is_file()]
+    published = published or set()
+    existing = [name for name in ("value.tif", "support_km.tif") if (out / name).is_file() and name not in published]
     if not existing:
         return
     print(  # ruff: ignore[print]
@@ -306,6 +319,68 @@ def _warn_stale_outputs(out: Path) -> None:
         "are from an earlier run and were left untouched",
         file=sys.stderr,
     )
+
+
+def _staging_fd(path: Path) -> int:
+    """Create `path` as a fresh 0600 regular file and return an open write fd.
+
+    Symlinks are replaced, never followed (issues #15, #77): the path is
+    unlinked, then recreated with O_CREAT | O_EXCL | O_NOFOLLOW — a symlink
+    (or any file) planted in that window makes os.open fail (ELOOP / EEXIST)
+    instead of being followed, and one retry resolves it.
+
+    Args:
+        path: Staging path in the output dir.
+
+    Returns:
+        Open fd on the fresh regular file.
+
+    Raises:
+        OSError: If the path still cannot be created as a regular file
+            after one retry.
+
+    """
+    path.unlink(missing_ok=True)
+    try:
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        if e.errno not in (errno.EEXIST, errno.ELOOP):
+            raise
+        # Planted in the unlink->open window: replace it once, try again.
+        path.unlink(missing_ok=True)
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+
+
+def _open_tiff_staging(path: Path, **profile: Any) -> rasterio.DatasetBase:
+    """Open `path` for GTiff write without ever following a symlink (issues #15, #77).
+
+    The file is created fresh via _staging_fd (O_EXCL | O_NOFOLLOW, 0600),
+    then the path is handed to rasterio.open and re-checked: a symlink
+    planted in the create->open window is caught (close, replace, retry
+    once) instead of having its target overwritten. Mirrors the
+    _open_fresh_memmap guard (issue #45).
+
+    Args:
+        path: Staging path in the output dir.
+        **profile: rasterio.open write profile (driver, dtype, width, ...).
+
+    Returns:
+        Open rasterio dataset; use under `with`.
+
+    Raises:
+        OSError: If the path is still a symlink after one retry.
+
+    """
+    for _attempt in (1, 2):
+        fd = _staging_fd(path)
+        os.close(fd)
+        ds = rasterio.open(path, "w", **profile)
+        if not path.is_symlink():
+            return ds
+        ds.close()
+        path.unlink(missing_ok=True)
+    msg = f"staging path is a symlink after retry: {path}"
+    raise OSError(msg)
 
 
 def _pos_float(text: str) -> float:
@@ -763,7 +838,7 @@ def _reproject_core(
         transform=dst_transform,
         crs=dst_crs,
     )
-    with rasterio.open(dst_path, "w", **dst_profile) as dst:
+    with _open_tiff_staging(Path(dst_path), **dst_profile) as dst:
         dst.update_tags(**tags)
         if scales:
             dst.scales = scales
@@ -948,7 +1023,7 @@ def _reproject_band(
             n_threads=n_threads,
         )
         if skip and counters["skipped"] > 0:
-            print(f"[reproj] skipped {counters['skipped']}/{counters['tiles']} all-NoData tiles")  # ruff: ignore[print]
+            log.debug("[reproj] skipped %d/%d all-NoData tiles", counters["skipped"], counters["tiles"])
 
 
 def _reproject_band_array(
@@ -1219,9 +1294,8 @@ def _turbo_write_parallel(
     ref_path = Path(dst_path + ".refhead.tif")
     try:
         zero = np.zeros((dst_height, dst_width), dtype=np.int16)
-        with rasterio.open(
+        with _open_tiff_staging(
             ref_path,
-            "w",
             **dict(
                 profile,
                 width=dst_width,
@@ -1271,7 +1345,7 @@ def _turbo_write_parallel(
         struct.pack_into(fmt324, head, t324[2] + i * sz324, head_end + pos)
         struct.pack_into(fmt325, head, t325[2] + i * sz325, len(t))
         pos += len(t)
-    with Path(dst_path).open("wb") as f:
+    with os.fdopen(_staging_fd(Path(dst_path)), "wb") as f:
         f.write(bytes(head))
         f.writelines(tiles)
     return True
@@ -1316,7 +1390,7 @@ def _stock_band_frames(
     """
     t = dst_transform * Affine(1, 0, i0, 0, 1, -j0)
     prof = dict(profile, width=bw, height=bh, transform=t, crs=out_crs)
-    with rasterio.open(scratch, "w", **prof) as dst:
+    with _open_tiff_staging(scratch, **prof) as dst:
         for j in range(0, bh, TILE_PX):
             h = min(TILE_PX, bh - j)
             for i in range(0, bw, TILE_PX):
@@ -1383,9 +1457,8 @@ def _turbo_write_stock_parallel(
         th = min(TILE_PX, dst_height)
         tw = min(TILE_PX, dst_width)
         zero = np.zeros((th, tw), dtype=np.int16)
-        with rasterio.open(
+        with _open_tiff_staging(
             ref_path,
-            "w",
             **dict(
                 profile,
                 width=dst_width,
@@ -1505,7 +1578,7 @@ def _turbo_write_stock_parallel(
         struct.pack_into(fmt324, head, t324[2] + i * sz324, head_end + pos)
         struct.pack_into(fmt325, head, t325[2] + i * sz325, len(t))
         pos += len(t)
-    with Path(dst_path).open("wb") as f:
+    with os.fdopen(_staging_fd(Path(dst_path)), "wb") as f:
         f.write(bytes(head))
         f.writelines(tiles)
     return True
@@ -1712,6 +1785,11 @@ class Pipeline:
         # Set by run(): labelled wall seconds (ingest sub-phases + write
         # sub-phases) for the DEBUG perf breakdown.
         self._phase_wall: dict[str, float] = {}
+        # Final-output names published (via os.replace) this run, set by the
+        # write phase: post-publish failures (e.g. a --json write error)
+        # then don't report the just-written rasters as stale "left
+        # untouched" (issues #40, #77).
+        self._published: set[str] = set()
         # Set by run() on success: machine-readable summary for --json (#55).
         self._summary: dict[str, Any] | None = None
 
@@ -1756,6 +1834,11 @@ class Pipeline:
         self.pts_path: Path
         self.cfg: _WorkerConfig
         self._cal: dict[str, Any] | None
+
+    @property
+    def published(self) -> set[str]:
+        """Final-output names published (via os.replace) this run (issues #40, #77)."""
+        return self._published
 
     def ingest(self) -> None:
         """Read input, filter, project to working CRS.
@@ -2481,7 +2564,10 @@ class Pipeline:
             if decision.exit_code == 3 and decision.message:
                 print(decision.message, file=sys.stderr)  # ruff: ignore[print]
         else:
-            print(decision.summary)  # ruff: ignore[print]
+            # stdout stays clean (the --json/--help contract): the summary
+            # goes through the run logger (stderr, INFO; -q suppresses it,
+            # like every other progress line) (#77).
+            log.info("%s", decision.summary)
             if decision.message:
                 print(decision.message, file=sys.stderr)  # ruff: ignore[print]
         if decision.exit_code == 3:
@@ -2804,11 +2890,12 @@ class Pipeline:
             wtmp_v, wtmp_s = ftmp_v, ftmp_s
         partial = False
         try:
-            for p in (wtmp_v, wtmp_s, ftmp_v, ftmp_s):
-                p.unlink(missing_ok=True)  # never follow a pre-planted symlink (issue #15)
+            # Staging opens create fresh 0600 regular files and never follow
+            # a pre-planted symlink (issues #15, #77); the ftmp finals are
+            # created the same way by _reproject_core below.
             with (
-                rasterio.open(wtmp_v, "w", **vprof) as vd,
-                rasterio.open(wtmp_s, "w", **sprof) as sd,
+                _open_tiff_staging(wtmp_v, **vprof) as vd,
+                _open_tiff_staging(wtmp_s, **sprof) as sd,
             ):
                 vd.update_tags(**vtags)
                 vd.scales = (1.0 / self.scale,)
@@ -2904,7 +2991,9 @@ class Pipeline:
                     )
             # Publish: the finals only ever change via atomic rename.
             ftmp_v.replace(vpath)
+            self._published.add(vpath.name)
             ftmp_s.replace(spath)
+            self._published.add(spath.name)
             if wtmp_v is not ftmp_v:
                 wtmp_v.unlink(missing_ok=True)
                 wtmp_s.unlink(missing_ok=True)
@@ -3038,8 +3127,8 @@ class Pipeline:
             warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
             with _prof.phase("write.oracle"):
                 cpl = self._turbo_zstd_ok()
-            for p in (ftmp_v, ftmp_s):
-                p.unlink(missing_ok=True)  # never follow a pre-planted symlink (issue #15)
+            # The writers below create ftmp_v / ftmp_s fresh (O_EXCL |
+            # O_NOFOLLOW) and never follow a pre-planted symlink (issues #15, #77).
             for band, arr, prof, path, tags, scales in (
                 ("value", val_dn, vprof, ftmp_v, vtags, (1.0 / self.scale,)),
                 ("support", sup_dn, sprof, ftmp_s, stags, (1.0,)),
@@ -3106,7 +3195,9 @@ class Pipeline:
                         )
             # Publish: the finals only ever change via atomic rename.
             ftmp_v.replace(vpath)
+            self._published.add(vpath.name)
             ftmp_s.replace(spath)
+            self._published.add(spath.name)
         except BaseException:
             # Mid-run failure (worker error, OOM, disk full): the finals were
             # not reached (os.replace is last). Warn so nobody consumes an
@@ -3303,13 +3394,18 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         The callable's return value.
 
     Raises:
-        SystemExit: 1 (pipeline/IO) or 2 (validation).
+        SystemExit: 1 (pipeline/IO) or 2 (validation, unknown EPSG).
 
     """
     try:
         return fn()
-    except CRSError as e:
-        _die(str(e))
+    except (CRSError, RasterioCRSError) as e:
+        # Unknown EPSG: pyproj's CRSError (--src-crs/--work-crs) and
+        # rasterio's CRSError (--out-crs, a ValueError subclass) both land
+        # here — one exit code for all three CRS flags: 2, "bad flag value"
+        # per the README exit-code table (#77). The message names the code.
+        print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
+        raise SystemExit(2) from None
     except ImportError as e:
         # e.g. parquet input without the optional pyarrow extra.
         _die(str(e))
@@ -3351,6 +3447,13 @@ def _sanitize_json(obj: Any) -> Any:
 def _write_json_summary(p: Pipeline, args: argparse.Namespace, out: Path) -> None:
     """Write <out>/run_summary.json for --json (issue #55); stdout stays clean.
 
+    Atomic like the raster finals (fresh 0600 tmp + os.replace): a
+    mid-write crash leaves no partial summary to block the next run, and a
+    write failure (e.g. run_summary.json pre-existing as a directory) is a
+    named error — exit 1 — never a raw traceback (#77). The rasters were
+    already published, so no stale-outputs warning fires either (the
+    run-phase handler filters on Pipeline._published).
+
     Args:
         p: Pipeline after a successful run() (provides run_summary()).
         args: Parsed CLI namespace (recorded under 'cli').
@@ -3361,9 +3464,14 @@ def _write_json_summary(p: Pipeline, args: argparse.Namespace, out: Path) -> Non
     summary["cli"] = dict(vars(args))
     summary["git_commit"] = _git_commit()
     path = out / "run_summary.json"
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(_sanitize_json(summary), f, indent=2, allow_nan=False)
-        f.write("\n")
+    tmp = out / "run_summary.json.tmp"
+    try:
+        with os.fdopen(_staging_fd(tmp), "wb") as f:
+            f.write((json.dumps(_sanitize_json(summary), indent=2, allow_nan=False) + "\n").encode("utf-8"))
+        tmp.replace(path)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        _die(f"cannot write run summary: {e}")
     log.info("run summary: %s", path)
 
 
@@ -3420,6 +3528,14 @@ def _configure_logging(level_name: str) -> None:
     root.setLevel(levels[level_name])
     for handler in root.handlers:
         if getattr(handler, "ppgrid_handler", False):
+            # Rebind to the current stderr: tests (capsys) and TTY swaps
+            # replace sys.stderr between runs; holding the first run's
+            # stream object sends later records into a closed file
+            # (logging-error spam, #77).
+            if handler.stream is not sys.stderr:  # type: ignore[attr-defined]
+                # Assign directly: setStream() flushes the old stream first,
+                # and that raises on a closed file (capsys test teardown).
+                handler.stream = sys.stderr  # type: ignore[attr-defined]
             return
     handler = logging.StreamHandler(stream=sys.stderr)
     handler.ppgrid_handler = True  # type: ignore[attr-defined]
@@ -3561,22 +3677,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Parse CLI arguments and run the pipeline.
+def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Path) -> None:
+    """Preflight phase of main(): input check, logging, validation, --plan.
+
+    Runs the whole pre-run sequence: the missing-input error, the `help`
+    pseudo-command, logging setup, all parser.error flag validations, the
+    out-is-a-file check, and the --plan branch (which exits 0). main() wraps
+    the call so every non-zero exit here can warn about stale outputs
+    (issues #40, #77).
 
     Args:
-        argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
+        parser: The argument parser (for print_help / error).
+        args: Parsed namespace (mutated: max_ram alias resolution).
+        out: Output directory path.
 
     Raises:
-        SystemExit: exit 0 for `ppgrid help` (and `--plan`), exit 1 for
-        pipeline/IO errors (`_die`), exit 2 for missing input, validation
-        errors, missing input columns (#57), or a non-empty out dir without
-        --force (#54), exit 3 for `--turbo-strict` shared-path infeasibility.
+        SystemExit: 0 (help, plan), 1 (out is a file), 2 (validation).
 
     """
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-
     if args.input is None:
         print("error: missing input file (CSV or Parquet)", file=sys.stderr)  # ruff: ignore[print]
         print("hint: run 'ppgrid help' for usage and examples", file=sys.stderr)  # ruff: ignore[print]
@@ -3612,7 +3730,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.turbo_strict and args.turbo is None and args.max_ram is None:
         parser.error("--turbo-strict requires --turbo or --max-ram")
 
-    out = Path(args.out)
     if out.exists() and not out.is_dir():
         _die(f"output path is a file, not a directory: {args.out}")
 
@@ -3626,6 +3743,39 @@ def main(argv: list[str] | None = None) -> None:
         _map_pipeline_errors(p.plan, args.input)
         print(p.plan_text(args))  # ruff: ignore[print]
         raise SystemExit(0)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Parse CLI arguments and run the pipeline.
+
+    Args:
+        argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
+
+    Raises:
+        SystemExit: exit 0 for `ppgrid help` (and `--plan`), exit 1 for
+        pipeline/IO errors (`_die`), exit 2 for missing input, validation
+        errors, missing input columns (#57), or a non-empty out dir without
+        --force (#54), exit 3 for `--turbo-strict` shared-path infeasibility.
+        Any non-zero exit over an earlier run's rasters also prints the
+        stale-outputs warning (issues #40, #77).
+
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    out = Path(args.out)
+
+    try:
+        # Preflight (input check, logging, flag validation, --plan branch):
+        # any non-zero exit over an earlier run's rasters warns instead of
+        # staying silent (issues #40, #77).
+        _main_preflight(parser, args, out)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            _warn_stale_outputs(out)
+        raise
+    except BaseException:
+        _warn_stale_outputs(out)
+        raise
 
     # #54: overwrite guard — a non-empty out dir means an earlier run's
     # outputs; require --force to clobber them.
@@ -3648,6 +3798,7 @@ def main(argv: list[str] | None = None) -> None:
         raise
     except OSError as e:
         _die(f"cannot create output directory {args.out}: {e}")
+    p: Pipeline | None = None
     try:
         # Construction (init validation, e.g. --scale range) gets the same
         # exit-code mapping as the run phase (review M-1, #56 contract).
@@ -3657,12 +3808,14 @@ def main(argv: list[str] | None = None) -> None:
             _write_json_summary(p, args, out)
     except SystemExit as e:
         # Any non-zero exit with an earlier run's rasters in place: warn
-        # instead of staying silent (issue #40).
+        # instead of staying silent (issue #40). Rasters this run already
+        # published (a post-publish failure, e.g. a --json write error)
+        # are not stale (#77).
         if e.code not in (0, None):
-            _warn_stale_outputs(out)
+            _warn_stale_outputs(out, p.published if p is not None else None)
         raise
     except BaseException:
-        _warn_stale_outputs(out)
+        _warn_stale_outputs(out, p.published if p is not None else None)
         raise
 
 
