@@ -35,8 +35,8 @@ import rasterio
 from pyproj import Transformer
 from pyproj.exceptions import CRSError
 from rasterio._io import MemoryDataset
-from rasterio.errors import CRSError as RasterioCRSError
 from rasterio.crs import CRS
+from rasterio.errors import CRSError as RasterioCRSError
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
@@ -343,6 +343,7 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
     Args:
         out: Output directory to check.
         published: Final-output names published by this run (None = none).
+
     """
     if not out.is_dir():
         return
