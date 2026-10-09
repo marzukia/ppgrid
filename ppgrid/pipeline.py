@@ -34,6 +34,7 @@ import rasterio
 from pyproj import Transformer
 from pyproj.exceptions import CRSError
 from rasterio._io import MemoryDataset
+from rasterio.crs import CRS
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
@@ -287,6 +288,46 @@ def _die(msg: str) -> NoReturn:
     """
     print(f"error: {msg}", file=sys.stderr)  # ruff: ignore[print]
     raise SystemExit(1)
+
+
+def _check_default_transform(
+    dst_transform: Any,
+    dst_width: int,
+    dst_height: int,
+    work_crs: int,
+    out_crs: int,
+) -> None:
+    """Validate a calculate_default_transform result (issue #74, P0).
+
+    When the work-CRS grid extent crosses the output projection's domain
+    (e.g. the Wagner VII pole at y = +/-7,342,230 m with a Web Mercator
+    target), GDAL returns a NaN transform and width = height = -2147483648
+    (INT32_MIN); every writer then dies at rasterio.open() with the cryptic
+    "Attempt to create -2147483648x-2147483648 dataset is illegal".
+    Name the cause instead.
+
+    Args:
+        dst_transform: Affine returned by calculate_default_transform.
+        dst_width: Width returned by calculate_default_transform.
+        dst_height: Height returned by calculate_default_transform.
+        work_crs: Work CRS EPSG code (for the message).
+        out_crs: Output CRS EPSG code (for the message).
+
+    Raises:
+        ValueError: If the transform is non-finite or the raster size is
+            non-positive. Mapped to exit 2 by _map_pipeline_errors, the
+            user-data-derived failure code.
+
+    """
+    if dst_width > 0 and dst_height > 0 and all(math.isfinite(v) for v in dst_transform):
+        return
+    msg = (
+        f"work-CRS grid extent (EPSG:{work_crs}) exceeds the output projection's domain "
+        f"(EPSG:{out_crs}): the derived output transform is not finite "
+        f"(raster size {dst_width}x{dst_height}). "
+        "Retry with --out-crs 4326, a coarser --res, or a clipped input extent."
+    )
+    raise ValueError(msg)
 
 
 def _warn_stale_outputs(out: Path) -> None:
@@ -1738,7 +1779,11 @@ class Pipeline:
         self.y: np.ndarray
         self.n: int
         self.n_total: int  # rows read (pre-filter), for the volumetric log lines
-        self.n_dropped: int  # NaN/inf rows dropped, for the volumetric log lines
+        self.n_dropped: int  # all rows dropped (NaN/inf + out-of-domain + non-finite projection)
+        self.n_dropped_nan_inf: int  # non-finite value/lon/lat rows
+        self.n_dropped_out_of_domain: int  # geographic rows outside lat/lon range (issue #76)
+        self.n_dropped_nonfinite_proj: int  # rows with non-finite projected x/y (issue #76)
+        self._drop_examples: list[str]  # first offender(s), for the ingest drop summary
 
         # Calibration outputs
         self.tf: Any
@@ -1804,19 +1849,108 @@ class Pipeline:
         self.n_total = int(v.size)
         good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
         v, lon, lat = v[good], lon[good], lat[good]
+        self.n_dropped_nan_inf = self.n_total - len(v)
+        kept = np.flatnonzero(good)  # original 0-based data-row numbers of kept rows
+
+        # Raw geographic domain (issue #76): pyproj is silent about
+        # out-of-range lat/lon — lat 95 maps to inf (int64-cast inf crashes
+        # grid() with "ix indices out of range"), lon 181 maps to a finite
+        # x that balloons the grid to global span. Drop such rows and name
+        # the first offender, same summary style as the NaN/inf line.
+        self.n_dropped_out_of_domain = 0
+        self.n_dropped_nonfinite_proj = 0
+        self._drop_examples = []
+        if CRS.from_epsg(self.src_crs).is_geographic:
+            in_range = (lat >= -90.0) & (lat <= 90.0) & (lon >= -180.0) & (lon <= 180.0)
+            if not in_range.all():
+                i = int(np.nonzero(~in_range)[0][0])
+                row = int(kept[i])
+                if not (-90.0 <= lat[i] <= 90.0):
+                    self._drop_examples.append(f"out-of-domain lat {lat[i]:.6f} outside [-90, 90] (row {row})")
+                else:
+                    self._drop_examples.append(f"out-of-domain lon {lon[i]:.6f} outside [-180, 180] (row {row})")
+                self.n_dropped_out_of_domain = int(np.count_nonzero(~in_range))
+                v, lon, lat, kept = v[in_range], lon[in_range], lat[in_range], kept[in_range]
+
         self.n = len(v)
         self.n_dropped = self.n_total - self.n
 
         if self.n == 0:
             msg = "No valid points found in input. Check columns and data."
+            if self._drop_examples:
+                msg += f" ({self._drop_examples[0]})"
             raise ValueError(msg)
 
         with _prof.phase("ingest.proj"):
             tr = Transformer.from_crs(self.src_crs, self.work_crs, always_xy=True)
             x, y = tr.transform(lon, lat)
-            self.x = np.asarray(x)
-            self.y = np.asarray(y)
+            x = np.asarray(x)
+            y = np.asarray(y)
+            # Transformed coords must be finite (issue #76): singular or
+            # out-of-domain inputs come back as +/-inf/NaN from pyproj
+            # (silent) and reach grid() as int64 min/max after casting.
+            good_xy = np.isfinite(x) & np.isfinite(y)
+            if not good_xy.all():
+                i = int(np.nonzero(~good_xy)[0][0])
+                row = int(kept[i])
+                self.n_dropped_nonfinite_proj = int(np.count_nonzero(~good_xy))
+                self._drop_examples.append(
+                    f"non-finite after projection to EPSG:{self.work_crs} "
+                    f"(row {row}: lon {lon[i]:.6f}, lat {lat[i]:.6f})",
+                )
+                v, lon, lat, x, y = v[good_xy], lon[good_xy], lat[good_xy], x[good_xy], y[good_xy]
+                self.n = len(v)
+                self.n_dropped = self.n_total - self.n
+                if self.n == 0:
+                    msg = f"No valid points remain after projection to EPSG:{self.work_crs} ({self._drop_examples[0]})"
+                    raise ValueError(msg)
+            self.x = x
+            self.y = y
             self.v = v
+
+    def _drop_summary(self) -> str:
+        """Ingest drop text for the plan/log lines (issue #76).
+
+        Returns:
+            'N NaN/inf dropped' when only non-finite rows were dropped
+            (byte-identical to the pre-#76 output), else an extended
+            breakdown naming the first offender.
+
+        """
+        if self.n_dropped_out_of_domain == 0 and self.n_dropped_nonfinite_proj == 0:
+            return f"{self.n_dropped} NaN/inf dropped"
+        detail = []
+        if self.n_dropped_nan_inf:
+            detail.append(f"{self.n_dropped_nan_inf} NaN/inf")
+        if self.n_dropped_out_of_domain:
+            detail.append(f"{self.n_dropped_out_of_domain} out-of-domain")
+        if self.n_dropped_nonfinite_proj:
+            detail.append(f"{self.n_dropped_nonfinite_proj} non-finite after projection")
+        text = f"{self.n_dropped} dropped ({'; '.join(detail)})"
+        if self._drop_examples:
+            text += f"; first: {self._drop_examples[0]}"
+        return text
+
+    def _ingest_summary_info(self) -> dict[str, int]:
+        """Ingest section of the --json run summary (issue #76).
+
+        The out-of-domain / non-finite-projection keys are only present when
+        non-zero, so an all-clean run keeps the historical three-key shape.
+
+        Returns:
+            Dict with rows_read, points, dropped_nan_inf (+ optional new keys).
+
+        """
+        info: dict[str, int] = {
+            "rows_read": self.n_total,
+            "points": self.n,
+            "dropped_nan_inf": self.n_dropped_nan_inf,
+        }
+        if self.n_dropped_out_of_domain:
+            info["dropped_out_of_domain"] = self.n_dropped_out_of_domain
+        if self.n_dropped_nonfinite_proj:
+            info["dropped_nonfinite_proj"] = self.n_dropped_nonfinite_proj
+        return info
 
     def _read_points(self, wanted: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Read (value, lon, lat) float64 arrays from the CSV input.
@@ -2158,7 +2292,7 @@ class Pipeline:
             f"  input:         {args.input}",
             f"  columns:       value={args.value_col!r} lng={args.lng_col!r} lat={args.lat_col!r}",
             f"  out dir:       {args.out} ({'exists' if out.is_dir() else 'does not exist yet'})",
-            f"  ingest:        {self.n_total} rows -> {self.n} points ({self.n_dropped} NaN/inf dropped)",
+            f"  ingest:        {self.n_total} rows -> {self.n} points ({self._drop_summary()})",
             f"  grid extent:   x0={self.x0:.3f} m, y0={self.y0:.3f} m (work CRS EPSG:{self.work_crs}, metres)",
             cells_line,
             f"  levels:        {self.levels} (halo {self.halo}, cap {self.cap_km_val:g} km)",
@@ -2263,11 +2397,7 @@ class Pipeline:
                 "block_size": self.block_size,
                 "compress": self.compress,
             },
-            "ingest": {
-                "rows_read": self.n_total,
-                "points": self.n,
-                "dropped_nan_inf": self.n_dropped,
-            },
+            "ingest": self._ingest_summary_info(),
             "calibration": self._cal,
             "timings_ms": {
                 "ingest": ms(t_ingest),
@@ -2329,10 +2459,10 @@ class Pipeline:
             reproj_s = pw.get("reproject_value", 0.0) + pw.get("reproject_support", 0.0)
             interp_s = pw.get("interpolate", 0.0) + pw.get("descent", 0.0)
             log.info(
-                "ingest: %d rows -> %d points (%d NaN/inf dropped) in %.2fs",
+                "ingest: %d rows -> %d points (%s) in %.2fs",
                 self.n_total,
                 self.n,
-                self.n_dropped,
+                self._drop_summary(),
                 t_ingest,
             )
             log.info("calibrate: transform=%s cap_km=%.4g in %.2fs", self.tname, self.cap_km_val, t_calibrate)
@@ -2369,11 +2499,14 @@ class Pipeline:
                     t_total * 1e3,
                 )
                 log.debug(
-                    "volumetrics: rows_read=%d points_ingested=%d dropped_nan_inf=%d cells=%d levels=%d "
+                    "volumetrics: rows_read=%d points_ingested=%d dropped_nan_inf=%d "
+                    "dropped_out_of_domain=%d dropped_nonfinite_proj=%d cells=%d levels=%d "
                     "cells_per_level=%s value=%dB (raw %dB) support=%dB (raw %dB) compression_ratio=%.2f",
                     self.n_total,
                     self.n,
-                    self.n_dropped,
+                    self.n_dropped_nan_inf,
+                    self.n_dropped_out_of_domain,
+                    self.n_dropped_nonfinite_proj,
                     self.nx * self.ny,
                     self.levels,
                     cells_per_level,
@@ -2879,6 +3012,8 @@ class Pipeline:
                         grid_src.height,
                         *grid_src.bounds,
                     )
+                # Out-of-domain grid extent -> NaN/INT32_MIN transform (issue #74).
+                _check_default_transform(dst_transform, dst_width, dst_height, self.work_crs, self.out_crs)
 
                 out_crs = f"EPSG:{self.out_crs}"
                 # NoData-tile skip (C(ii), PR #27): the task blocks are the
@@ -3047,6 +3182,8 @@ class Pipeline:
                 self.x0 + self.nx * self.res,
                 self.y0 + self.ny * self.res,
             )
+            # Out-of-domain grid extent -> NaN/INT32_MIN transform (issue #74).
+            _check_default_transform(dst_transform, dst_width, dst_height, self.work_crs, self.out_crs)
             # Budgeted MT thread count from the turbo plan drives the warp pool;
             # the n_threads kwarg stays the explicit non-turbo knob.
             warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
