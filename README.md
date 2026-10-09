@@ -98,13 +98,16 @@ ppgrid data.csv --value-col premium --calibration calibration.json
 
 # Round output percentiles to a step (e.g. 5 -> 90/95/100) for clean vectorisation
 ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
+
+# Print help with examples (also: --help)
+ppgrid help
 ```
 
 ### CLI Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `input` | (required) | CSV or Parquet input path |
+| `input` | — | CSV or Parquet input path (bare `ppgrid` exits 2 with a hint; `ppgrid help` prints usage) |
 | `-o, --out` | `out/` | Output directory |
 | `--value-col` | `value` | Value column name |
 | `--lng-col` | `longitude` | Longitude column name |
@@ -128,6 +131,8 @@ ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
 | `--max-ram` | (none) | Explicit RAM cap in GB (overrides the `--turbo` preset). Implies `--turbo` |
 | `--ram-gb` | (none) | Alias of `--max-ram` |
 | `--turbo-strict` | False | Shared path infeasible under the budget: error + exit 3 instead of `[warn]` + per-box fallback (exit 0) |
+| `--verbose` | False | Debug logging: per-phase wall times + volumetric detail (shorthand for `--log-level debug`) |
+| `--log-level` | `info` | Progress log level on stderr: `error`, `warning`, `info`, `debug` (env `PPGRID_LOG_LEVEL`, legacy `LOGGING`; `verbose` = debug) |
 
 ### Turbo mode
 
