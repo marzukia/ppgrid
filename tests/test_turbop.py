@@ -157,6 +157,21 @@ def test_worked_table_rows(
         assert pl.est_peak_bytes / GB == pytest.approx(peak_gb, abs=0.05)
 
 
+def test_wall_range_regime_mismatch_fallback() -> None:
+    """A grid whose chosen regime differs from the table row takes the ±15% fallback.
+
+    Not the row's tabled range, which can exclude the central estimate
+    (the pre-fix bug at turbop.py wall_range_s).
+    """
+    pl = plan(cap_gb=32.0, n_cells=10_000, wc=100, radius=5, cpu=8)
+    row = table_row(32.0)
+    assert row is not None
+    assert pl.regime != row.regime  # small grid -> A, table row is B
+    lo, hi = pl.wall_range_s
+    assert (lo, hi) == pytest.approx((0.85 * pl.wall_s, 1.15 * pl.wall_s))
+    assert lo <= pl.wall_s <= hi
+
+
 def test_worked_table_anchor_ratios() -> None:
     """Wall ranges divide to the table's vs-anchor ratios (479.6 s)."""
     expected = {16.0: (0.60, 0.79), 32.0: (0.50, 0.69), 64.0: (0.24, 0.33), 128.0: (0.24, 0.33)}

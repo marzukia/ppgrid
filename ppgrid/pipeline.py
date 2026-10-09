@@ -1358,7 +1358,9 @@ def _turbo_write_parallel(
         data = ref_path.read_bytes()
     finally:
         ref_path.unlink(missing_ok=True)
-        del zero
+        # No `del zero` here (audit #78 P1-1, as in the stock writer): if the
+        # allocation fails `zero` is unbound and the del would mask the root
+        # error. The 512^2 tile local dies at function return anyway.
 
     try:
         info = _tif_parse_ifd(data)
