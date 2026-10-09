@@ -7,19 +7,22 @@ capped raster surface, in minutes, on a single machine, with no GPU.
 from __future__ import annotations
 
 import argparse
+import difflib
 import io
 import json
 import logging
 import math
 import os
+import shutil
 import struct
+import subprocess  # ruff: ignore[suspicious-subprocess-import] — git rev-parse for the --json summary
 import sys
 import threading
 import time
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from itertools import starmap
 from pathlib import Path
@@ -96,6 +99,13 @@ logging:
   LOGGING=verbose) adds a per-phase wall-time
   breakdown and volumetric detail (rows read, NaN/inf dropped, cells per level,
   output bytes raw vs compressed, resolved plan).
+
+exit codes:
+  0  ok (also: `ppgrid help` and `--plan`)
+  1  pipeline / I/O error (bad output path, missing input file, disk full)
+  2  validation error (bad flag value, missing input column, out dir not
+     empty without --force)
+  3  --turbo-strict: shared path infeasible under the RAM budget
 
 Run `ppgrid help` to print this text at any time."""
 
@@ -339,6 +349,51 @@ def _cap_km_arg(text: str) -> float | str:
     if text == "auto":
         return "auto"
     return _pos_float(text)
+
+
+def _crs_arg(text: str) -> int:
+    """Argparse type: an EPSG code, bare int or 'EPSG:<code>' string (#58).
+
+    Args:
+        text: Raw CLI argument string (e.g. '4326' or 'EPSG:4326').
+
+    Returns:
+        The parsed EPSG code.
+
+    Raises:
+        argparse.ArgumentTypeError: If text is not a bare int or EPSG-prefixed int.
+
+    """
+    t = text.strip()
+    if t.upper().startswith("EPSG:"):
+        t = t[len("EPSG:") :]
+    try:
+        return int(t)
+    except ValueError as exc:
+        msg = f"invalid EPSG code: {text!r} (use e.g. 4326 or 'EPSG:4326')"
+        raise argparse.ArgumentTypeError(msg) from exc
+
+
+def _workers_arg(text: str) -> int:
+    """Argparse type: a worker count, or 'auto' = os.cpu_count() (#59).
+
+    Args:
+        text: Raw CLI argument string.
+
+    Returns:
+        The parsed count ('auto' resolves to the logical CPU count).
+
+    Raises:
+        argparse.ArgumentTypeError: If text is not an int or 'auto'.
+
+    """
+    if text.lower() == "auto":
+        return os.cpu_count() or 1
+    try:
+        return int(text)
+    except ValueError as exc:
+        msg = f"invalid worker count: {text!r} (use a positive integer or 'auto')"
+        raise argparse.ArgumentTypeError(msg) from exc
 
 
 def _neighbour_block_ids(bx: int, by: int, nbx: int, nby: int) -> list[int]:
@@ -1588,6 +1643,8 @@ class Pipeline:
         turbo: bool = False,
         turbo_cap_gb: float | None = None,
         turbo_strict: bool = False,
+        seed: int = 0,
+        dry_run: bool = False,
     ) -> None:
         """Initialise the interpolation pipeline.
 
@@ -1598,6 +1655,7 @@ class Pipeline:
             ValueError: If n_threads is not >= 1.
             ValueError: If max_band_parallel is not >= 1.
             ValueError: If turbo_cap_gb is not > 0.
+            ValueError: If seed is not >= 0.
 
         """
         self.input_path = input_path
@@ -1640,6 +1698,13 @@ class Pipeline:
         self.turbo = turbo
         self.turbo_cap_gb = turbo_cap_gb
         self.turbo_strict = turbo_strict
+        if seed < 0:
+            msg = f"seed must be >= 0: {seed}"
+            raise ValueError(msg)
+        self.seed = seed
+        # --plan dry run: ingest/calibrate/grid run in memory only; no files
+        # (calibration.json, _points.npy) and no directories are created (#53).
+        self.dry_run = dry_run
         # Set by _turbo_precheck() (run(), after grid()).
         self._turbo_plan: turbop.TurboPlan | None = None
         self._turbo_decision: turbop.PrecheckDecision | None = None
@@ -1647,6 +1712,8 @@ class Pipeline:
         # Set by run(): labelled wall seconds (ingest sub-phases + write
         # sub-phases) for the DEBUG perf breakdown.
         self._phase_wall: dict[str, float] = {}
+        # Set by run() on success: machine-readable summary for --json (#55).
+        self._summary: dict[str, Any] | None = None
 
         if self.scale * PERCENTILE_MAX > INT16_MAX:
             msg = (
@@ -1801,7 +1868,7 @@ class Pipeline:
                 cal = json.load(f)
         elif not self.skip_calibration:
             if self.n > self.calib_max_points:
-                sub = np.random.default_rng(0).choice(self.n, self.calib_max_points, replace=False)
+                sub = np.random.default_rng(self.seed).choice(self.n, self.calib_max_points, replace=False)
                 cx, cy, cv = self.x[sub], self.y[sub], self.v[sub]
             else:
                 cx, cy, cv = self.x, self.y, self.v
@@ -1813,7 +1880,7 @@ class Pipeline:
                 # discarded anyway, and it dominates run time / memory).
                 cap, detail = float(self.cap_km), {}
             else:
-                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv))
+                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv), seed=self.seed)
 
             cal = {
                 "transform": tf.name,
@@ -1875,7 +1942,7 @@ class Pipeline:
         # a later --transform auto run reloading it would silently change the
         # output. allow_nan=False: a NaN that slips through is a loud error,
         # not silent non-strict JSON (issue #14).
-        if cal_fresh and cal is not None:
+        if cal_fresh and cal is not None and not self.dry_run:
             Path(self.out_dir).mkdir(parents=True, exist_ok=True)
             cal_path = cpath_obj or Path(self.out_dir) / "calibration.json"
             with cal_path.open("w", encoding="utf-8") as f:
@@ -1938,12 +2005,15 @@ class Pipeline:
 
         # Memmap for workers (bands PTS_X/PTS_Y/PTS_TV — see constants above).
         # Fresh 0600 file, never follows a pre-planted symlink (issue #15).
+        # Skipped in --plan dry-run mode (no files are created; the write
+        # phase, which reads it, never runs).
         self.pts_path = Path(self.out_dir) / "_points.npy"
-        pts = _open_fresh_memmap(self.pts_path, np.float64, (PTS_NBANDS, self.n))
-        pts[PTS_X] = self.x[order]
-        pts[PTS_Y] = self.y[order]
-        pts[PTS_TV] = self.tv[order]
-        pts.flush()
+        if not self.dry_run:
+            pts = _open_fresh_memmap(self.pts_path, np.float64, (PTS_NBANDS, self.n))
+            pts[PTS_X] = self.x[order]
+            pts[PTS_Y] = self.y[order]
+            pts[PTS_TV] = self.tv[order]
+            pts.flush()
 
         # Task list (one pass: blocks whose 3x3 neighbourhood holds points
         # are computed, the rest are written as nodata)
@@ -2022,8 +2092,186 @@ class Pipeline:
             # OOM, disk full — _points.npy + partial TIFF temps are removed
             # (issue #15).
             self._remove_run_temps()
-        self._log_run_summary(t_ingest, t_calibrate, t_grid, t_write, time.perf_counter() - t_total, vpath, spath)
+        t_total = time.perf_counter() - t_total
+        self._log_run_summary(t_ingest, t_calibrate, t_grid, t_write, t_total, vpath, spath)
+        self._summary = self._collect_summary(vpath, spath, t_ingest, t_calibrate, t_grid, t_write, t_total)
         return vpath, spath
+
+    def plan(self) -> None:
+        """Resolve the full run plan without the write phase (--plan, #53).
+
+        Runs ingest -> calibrate -> grid -> turbo precheck; with dry_run
+        active no files or directories are created. A --turbo-strict
+        infeasibility in the precheck exits 3 (SystemExit propagates).
+
+        """
+        self.ingest()
+        self.calibrate()
+        self.grid()
+        self._turbo_precheck()
+
+    def plan_text(self, args: argparse.Namespace) -> str:
+        """Human-readable run plan for --plan (issue #53); printed on stdout.
+
+        Args:
+            args: Parsed CLI namespace (input/columns/out paths, --json).
+
+        Returns:
+            The multi-line plan text.
+
+        """
+        out = Path(args.out)
+        pct_step = f"{self.percentile_step:g}" if self.percentile_step is not None else "off"
+        mbp = f"{args.max_band_parallel}" if args.max_band_parallel is not None else "default (--workers)"
+        json_extra = " + run_summary.json" if args.json else ""
+        cells_line = (
+            f"  grid cells:    {self.nx} x {self.ny} = {self.nx * self.ny:,} cells @ res={self.res:g} m "
+            f"(padded {self.nx_padded} x {self.ny_padded}, step {self.step})"
+        )
+        blocks_line = (
+            f"  blocks:        {self.nbx} x {self.nby} of bsize={self.bsize} "
+            f"({len(self.tasks)} tasks, {len(self.empty_blocks)} empty)"
+        )
+        lines = [
+            "ppgrid run plan (--plan: nothing written, exit 0)",
+            f"  input:         {args.input}",
+            f"  columns:       value={args.value_col!r} lng={args.lng_col!r} lat={args.lat_col!r}",
+            f"  out dir:       {args.out} ({'exists' if out.is_dir() else 'does not exist yet'})",
+            f"  ingest:        {self.n_total} rows -> {self.n} points ({self.n_dropped} NaN/inf dropped)",
+            f"  grid extent:   x0={self.x0:.3f} m, y0={self.y0:.3f} m (work CRS EPSG:{self.work_crs}, metres)",
+            cells_line,
+            f"  levels:        {self.levels} (halo {self.halo}, cap {self.cap_km_val:g} km)",
+            blocks_line,
+            f"  transform:     {self.tname}",
+            f"  saturation:    {self.saturation:g}",
+            f"  scale:         {self.scale:g} (DN = percentile * scale), percentile-step: {pct_step}",
+            f"  seed:          {self.seed}",
+            f"  workers:       {self.workers}, max-band-parallel: {mbp}",
+            f"  compress:      {self.compress}",
+            f"  outputs:       value.tif (EPSG:{self.out_crs}) + support_km.tif{json_extra}",
+        ]
+        if self.turbo and self._turbo_decision is not None and self._turbo_plan is not None:
+            d, t = self._turbo_decision, self._turbo_plan
+            lines.append(
+                f"  turbo:         on — regime {d.regime}, path {d.path}, cap {t.cap_gb:g} GB, "
+                f"budget {d.budget_gb:g} GB, est peak {d.est_peak_gb:g} GB, workers {t.workers}"
+            )
+        elif self.turbo:
+            lines.append("  turbo:         on")
+        else:
+            lines.append("  turbo:         off")
+        return "\n".join(lines)
+
+    def run_summary(self) -> dict[str, Any]:
+        """Machine-readable summary of the last successful run() (for --json, #55).
+
+        Returns:
+            Dict with timings, volumetrics, grid metadata, calibration,
+            seed and output paths (CLI params + git commit are added by main).
+
+        Raises:
+            RuntimeError: If run() has not completed successfully.
+
+        """
+        if self._summary is None:
+            msg = "run_summary() called before a successful run()"
+            raise RuntimeError(msg)
+        return self._summary
+
+    def _collect_summary(
+        self,
+        vpath: str,
+        spath: str,
+        t_ingest: float,
+        t_calibrate: float,
+        t_grid: float,
+        t_write: float,
+        t_total: float,
+    ) -> dict[str, Any]:
+        """Assemble the --json run summary dict from post-run state (#55).
+
+        All values are plain Python types (JSON-safe): numpy scalars are
+        converted, the turbo dataclasses go through asdict().
+
+        """
+        pw = self._phase_wall
+        disk_v = Path(vpath).stat().st_size
+        disk_s = Path(spath).stat().st_size
+        raw = self.nx * self.ny * 2  # one int16 band
+        cells_per_level = [(self.nx_padded >> k) * (self.ny_padded >> k) for k in range(self.levels + 1)]
+        turbo: dict[str, Any] | None = None
+        if self._turbo_decision is not None:
+            turbo = {
+                "enabled": True,
+                "decision": asdict(self._turbo_decision),
+                "plan": asdict(self._turbo_plan) if self._turbo_plan is not None else None,
+                "budget_bytes": self._turbo_budget_bytes,
+            }
+
+        def ms(seconds: float) -> float:
+            return round(seconds * 1e3, 3)
+
+        return {
+            "ppgrid_version": __version__,
+            "seed": self.seed,
+            "transform": self.tname,
+            "cap_km": float(self.cap_km_val),
+            "grid": {
+                "nx": self.nx,
+                "ny": self.ny,
+                "cells": self.nx * self.ny,
+                "res_m": float(self.res),
+                "x0_m": float(self.x0),
+                "y0_m": float(self.y0),
+                "nx_padded": self.nx_padded,
+                "ny_padded": self.ny_padded,
+                "levels": self.levels,
+                "step": self.step,
+                "halo": self.halo,
+                "bsize": self.bsize,
+                "nbx": self.nbx,
+                "nby": self.nby,
+                "n_tasks": len(self.tasks),
+                "n_empty_blocks": len(self.empty_blocks),
+                "src_crs": self.src_crs,
+                "work_crs": self.work_crs,
+                "out_crs": self.out_crs,
+                "saturation": float(self.saturation),
+                "scale": float(self.scale),
+                "percentile_step": self.percentile_step,
+                "block_size": self.block_size,
+                "compress": self.compress,
+            },
+            "ingest": {
+                "rows_read": self.n_total,
+                "points": self.n,
+                "dropped_nan_inf": self.n_dropped,
+            },
+            "calibration": self._cal,
+            "timings_ms": {
+                "ingest": ms(t_ingest),
+                "calibrate": ms(t_calibrate),
+                "grid": ms(t_grid),
+                "write": ms(t_write),
+                "total": ms(t_total),
+                "subphases": {k: ms(v) for k, v in pw.items()},
+            },
+            "volumetrics": {
+                "value": {
+                    "raw_bytes": raw,
+                    "compressed_bytes": disk_v,
+                    "compression_ratio": (raw / disk_v) if disk_v else None,
+                },
+                "support": {
+                    "raw_bytes": raw,
+                    "compressed_bytes": disk_s,
+                    "compression_ratio": (raw / disk_s) if disk_s else None,
+                },
+                "cells_per_level": cells_per_level,
+            },
+            "turbo": turbo,
+            "outputs": {"value": vpath, "support": spath},
+        }
 
     def _log_run_summary(
         self,
@@ -2220,9 +2468,15 @@ class Pipeline:
         self._turbo_plan = plan
         self._turbo_decision = decision
         self._turbo_budget_bytes = plan.budget_bytes
-        print(decision.summary)  # ruff: ignore[print]
-        if decision.message:
-            print(decision.message, file=sys.stderr)  # ruff: ignore[print]
+        if self.dry_run:
+            # --plan: the plan printout carries the decision; only a hard
+            # failure (--turbo-strict infeasible) says its piece on stderr.
+            if decision.exit_code == 3 and decision.message:
+                print(decision.message, file=sys.stderr)  # ruff: ignore[print]
+        else:
+            print(decision.summary)  # ruff: ignore[print]
+            if decision.message:
+                print(decision.message, file=sys.stderr)  # ruff: ignore[print]
         if decision.exit_code == 3:
             raise SystemExit(3)
 
@@ -2889,11 +3143,228 @@ def run(
     return p.run()
 
 
-def _resolve_log_level(*, verbose: bool, log_level: str | None) -> str:
-    """Resolve the ppgrid log level: explicit flag > env > default info.
+def _input_columns(path: str) -> list[str] | None:
+    """Cheaply read the input file's column names for the #57 preflight.
 
-    Precedence: `--log-level` (most specific) > `--verbose` (shorthand for
-    debug) > `LOGGING` > `info`.
+    Args:
+        path: CSV or Parquet input path.
+
+    Returns:
+        Column name list, or None when they cannot be read cheaply (missing
+        file, unreadable format, parquet without pyarrow) — the pipeline run
+        then reports the real error.
+
+    """
+    try:
+        if path.endswith((".parquet", ".pq")):
+            import pyarrow.parquet as pq
+
+            with pq.ParquetFile(path) as f:
+                return [str(n) for n in f.schema.names]
+        df = pd.read_csv(path, nrows=0)
+        return [str(c) for c in df.columns]
+    except Exception:  # ruff: ignore[blind-except] — preflight is best-effort; the run reports the real error
+        return None
+
+
+def _check_columns(path: str, value_col: str, lng_col: str, lat_col: str) -> None:
+    """Exit 2 with the real columns + closest matches on a missing column (#57).
+
+    Args:
+        path: Input file path.
+        value_col: --value-col name.
+        lng_col: --lng-col name.
+        lat_col: --lat-col name.
+
+    Raises:
+        SystemExit: code 2 when a requested column is absent from the input.
+
+    """
+    cols = _input_columns(path)
+    if cols is None:
+        return
+    for flag, name in (("--value-col", value_col), ("--lng-col", lng_col), ("--lat-col", lat_col)):
+        if name in cols:
+            continue
+        shown = ", ".join(cols[:24]) + (f", ... ({len(cols)} total)" if len(cols) > 24 else "")
+        lines = [
+            f"error: {flag} {name!r} not found in {path}",
+            f"  columns found: {shown}",
+        ]
+        close = difflib.get_close_matches(name, cols, n=3)
+        if close:
+            lines.append(f"  did you mean: {', '.join(close)}?")
+        print("\n".join(lines), file=sys.stderr)  # ruff: ignore[print]
+        raise SystemExit(2)
+
+
+def _git_commit() -> str | None:
+    """HEAD commit of the checkout this package runs from (None outside git).
+
+    Runs a short `git rev-parse HEAD` in the package directory so an installed
+    (non-git) copy yields None instead of a hang or a wrong hash.
+
+    Returns:
+        Commit hash string, or None.
+
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        # argv is [which(git), "rev-parse", "HEAD"] — fully controlled, not untrusted input
+        r = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+            [git, "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
+    """Build the Pipeline from parsed CLI args (shared by --plan and run).
+
+    Resolves the turbo flag/cap pair in one place so the two paths cannot
+    drift.
+
+    Args:
+        args: Parsed CLI namespace.
+        dry_run: True for --plan (no files created).
+
+    Returns:
+        Configured Pipeline, not yet run.
+
+    """
+    turbo = args.turbo is not None or args.max_ram is not None
+    turbo_cap_gb: float | None
+    if args.max_ram is not None:
+        turbo_cap_gb = args.max_ram
+    elif args.turbo not in (None, "auto"):
+        turbo_cap_gb = float(args.turbo)
+    else:
+        turbo_cap_gb = None
+    return Pipeline(
+        args.input,
+        args.value_col,
+        args.lng_col,
+        args.lat_col,
+        args.out,
+        res=args.res,
+        cap_km=args.cap_km,
+        transform=args.transform,
+        saturation=args.saturation,
+        block_size=args.block,
+        workers=args.workers,
+        calib_path=args.calibration,
+        scale=args.scale,
+        percentile_step=args.percentile_step,
+        compress=args.compress,
+        calib_max_points=args.calib_max_points,
+        src_crs=args.src_crs,
+        work_crs=args.work_crs,
+        out_crs=args.out_crs,
+        skip_calibration=args.skip_calibration,
+        max_band_parallel=args.max_band_parallel,
+        turbo=turbo,
+        turbo_cap_gb=turbo_cap_gb,
+        turbo_strict=args.turbo_strict,
+        seed=args.seed,
+        dry_run=dry_run,
+    )
+
+
+def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
+    """Run a pipeline phase, mapping exceptions to the CLI exit-code contract.
+
+    Shared by the --plan phases and the full run so both report identically:
+    exit 1 for pipeline/IO errors, exit 2 for validation errors (bad
+    columns, no valid points), exit 3 passes through (--turbo-strict).
+
+    Args:
+        fn: Zero-arg callable running the phase (or the full run).
+        input_path: Input path for the FileNotFoundError message.
+
+    Returns:
+        The callable's return value.
+
+    Raises:
+        SystemExit: 1 (pipeline/IO) or 2 (validation).
+
+    """
+    try:
+        return fn()
+    except CRSError as e:
+        _die(str(e))
+    except ImportError as e:
+        # e.g. parquet input without the optional pyarrow extra.
+        _die(str(e))
+    except FileNotFoundError as e:
+        _die(f"input file not found: {e.filename or input_path}")
+    except pd.errors.ParserError as e:
+        _die(f"malformed input file: {e}")
+    except (KeyError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
+        raise SystemExit(2) from None
+    except OSError as e:
+        # NotADirectoryError, disk full, etc.
+        _die(str(e))
+
+
+def _sanitize_json(obj: Any) -> Any:
+    """Recursively replace non-finite floats with None (strict JSON, #55).
+
+    An external --calibration file may carry NaN/Infinity literals in
+    fields that are not pre-validated; json.dump(allow_nan=False) would
+    raise, so they become null in the summary.
+
+    Args:
+        obj: Summary structure (dict/list/scalar).
+
+    Returns:
+        A copy containing only finite floats.
+
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    return obj
+
+
+def _write_json_summary(p: Pipeline, args: argparse.Namespace, out: Path) -> None:
+    """Write <out>/run_summary.json for --json (issue #55); stdout stays clean.
+
+    Args:
+        p: Pipeline after a successful run() (provides run_summary()).
+        args: Parsed CLI namespace (recorded under 'cli').
+        out: Output directory.
+
+    """
+    summary = p.run_summary()
+    summary["cli"] = dict(vars(args))
+    summary["git_commit"] = _git_commit()
+    path = out / "run_summary.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(_sanitize_json(summary), f, indent=2, allow_nan=False)
+        f.write("\n")
+    log.info("run summary: %s", path)
+
+
+def _resolve_log_level(*, verbose: bool, log_level: str | None, quiet: bool = False) -> str:
+    """Resolve the ppgrid log level: explicit flag > quiet > verbose > env > info.
+
+    Precedence: `--log-level` (most specific) > `--quiet` (suppress below
+    WARNING, #52) > `--verbose` (shorthand for debug) > `LOGGING` > `info`.
     Env values accept the four level names or the alias `verbose` (case-
     insensitive, = debug); an unrecognized value warns and falls back to
     info (a mistyped env var must not break the run).
@@ -2901,6 +3372,7 @@ def _resolve_log_level(*, verbose: bool, log_level: str | None) -> str:
     Args:
         verbose: --verbose flag.
         log_level: --log-level flag value, or None when the flag is absent.
+        quiet: --quiet flag (suppress stderr below WARNING).
 
     Returns:
         One of 'error', 'warning', 'info', 'debug'.
@@ -2908,19 +3380,19 @@ def _resolve_log_level(*, verbose: bool, log_level: str | None) -> str:
     """
     if log_level is not None:
         return log_level
+    if quiet:
+        return "warning"
     if verbose:
         return "debug"
-    for var in ("LOGGING",):
-        raw = os.environ.get(var)
-        if raw is None:
-            continue
-        val = raw.strip().lower()
-        if val == "verbose":
-            return "debug"
-        if val in _LOG_LEVELS:
-            return val
-        print(f"warning: unrecognized {var}={raw!r}; using 'info'", file=sys.stderr)  # ruff: ignore[print]
+    raw = os.environ.get("LOGGING")
+    if raw is None:
         return "info"
+    val = raw.strip().lower()
+    if val == "verbose":
+        val = "debug"
+    if val in _LOG_LEVELS:
+        return val
+    print(f"warning: unrecognized LOGGING={raw!r}; using 'info'", file=sys.stderr)  # ruff: ignore[print]
     return "info"
 
 
@@ -2975,7 +3447,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Counts for a cell to fully self-trust",
     )
     parser.add_argument("--block", type=int, default=DEFAULT_BLOCK, help="Block size in cells")
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of workers")
+    parser.add_argument(
+        "--workers",
+        type=_workers_arg,
+        default=DEFAULT_WORKERS,
+        help="Number of workers (positive integer, or 'auto' = os.cpu_count()); default 4",
+    )
     parser.add_argument("--scale", type=_pos_float, default=DEFAULT_SCALE, help="DN = percentile * scale")
     parser.add_argument(
         "--percentile-step",
@@ -2986,15 +3463,55 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compress", default="ZSTD")
     parser.add_argument("--calib-max-points", type=int, default=CALIB_MAX_POINTS_DEFAULT)
     parser.add_argument("--calibration", default=None, help="Calibration JSON path")
-    parser.add_argument("--src-crs", type=int, default=SRC_CRS)
+    parser.add_argument(
+        "--src-crs",
+        type=_crs_arg,
+        default=SRC_CRS,
+        help=f"Input CRS as a bare int or 'EPSG:<code>' string (default {SRC_CRS})",
+    )
     parser.add_argument(
         "--work-crs",
-        type=int,
+        type=_crs_arg,
         default=WORK_CRS,
-        help=f"Working CRS for interpolation (default {WORK_CRS})",
+        help=f"Working CRS for interpolation, bare int or 'EPSG:<code>' (default {WORK_CRS})",
     )
-    parser.add_argument("--out-crs", type=int, default=OUT_CRS, help=f"Output CRS (default {OUT_CRS})")
+    parser.add_argument(
+        "--out-crs",
+        type=_crs_arg,
+        default=OUT_CRS,
+        help=f"Output CRS, bare int or 'EPSG:<code>' (default {OUT_CRS})",
+    )
     parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for the calibration subsampling and blocked-CV bootstrap (default 0; "
+        "same seed + same input -> reproducible outputs)",
+    )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="Resolve the full run plan, print it, and exit 0 before running; creates no files or directories",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing outputs in the out dir (default: exit 2 when value.tif / "
+        "support_km.tif / calibration.json / run_summary.json are already present)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Write a machine-readable run summary to <out>/run_summary.json "
+        "(phase timings, volumetrics, grid, calibration, CLI params; stdout stays clean)",
+    )
+    parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress stderr below WARNING (beats --verbose and LOGGING; an explicit --log-level wins)",
+    )
     parser.add_argument(
         "--max-band-parallel",
         type=int,
@@ -3044,9 +3561,10 @@ def main(argv: list[str] | None = None) -> None:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
 
     Raises:
-        SystemExit: exit 0 for `ppgrid help`, exit 1 for pipeline/IO errors
-        (`_die`), exit 2 for missing input or value validation errors, exit 3
-        for `--turbo-strict` shared-path infeasibility.
+        SystemExit: exit 0 for `ppgrid help` (and `--plan`), exit 1 for
+        pipeline/IO errors (`_die`), exit 2 for missing input, validation
+        errors, missing input columns (#57), or a non-empty out dir without
+        --force (#54), exit 3 for `--turbo-strict` shared-path infeasibility.
 
     """
     parser = _build_parser()
@@ -3061,7 +3579,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         raise SystemExit(0)
 
-    _configure_logging(_resolve_log_level(verbose=args.verbose, log_level=args.log_level))
+    _configure_logging(_resolve_log_level(verbose=args.verbose, log_level=args.log_level, quiet=args.quiet))
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
@@ -3073,6 +3591,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--max-band-parallel must be at least 1")
     if args.calib_max_points < 1:
         parser.error("--calib-max-points must be at least 1")
+    if args.seed < 0:
+        parser.error("--seed must be >= 0")
     for flag, val in (("--src-crs", args.src_crs), ("--work-crs", args.work_crs), ("--out-crs", args.out_crs)):
         if val <= 0:
             parser.error(f"{flag} must be a positive EPSG code")
@@ -3084,65 +3604,50 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--max-ram and --ram-gb are aliases and must match")
     if args.turbo_strict and args.turbo is None and args.max_ram is None:
         parser.error("--turbo-strict requires --turbo or --max-ram")
-    turbo = args.turbo is not None or args.max_ram is not None
-    if args.max_ram is not None:
-        turbo_cap_gb: float | None = args.max_ram
-    elif args.turbo not in (None, "auto"):
-        turbo_cap_gb = float(args.turbo)
-    else:
-        turbo_cap_gb = None
 
     out = Path(args.out)
     if out.exists() and not out.is_dir():
         _die(f"output path is a file, not a directory: {args.out}")
+
+    if args.plan:
+        # #53: resolve the full plan (ingest -> calibrate -> grid -> turbo
+        # precheck) in memory, print it, and exit 0. dry_run keeps calibrate
+        # and grid from writing files, so nothing is created.
+        # #57: column preflight first (same error as the run path).
+        _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
+        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=True), args.input)
+        _map_pipeline_errors(p.plan, args.input)
+        print(p.plan_text(args))  # ruff: ignore[print]
+        raise SystemExit(0)
+
+    # #54: overwrite guard — a non-empty out dir means an earlier run's
+    # outputs; require --force to clobber them.
+    if not args.force:
+        guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
+        existing = [name for name in guarded if (out / name).is_file()]
+        if existing:
+            print(f"error: output directory {args.out} already contains: {', '.join(existing)}", file=sys.stderr)  # ruff: ignore[print]
+            print("hint: pass --force to overwrite them", file=sys.stderr)  # ruff: ignore[print]
+            raise SystemExit(2)
+
     try:
+        # #57: friendly missing-column error before any pipeline work; inside
+        # the stale-outputs handler so a failed run over an earlier run's
+        # outputs still warns (issue #40).
+        _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
         out.mkdir(parents=True, exist_ok=True)
+    except SystemExit:
+        _warn_stale_outputs(out)
+        raise
     except OSError as e:
         _die(f"cannot create output directory {args.out}: {e}")
     try:
-        try:
-            run(
-                args.input,
-                args.value_col,
-                args.lng_col,
-                args.lat_col,
-                args.out,
-                res=args.res,
-                cap_km=args.cap_km,
-                transform=args.transform,
-                saturation=args.saturation,
-                block_size=args.block,
-                workers=args.workers,
-                calib_path=args.calibration,
-                scale=args.scale,
-                percentile_step=args.percentile_step,
-                compress=args.compress,
-                calib_max_points=args.calib_max_points,
-                src_crs=args.src_crs,
-                work_crs=args.work_crs,
-                out_crs=args.out_crs,
-                skip_calibration=args.skip_calibration,
-                max_band_parallel=args.max_band_parallel,
-                turbo=turbo,
-                turbo_cap_gb=turbo_cap_gb,
-                turbo_strict=args.turbo_strict,
-            )
-        except CRSError as e:
-            # Invalid --src-crs / --work-crs / --out-crs (proj_create failure).
-            _die(str(e))
-        except ImportError as e:
-            # e.g. parquet input without the optional pyarrow extra.
-            _die(str(e))
-        except FileNotFoundError as e:
-            _die(f"input file not found: {e.filename or args.input}")
-        except pd.errors.ParserError as e:
-            _die(f"malformed input file: {e}")
-        except (KeyError, ValueError) as e:
-            print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
-            raise SystemExit(2) from None
-        except OSError as e:
-            # NotADirectoryError, disk full, etc.
-            _die(str(e))
+        # Construction (init validation, e.g. --scale range) gets the same
+        # exit-code mapping as the run phase (review M-1, #56 contract).
+        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False), args.input)
+        _map_pipeline_errors(p.run, args.input)
+        if args.json:
+            _write_json_summary(p, args, out)
     except SystemExit as e:
         # Any non-zero exit with an earlier run's rasters in place: warn
         # instead of staying silent (issue #40).
