@@ -132,7 +132,7 @@ ppgrid help
 | `--ram-gb` | (none) | Alias of `--max-ram` |
 | `--turbo-strict` | False | Shared path infeasible under the budget: error + exit 3 instead of `[warn]` + per-box fallback (exit 0) |
 | `--verbose` | False | Debug logging: per-phase wall times + volumetric detail (shorthand for `--log-level debug`) |
-| `--log-level` | `info` | Progress log level on stderr: `error`, `warning`, `info`, `debug` (env `PPGRID_LOG_LEVEL`, legacy `LOGGING`; `verbose` = debug) |
+| `--log-level` | `info` | Progress log level on stderr: `error`, `warning`, `info`, `debug` (env `LOGGING`; `verbose` = debug) |
 
 ### Turbo mode
 

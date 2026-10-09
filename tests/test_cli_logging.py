@@ -1,7 +1,7 @@
 """CLI help command + leveled logging tests.
 
 Covers: the `ppgrid help` subcommand, the no-input error hint, the enriched
---help epilog, --verbose / --log-level / PPGRID_LOG_LEVEL / LOGGING resolution,
+--help epilog, --verbose / --log-level / LOGGING resolution,
 INFO phase progress + summary lines, DEBUG perf/volumetric lines, and
 byte-identical output with and without --verbose (logging is side-channel).
 """
@@ -84,14 +84,12 @@ def test_parser_log_flags() -> None:
         (False, None, {}, "info"),  # default
         (True, None, {}, "debug"),  # --verbose shorthand
         (False, "debug", {}, "debug"),
-        (False, "info", {"PPGRID_LOG_LEVEL": "debug"}, "info"),  # explicit flag beats env
-        (True, None, {"PPGRID_LOG_LEVEL": "error"}, "debug"),  # --verbose beats env
-        (True, "warning", {"PPGRID_LOG_LEVEL": "error"}, "warning"),  # explicit level beats --verbose
-        (False, None, {"PPGRID_LOG_LEVEL": "debug", "LOGGING": "error"}, "debug"),  # PPGRID beats legacy
-        (False, None, {"LOGGING": "error"}, "error"),  # legacy alias
-        (False, None, {"LOGGING": "verbose"}, "debug"),  # legacy alias value
-        (False, None, {"PPGRID_LOG_LEVEL": "verbose"}, "debug"),
-        (False, None, {"PPGRID_LOG_LEVEL": "bogus"}, "info"),  # unrecognized -> info
+        (False, "info", {"LOGGING": "debug"}, "info"),  # explicit flag beats env
+        (True, None, {"LOGGING": "error"}, "debug"),  # --verbose beats env
+        (True, "warning", {"LOGGING": "error"}, "warning"),  # explicit level beats --verbose
+        (False, None, {"LOGGING": "error"}, "error"),  # env var
+        (False, None, {"LOGGING": "verbose"}, "debug"),  # verbose alias value
+        (False, None, {"LOGGING": "bogus"}, "info"),  # unrecognized -> info
     ],
 )
 def test_resolve_log_level_precedence(
@@ -102,8 +100,7 @@ def test_resolve_log_level_precedence(
     env: dict[str, str],
     expect: str,
 ) -> None:
-    """Resolution precedence: --log-level > --verbose > PPGRID_LOG_LEVEL > LOGGING > info."""
-    monkeypatch.delenv("PPGRID_LOG_LEVEL", raising=False)
+    """Resolution precedence: --log-level > --verbose > LOGGING > info."""
     monkeypatch.delenv("LOGGING", raising=False)
     for key, val in env.items():
         monkeypatch.setenv(key, val)

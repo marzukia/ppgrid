@@ -91,7 +91,7 @@ examples:
 logging:
   Progress goes to stderr (stdout stays clean). Default level is info (one line
   per phase + a final summary). --verbose (or --log-level debug, or
-  PPGRID_LOG_LEVEL=verbose / LOGGING=verbose) adds a per-phase wall-time
+  LOGGING=verbose) adds a per-phase wall-time
   breakdown and volumetric detail (rows read, NaN/inf dropped, cells per level,
   output bytes raw vs compressed, resolved plan).
 
@@ -2037,7 +2037,7 @@ class Pipeline:
 
         INFO (default): one line per phase, then a final summary
         (rows -> grid WxH cells, total wall time, output paths). DEBUG
-        (--verbose / PPGRID_LOG_LEVEL=verbose): per-phase wall time in ms,
+        (--verbose / LOGGING=verbose): per-phase wall time in ms,
         volumetric counts (rows read, NaN/inf dropped, cells per level,
         output bytes raw vs compressed) and the resolved plan.
 
@@ -2888,7 +2888,7 @@ def _resolve_log_level(*, verbose: bool, log_level: str | None) -> str:
     """Resolve the ppgrid log level: explicit flag > env > default info.
 
     Precedence: `--log-level` (most specific) > `--verbose` (shorthand for
-    debug) > `PPGRID_LOG_LEVEL` > `LOGGING` (legacy alias) > `info`.
+    debug) > `LOGGING` > `info`.
     Env values accept the four level names or the alias `verbose` (case-
     insensitive, = debug); an unrecognized value warns and falls back to
     info (a mistyped env var must not break the run).
@@ -2905,7 +2905,7 @@ def _resolve_log_level(*, verbose: bool, log_level: str | None) -> str:
         return log_level
     if verbose:
         return "debug"
-    for var in ("PPGRID_LOG_LEVEL", "LOGGING"):
+    for var in ("LOGGING",):
         raw = os.environ.get(var)
         if raw is None:
             continue
@@ -3027,7 +3027,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-level",
         choices=list(_LOG_LEVELS),
         default=None,
-        help="Progress log level on stderr (default info; env PPGRID_LOG_LEVEL, legacy LOGGING; 'verbose' = debug)",
+        help="Progress log level on stderr (default info; env LOGGING; 'verbose' = debug)",
     )
     return parser
 
