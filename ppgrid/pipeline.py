@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import math
 import os
 import struct
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from functools import partial
 from itertools import starmap
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Self
 
 import numpy as np
 import pandas as pd
@@ -67,6 +68,61 @@ from .pullpush import (
 # another thread can restore a stale filter snapshot and leak the benign
 # warning. It carries no information here, so ignore the category.
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+
+# Module logger (pattern shared with turbop.py). The CLI configures the
+# `ppgrid` logger (level + compact stderr format) in main(); library users
+# who never call main() see at most WARNING+ via the lastResort handler.
+log = logging.getLogger("ppgrid.pipeline")
+
+_LOG_FORMAT = "%(levelname).1s %(name)s: %(message)s"
+_LOG_LEVELS: tuple[str, ...] = ("error", "warning", "info", "debug")
+
+_EPILOG = """\
+examples:
+  # Basic run: 10 km cells, auto transform and fill cap, default 4 workers
+  ppgrid data/melb_houses.csv -o out/melb_10km --res 10000 --value-col price
+
+  # Custom transform, CRS and DN scale: log10 values, WGS84 output, DN = 10*percentile
+  ppgrid data/all_equakes.csv -o out/eq --transform log10 --out-crs 4326 --scale 10 --cap-km 20 --value-col mag
+
+  # Turbo / low-RAM: 32 GB budget, strict (exit 3 if infeasible).
+  # au_gcc_sparse.csv is the production dataset (not in the repo); any sparse
+  # CSV with lng/lat/value columns works.
+  ppgrid data/au_gcc_sparse.csv -o out/au --turbo 32 --turbo-strict --workers 8
+
+logging:
+  Progress goes to stderr (stdout stays clean). Default level is info (one line
+  per phase + a final summary). --verbose (or --log-level debug, or
+  LOGGING=verbose) adds a per-phase wall-time
+  breakdown and volumetric detail (rows read, NaN/inf dropped, cells per level,
+  output bytes raw vs compressed, resolved plan).
+
+Run `ppgrid help` to print this text at any time."""
+
+
+class _WallPhase:
+    """Context manager: accumulate wall seconds for `label` into `times`.
+
+    Feeds the DEBUG per-phase breakdown in Pipeline.run() (time.perf_counter
+    only; no I/O, and the logged lines are level-gated, so the default INFO
+    run pays nothing but two counter reads per phase).
+    """
+
+    __slots__ = ("label", "t0", "times")
+
+    def __init__(self, label: str, times: dict[str, float]) -> None:
+        self.label = label
+        self.times = times
+        self.t0 = 0.0
+
+    def __enter__(self) -> Self:
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.times[self.label] = self.times.get(self.label, 0.0) + (time.perf_counter() - self.t0)
+        return False
+
 
 WORK_CRS: int = 6933  # Wagner VII — global equal-area, metres are true
 SRC_CRS: int = 4326  # WGS 84 lon/lat (default input)
@@ -1588,6 +1644,9 @@ class Pipeline:
         self._turbo_plan: turbop.TurboPlan | None = None
         self._turbo_decision: turbop.PrecheckDecision | None = None
         self._turbo_budget_bytes: float | None = None
+        # Set by run(): labelled wall seconds (ingest sub-phases + write
+        # sub-phases) for the DEBUG perf breakdown.
+        self._phase_wall: dict[str, float] = {}
 
         if self.scale * PERCENTILE_MAX > INT16_MAX:
             msg = (
@@ -1601,6 +1660,8 @@ class Pipeline:
         self.x: np.ndarray
         self.y: np.ndarray
         self.n: int
+        self.n_total: int  # rows read (pre-filter), for the volumetric log lines
+        self.n_dropped: int  # NaN/inf rows dropped, for the volumetric log lines
 
         # Calibration outputs
         self.tf: Any
@@ -1661,9 +1722,12 @@ class Pipeline:
             with _prof.phase("ingest.csv"):
                 v, lon, lat = self._read_points(wanted)
 
+        # Volumetric (DEBUG log): rows read vs valid points after filtering.
+        self.n_total = int(v.size)
         good = np.isfinite(v) & np.isfinite(lon) & np.isfinite(lat)
         v, lon, lat = v[good], lon[good], lat[good]
         self.n = len(v)
+        self.n_dropped = self.n_total - self.n
 
         if self.n == 0:
             msg = "No valid points found in input. Check columns and data."
@@ -1925,25 +1989,153 @@ class Pipeline:
     def run(self) -> tuple[str, str]:
         """Execute the full pipeline.
 
+        Logs phase progress at INFO and a per-phase wall-time + volumetric
+        breakdown at DEBUG (see _log_run_summary). Logging is side-channel
+        only: it never touches the raster bytes.
+
         Returns:
             Tuple of value and support GeoTIFF file paths.
 
         """
+        self._phase_wall = {}
+        t_total = time.perf_counter()
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
+        t0 = time.perf_counter()
         with _prof.phase("ingest"):
             self.ingest()
+        t_ingest = time.perf_counter() - t0
+        t0 = time.perf_counter()
         with _prof.phase("calibrate"):
             self.calibrate()
+        t_calibrate = time.perf_counter() - t0
         try:
+            t0 = time.perf_counter()
             with _prof.phase("grid"):
                 self.grid()
+            t_grid = time.perf_counter() - t0
             self._turbo_precheck()
-            return self._write_rasters()
+            t0 = time.perf_counter()
+            vpath, spath = self._write_rasters()
+            t_write = time.perf_counter() - t0
         finally:
             # Temp cleanup on every path: grid failure, mid-run worker error,
             # OOM, disk full — _points.npy + partial TIFF temps are removed
             # (issue #15).
             self._remove_run_temps()
+        self._log_run_summary(t_ingest, t_calibrate, t_grid, t_write, time.perf_counter() - t_total, vpath, spath)
+        return vpath, spath
+
+    def _log_run_summary(
+        self,
+        t_ingest: float,
+        t_calibrate: float,
+        t_grid: float,
+        t_write: float,
+        t_total: float,
+        vpath: str,
+        spath: str,
+    ) -> None:
+        """Emit the run's log lines: phase progress (INFO) + detail (DEBUG).
+
+        INFO (default): one line per phase, then a final summary
+        (rows -> grid WxH cells, total wall time, output paths). DEBUG
+        (--verbose / LOGGING=verbose): per-phase wall time in ms,
+        volumetric counts (rows read, NaN/inf dropped, cells per level,
+        output bytes raw vs compressed) and the resolved plan.
+
+        Never raises: a logging failure must not fail a successful run.
+
+        Args:
+            t_ingest: ingest wall seconds.
+            t_calibrate: calibrate wall seconds.
+            t_grid: grid (spatial index) wall seconds.
+            t_write: write (interpolate + reproject + raster I/O) wall seconds.
+            t_total: total run wall seconds.
+            vpath: Value GeoTIFF path.
+            spath: Support GeoTIFF path.
+
+        """
+        pw = self._phase_wall
+        try:
+            reproj_s = pw.get("reproject_value", 0.0) + pw.get("reproject_support", 0.0)
+            interp_s = pw.get("interpolate", 0.0) + pw.get("descent", 0.0)
+            log.info(
+                "ingest: %d rows -> %d points (%d NaN/inf dropped) in %.2fs",
+                self.n_total,
+                self.n,
+                self.n_dropped,
+                t_ingest,
+            )
+            log.info("calibrate: transform=%s cap_km=%.4g in %.2fs", self.tname, self.cap_km_val, t_calibrate)
+            log.info("grid: %dx%d cells (%d) in %.2fs", self.nx, self.ny, self.nx * self.ny, t_grid)
+            log.info("interpolate: done in %.2fs", interp_s)
+            log.info("write: reproject %.2fs, done in %.2fs", reproj_s, t_write)
+            disk_v = Path(vpath).stat().st_size
+            disk_s = Path(spath).stat().st_size
+            log.info(
+                "done: %d rows -> %dx%d grid (%d cells) in %.2fs -> %s, %s",
+                self.n_total,
+                self.nx,
+                self.ny,
+                self.nx * self.ny,
+                t_total,
+                vpath,
+                spath,
+            )
+            if log.isEnabledFor(logging.DEBUG):
+                raw = self.nx * self.ny * 2  # one int16 band
+                cells_per_level = [(self.nx_padded >> k) * (self.ny_padded >> k) for k in range(self.levels + 1)]
+                total_disk = disk_v + disk_s
+                log.debug(
+                    "perf: ingest=%.0fms calibrate=%.0fms grid=%.0fms descent=%.0fms interpolate=%.0fms "
+                    "reproject_value=%.0fms reproject_support=%.0fms write=%.0fms total=%.0fms",
+                    t_ingest * 1e3,
+                    t_calibrate * 1e3,
+                    t_grid * 1e3,
+                    pw.get("descent", 0.0) * 1e3,
+                    pw.get("interpolate", 0.0) * 1e3,
+                    pw.get("reproject_value", 0.0) * 1e3,
+                    pw.get("reproject_support", 0.0) * 1e3,
+                    t_write * 1e3,
+                    t_total * 1e3,
+                )
+                log.debug(
+                    "volumetrics: rows_read=%d points_ingested=%d dropped_nan_inf=%d cells=%d levels=%d "
+                    "cells_per_level=%s value=%dB (raw %dB) support=%dB (raw %dB) compression_ratio=%.2f",
+                    self.n_total,
+                    self.n,
+                    self.n_dropped,
+                    self.nx * self.ny,
+                    self.levels,
+                    cells_per_level,
+                    disk_v,
+                    raw,
+                    disk_s,
+                    raw,
+                    (raw * 2) / total_disk if total_disk else 0.0,
+                )
+                if self._turbo_decision is not None:
+                    turbo_desc = (
+                        f"on (regime {self._turbo_decision.regime}, path {self._turbo_decision.path}, "
+                        f"cap {self._turbo_plan.cap_gb:g} GB)"
+                        if self._turbo_plan is not None
+                        else "on"
+                    )
+                else:
+                    turbo_desc = "off"
+                log.debug(
+                    "plan: workers=%d n_threads=%d res=%.4g m block=%d levels=%d cap_km=%.4g transform=%s turbo=%s",
+                    self.workers,
+                    self.n_threads,
+                    self.res,
+                    self.bsize,
+                    self.levels,
+                    self.cap_km_val,
+                    self.tname,
+                    turbo_desc,
+                )
+        except Exception:  # ruff: ignore[blind-except, try-except-pass] — logging must never fail a successful run
+            pass
 
     def _remove_run_temps(self) -> None:
         """Remove every run temp file in out_dir (idempotent, best effort)."""
@@ -2380,9 +2572,14 @@ class Pipeline:
                     cfg.tf = make_transform(cfg.transform_state)
                     cfg.pct = PercentileTransform(cfg.pct_quantiles)
                     _CTX["cfg"] = cfg
-                    if self._prepare_shared():
-                        cfg.shared = True
-                    with ThreadPoolExecutor(max_workers=self.workers) as ex, _prof.phase("write.serial"):
+                    with _WallPhase("descent", self._phase_wall):
+                        if self._prepare_shared():
+                            cfg.shared = True
+                    with (
+                        ThreadPoolExecutor(max_workers=self.workers) as ex,
+                        _prof.phase("write.serial"),
+                        _WallPhase("interpolate", self._phase_wall),
+                    ):
                         for bx, by, out in ex.map(_process_block, self.tasks):
                             w = _block_window(bx, by, self.cfg)
 
@@ -2420,7 +2617,7 @@ class Pipeline:
                         "nby": self.nby,
                         "task_bids": {bx * self.nby + by for bx, by in self.tasks},
                     }
-                with _prof.phase("write.reproj_value"):
+                with _prof.phase("write.reproj_value"), _WallPhase("reproject_value", self._phase_wall):
                     _reproject_band(
                         str(wtmp_v),
                         str(ftmp_v),
@@ -2432,7 +2629,7 @@ class Pipeline:
                         task_info=task_info,
                         n_threads=self.n_threads,
                     )
-                with _prof.phase("write.reproj_support"):
+                with _prof.phase("write.reproj_support"), _WallPhase("reproject_support", self._phase_wall):
                     _reproject_band(
                         str(wtmp_s),
                         str(ftmp_s),
@@ -2512,7 +2709,7 @@ class Pipeline:
 
         partial = False
         try:
-            with _prof.phase("write.dnfill"):
+            with _prof.phase("write.dnfill"), _WallPhase("dnfill", self._phase_wall):
                 # File-backed (tmpfs) DN fields, not anon RAM (issue #39
                 # pass 3): the warp pass re-reads every 2048^2 block once,
                 # and external ~15 GB memory hogs swap anon pages out of the
@@ -2535,9 +2732,13 @@ class Pipeline:
                     cfg.tf = make_transform(cfg.transform_state)
                     cfg.pct = PercentileTransform(cfg.pct_quantiles)
                     _CTX["cfg"] = cfg
-                    if self._prepare_shared():
-                        cfg.shared = True
-                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                    with _WallPhase("descent", self._phase_wall):
+                        if self._prepare_shared():
+                            cfg.shared = True
+                    with (
+                        _WallPhase("interpolate", self._phase_wall),
+                        ThreadPoolExecutor(max_workers=self.workers) as ex,
+                    ):
                         for bx, by, out in ex.map(_process_block, self.tasks):
                             w = _block_window(bx, by, self.cfg)
                             if out is None:
@@ -2582,7 +2783,7 @@ class Pipeline:
                 ("value", val_dn, vprof, ftmp_v, vtags, (1.0 / self.scale,)),
                 ("support", sup_dn, sprof, ftmp_s, stags, (1.0,)),
             ):
-                with _prof.phase(f"write.reproj_{band}"):
+                with _prof.phase(f"write.reproj_{band}"), _WallPhase(f"reproject_{band}", self._phase_wall):
                     wrote = False
                     if cpl:
                         try:
@@ -2688,11 +2889,74 @@ def run(
     return p.run()
 
 
+def _resolve_log_level(*, verbose: bool, log_level: str | None) -> str:
+    """Resolve the ppgrid log level: explicit flag > env > default info.
+
+    Precedence: `--log-level` (most specific) > `--verbose` (shorthand for
+    debug) > `LOGGING` > `info`.
+    Env values accept the four level names or the alias `verbose` (case-
+    insensitive, = debug); an unrecognized value warns and falls back to
+    info (a mistyped env var must not break the run).
+
+    Args:
+        verbose: --verbose flag.
+        log_level: --log-level flag value, or None when the flag is absent.
+
+    Returns:
+        One of 'error', 'warning', 'info', 'debug'.
+
+    """
+    if log_level is not None:
+        return log_level
+    if verbose:
+        return "debug"
+    for var in ("LOGGING",):
+        raw = os.environ.get(var)
+        if raw is None:
+            continue
+        val = raw.strip().lower()
+        if val == "verbose":
+            return "debug"
+        if val in _LOG_LEVELS:
+            return val
+        print(f"warning: unrecognized {var}={raw!r}; using 'info'", file=sys.stderr)  # ruff: ignore[print]
+        return "info"
+    return "info"
+
+
+def _configure_logging(level_name: str) -> None:
+    """Configure the `ppgrid` logger for one CLI run (stderr, compact format).
+
+    Only the `ppgrid` logger is touched — never the root logger — so library
+    users' logging setup is undisturbed and stdout stays clean for any
+    machine-readable output. Idempotent: repeated main() calls in one
+    process (tests) update the level instead of stacking handlers.
+
+    Args:
+        level_name: Resolved level name from _resolve_log_level.
+
+    """
+    levels = {"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO, "debug": logging.DEBUG}
+    root = logging.getLogger("ppgrid")
+    root.setLevel(levels[level_name])
+    for handler in root.handlers:
+        if getattr(handler, "ppgrid_handler", False):
+            return
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.ppgrid_handler = True  # type: ignore[attr-defined]
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    root.addHandler(handler)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser (tests exercise the flags here)."""
-    parser = argparse.ArgumentParser(description="Pull-push scattered-data interpolation")
+    parser = argparse.ArgumentParser(
+        description="Pull-push scattered-data interpolation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_EPILOG,
+    )
     parser.add_argument("--version", action="version", version=f"ppgrid {__version__}")
-    parser.add_argument("input", help="CSV or Parquet input path")
+    parser.add_argument("input", nargs="?", help="CSV or Parquet input path")
     parser.add_argument("-o", "--out", default="out/", help="Output directory (default: ./out)")
     parser.add_argument("--value-col", default="value", help="Value column name")
     parser.add_argument("--lng-col", default="longitude", help="Longitude column name")
@@ -2759,6 +3023,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Shared path infeasible under the budget: error + exit 3 instead of [warn] + per-box fallback (exit 0).",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Debug logging: per-phase wall times + volumetric detail (shorthand for --log-level debug)",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=list(_LOG_LEVELS),
+        default=None,
+        help="Progress log level on stderr (default info; env LOGGING; 'verbose' = debug)",
+    )
     return parser
 
 
@@ -2769,13 +3044,24 @@ def main(argv: list[str] | None = None) -> None:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
 
     Raises:
-        SystemExit: exit 1 for pipeline/IO errors (`_die`), exit 2 for
-        value validation errors, exit 3 for `--turbo-strict` shared-path
-        infeasibility.
+        SystemExit: exit 0 for `ppgrid help`, exit 1 for pipeline/IO errors
+        (`_die`), exit 2 for missing input or value validation errors, exit 3
+        for `--turbo-strict` shared-path infeasibility.
 
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.input is None:
+        print("error: missing input file (CSV or Parquet)", file=sys.stderr)  # ruff: ignore[print]
+        print("hint: run 'ppgrid help' for usage and examples", file=sys.stderr)  # ruff: ignore[print]
+        raise SystemExit(2)
+    if args.input == "help" and not Path("help").exists():
+        # A literal file named "help" wins over the pseudo-command (use --help).
+        parser.print_help()
+        raise SystemExit(0)
+
+    _configure_logging(_resolve_log_level(verbose=args.verbose, log_level=args.log_level))
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
