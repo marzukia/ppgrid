@@ -1,11 +1,13 @@
-"""CLI polish smalls tests (#52-#60).
+"""CLI polish smalls tests (#52-#60, #77).
 
 Covers: --quiet suppression + precedence, --plan (exit 0, no files), the
 overwrite guard + --force (#54), --json run summary (#55), the exit-code
 epilog (#56), friendly missing-column errors (#57), EPSG string CRS args
 (#58), --workers auto (#59), --seed (#60 — stochastic case: calibration
-subsampling + blocked-CV bootstrap are seeded), and byte-identical outputs
-with/without each new flag.
+subsampling + blocked-CV bootstrap are seeded), byte-identical outputs
+with/without each new flag, and the #77 contract fixes (stdout stays clean
+on turbo + sparse-skip runs, stale-warning coverage for preflight/plan
+failures, --json write-failure mapping, EPSG exit-2 alignment).
 """
 
 import hashlib
@@ -419,3 +421,117 @@ def test_new_flags_byte_identical(tmp_path: Path, extra: list[str]) -> None:
     main(_run_argv(tmp_path, tmp_path / "ref"))
     main(_run_argv(tmp_path, tmp_path / "alt", *extra))
     assert _outputs_sha(tmp_path / "ref") == _outputs_sha(tmp_path / "alt"), extra
+
+
+# ---------------------------------------------------------------------------
+# #77: CLI contract fixes
+# ---------------------------------------------------------------------------
+
+
+def test_turbo_run_keeps_stdout_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Turbo run: the precheck summary is a log line (stderr), stdout stays empty (#77)."""
+    with caplog.at_level(logging.DEBUG, logger="ppgrid"):
+        main(_run_argv(tmp_path, tmp_path / "out", "--turbo", "16"))
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert any(m.startswith("--turbo: cap 16") for m in _pipeline_records(caplog))
+
+
+def _far_csv(tmp_path: Path) -> str:
+    """Two far-apart points (Melbourne + Darwin) for a sparse grid (the #77 repro)."""
+    csv = tmp_path / "far.csv"
+    csv.write_text("value,lng,lat\n1.0,145.0,-37.8\n2.0,130.8,-12.4\n")
+    return str(csv)
+
+
+def test_sparse_tile_skip_keeps_stdout_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Sparse grid: the reproject tile-skip counter is DEBUG log, stdout stays empty (#77)."""
+    out = tmp_path / "out"
+    with caplog.at_level(logging.DEBUG, logger="ppgrid"):
+        main(
+            [
+                _far_csv(tmp_path),
+                "-o",
+                str(out),
+                "--value-col",
+                "value",
+                "--lng-col",
+                "lng",
+                "--lat-col",
+                "lat",
+                "--res",
+                "100",
+                "--cap-km",
+                "20",
+                "--block",
+                "2048",
+                "--workers",
+                "2",
+                "--log-level",
+                "debug",  # the skip counter is a DEBUG log line (#77)
+            ]
+        )
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert any("all-NoData tiles" in m for m in _pipeline_records(caplog, max_level=logging.DEBUG))
+
+
+def test_plan_failure_warns_stale_outputs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--plan failure over an earlier run's outputs warns about the stale rasters (#77)."""
+    out = tmp_path / "out"
+    main(_run_argv(tmp_path, out))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        main(_run_argv(tmp_path, out, "--plan", "--value-col", "nope"))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "failed before writing outputs" in err
+    assert "value.tif" in err
+
+
+def test_argparse_error_warns_stale_outputs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Argparse validation failure (exit 2) over an earlier run's outputs warns (#77)."""
+    out = tmp_path / "out"
+    main(_run_argv(tmp_path, out))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        main(_run_argv(tmp_path, out, "--workers", "0"))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--workers must be at least 1" in err
+    assert "failed before writing outputs" in err
+
+
+def test_json_summary_dir_conflict_exit1_no_stale_warning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """run_summary.json as a directory: exit 1, named error, no traceback.
+
+    No stale-outputs warning: the rasters were published this run (#77).
+    """
+    out = tmp_path / "out"
+    main(_run_argv(tmp_path, out))
+    capsys.readouterr()
+    (out / "run_summary.json").mkdir()
+    with pytest.raises(SystemExit) as exc:
+        main(_run_argv(tmp_path, out, "--json", "--force"))
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "cannot write run summary" in err
+    assert "Traceback" not in err
+    assert "failed before writing outputs" not in err
+    assert not (out / "run_summary.json.tmp").exists()
+    assert (out / "value.tif").is_file()
+
+
+@pytest.mark.parametrize("flag", ["--src-crs", "--work-crs", "--out-crs"])
+def test_unknown_epsg_exit2_all_flags(tmp_path: Path, capsys: pytest.CaptureFixture[str], flag: str) -> None:
+    """Unknown EPSG exits 2 (bad flag value) for all three CRS flags and names the code (#77)."""
+    with pytest.raises(SystemExit) as exc:
+        main(_run_argv(tmp_path, tmp_path / "out", flag, "999999999", "--force"))
+    assert exc.value.code == 2, flag
+    err = capsys.readouterr().err
+    assert "999999999" in err
+    assert "Traceback" not in err
