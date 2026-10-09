@@ -1,6 +1,8 @@
 """Tests for ppgrid.calibrate."""
 
+import json
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,6 +13,7 @@ from ppgrid.calibrate import (
     choose_transform,
     make_transform,
     transforms,
+    validate_calibration,
 )
 
 
@@ -136,3 +139,134 @@ def test_blocked_cv_skill_degenerate_targets() -> None:
         skill2, rows2 = blocked_cv_skill(x2, y, np.full(6, 42.0), block_km=50.0, res=1000.0)
         assert skill2 == 0.0
         assert rows2 == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #79: choose_transform guards, calibration.json validation, bootstrap 0/0
+# ---------------------------------------------------------------------------
+
+
+def test_choose_transform_empty_values() -> None:
+    """#79: empty values raise a friendly ValueError (was a raw zero-size minimum error)."""
+    with pytest.raises(ValueError, match="empty values"):
+        choose_transform(np.empty(0), np.empty(0), np.empty(0))
+
+
+def test_choose_transform_all_nan_values() -> None:
+    """#79: every candidate rejected (non-finite input) -> ValueError naming the cause (was IndexError)."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(0, 1e5, 500)
+    y = rng.normal(0, 1e5, 500)
+    with pytest.raises(ValueError, match="non-finite input"):
+        choose_transform(x, y, np.full(500, np.nan))
+
+
+def test_validate_calibration_accepts_well_formed() -> None:
+    """#79: a file the pipeline itself wrote must pass validation."""
+    q = np.linspace(0.0, 10.0, PercentileTransform.NQ).tolist()
+    validate_calibration(
+        {
+            "transform": "percentile",
+            "transform_state": {"name": "percentile", "quantiles": q},
+            "percentile_quantiles": q,
+            "cap_km": 20.0,
+        },
+        "cal.json",
+    )
+    validate_calibration({"transform": "identity", "cap_km": 20.0}, "cal.json")
+    validate_calibration({"transform_state": {"name": "identity"}, "cap_km": 20.0}, "cal.json")
+
+
+@pytest.mark.parametrize(
+    ("cal", "match"),
+    [
+        ({"transform": "percentile", "transform_state": {"name": "percentile"}}, "transform_state.quantiles"),
+        ({"transform": "bogus"}, "bogus"),
+        ({"transform_state": {"name": "percentile", "quantiles": [0.0, 1.0]}}, "transform_state.quantiles"),
+        ({"percentile_quantiles": [0.0, 1.0]}, "percentile_quantiles"),
+        ({"percentile_quantiles": "nope"}, "percentile_quantiles"),
+        ({"percentile_quantiles": [0.0] * 1000 + ["x"]}, "not a finite number"),
+        ({"transform": "identity", "transform_state": "nope"}, "transform_state must be a JSON object"),
+        ([1, 2, 3], "top level must be a JSON object"),
+    ],
+)
+def test_validate_calibration_rejects(tmp_path: Path, cal: object, match: str) -> None:
+    """#79: each malformed field is one friendly ValueError naming file and field."""
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(cal))
+    with pytest.raises(ValueError, match=match):
+        validate_calibration(cal, str(path))
+    with pytest.raises(ValueError, match=r"bad\.json"):
+        validate_calibration(cal, str(path))
+
+
+def test_bootstrap_zero_baseline_draws_keep_finite_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#79: controlled stub repro (1,600 pts, dominant mode exactly at the global mean).
+
+    A bootstrap draw where the baseline is exactly constant (0/0) is skipped,
+    not NaN: no RuntimeWarning, finite CI, and the CI keeps the point skill.
+    """
+    import ppgrid.calibrate as cal
+
+    n = 1_600
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0.0, 4.0e5, n)
+    y = rng.uniform(0.0, 4.0e5, n)
+    tv = np.full(n, 10.0)
+    # Four balanced outliers: the global mean stays exactly the dominant mode in float64.
+    tv[10], tv[20] = 11.0, 9.0  # in the 1 km support half
+    tv[1010], tv[1020] = 12.0, 8.0  # in the 5 km support half
+    assert tv.mean() == 10.0
+
+    def stub(
+        _xx: np.ndarray,
+        _yy: np.ndarray,
+        t: np.ndarray,
+        _train: np.ndarray,
+        _res: float,
+        _levels: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sup = np.where(np.arange(len(t)) < n // 2, 1.0, 5.0)
+        return t, sup  # perfect prediction: e_m == 0 everywhere
+
+    monkeypatch.setattr(cal, "_fit_predict", stub)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        overall, rows = cal.blocked_cv_skill(x, y, tv)
+
+    assert overall == 1.0
+    assert {r["hi_km"] for r in rows} >= {2.0, 8.0}  # both populated bins survive
+    for r in rows:
+        assert np.isfinite(r["skill"])
+        assert np.isfinite(r["ci_lo"])
+        assert np.isfinite(r["ci_hi"])
+        assert r["ci_lo"] == 1.0
+        assert r["ci_hi"] == 1.0
+
+
+def test_fill_cap_nonfinite_ci_uses_point_skill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#79: a NaN ci in the first bin must not break the cap prefix loop.
+
+    Non-finite CI falls back to the point skill, so the later healthy bins
+    decide the cap (old behaviour: silent 25.0 default).
+    """
+    import ppgrid.calibrate as cal
+
+    def fake_blocked(
+        _xx: np.ndarray,
+        _yy: np.ndarray,
+        _tv: np.ndarray,
+        block_km: float,  # ruff: ignore[unused-function-argument] — bound by keyword from calibrate_fill_cap
+        **_kw: object,
+    ) -> tuple[float, list]:
+        rows = [
+            {"lo_km": 0.0, "hi_km": 2.0, "n": 500, "skill": 0.7, "ci_lo": float("nan"), "ci_hi": float("nan")},
+            {"lo_km": 2.0, "hi_km": 4.0, "n": 500, "skill": 0.7, "ci_lo": 0.7, "ci_hi": 0.9},
+            {"lo_km": 4.0, "hi_km": 8.0, "n": 500, "skill": 0.6, "ci_lo": 0.6, "ci_hi": 0.85},
+        ]
+        return 0.8, rows
+
+    monkeypatch.setattr(cal, "blocked_cv_skill", fake_blocked)
+    cap, detail = cal.calibrate_fill_cap(np.empty(0), np.empty(0), np.empty(0), block_km=(100.0,))
+    assert cap == 8.0  # not 25.0 (FILL_CAP_DEFAULT_KM) and not broken at the first bin
+    assert detail[100.0]["cap_km"] == 8.0
