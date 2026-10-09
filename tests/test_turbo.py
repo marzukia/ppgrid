@@ -7,10 +7,14 @@
   float64 inference, |x| >= 2**53, NaN/inf, quoted fields, non-adjacent
   columns) (S3.5, review F3)
 - fallbacks: small files and quoted-newline files stay on the serial parse
+- S3 bit-identity for all-integer columns |x| >= 2**58 (audit P0-2):
+  serial vs chunk `_read_points` bit-identical; the serial float64 pin
+  follows the C-parser float path per token (stateless per-token reference)
 - n_threads=1 regression: the default code path is the serial one (A8)
 """
 
 import hashlib
+import io
 import math
 import multiprocessing as mp
 import struct
@@ -223,6 +227,146 @@ def test_ingest_mt_quoted_newline_refuses(tmp_path: Path, monkeypatch: pytest.Mo
     p.ingest()
     assert p.n == 2  # the serial parse reads both rows
     assert np.array_equal(p.v, np.array([1.5, 2.5]))
+
+
+def _write_value_csv(path: Path, value_toks: list[str]) -> None:
+    """Write a 3-column CSV (value, longitude, latitude).
+
+    Value column holds the given raw tokens; coordinates are small
+    deterministic floats (|x| < 2**53), off the audit P0-2 pattern.
+    """
+    rng = np.random.default_rng(31)
+    n = len(value_toks)
+    lon = rng.uniform(144.0, 145.0, n)
+    lat = rng.uniform(-38.0, -37.0, n)
+    lines = ["value,longitude,latitude"]
+    for t, lo, la in zip(value_toks, lon, lat, strict=True):
+        lines.append(f"{t},{float(lo)!r},{float(la)!r}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _big_int_value_toks() -> list[str]:
+    """Return the audit P0-2 (2026-10-09) pattern value tokens.
+
+    All-integer column in 2**58-2048..2**58+2047 (where pandas' C-parser
+    float path is not correctly rounded) plus one 2**63-1 literal.
+    """
+    return [str(x) for x in range(2**58 - 2048, 2**58 + 2048)] + [str(2**63 - 1)]
+
+
+def test_ingest_bigint_serial_bit_identical_to_chunk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """S3 regression pin (audit P0-2, 2026-10-09, decision (a)).
+
+    All-integer value column with |x| >= 2**58: n_threads=1 must be
+    bit-identical to n_threads=4 (np.array_equal, NOT allclose). Pre-fix,
+    the serial read inferred int64 (correctly rounded int64->f64) while the
+    chunk read pinned float64 (C-parser float path), so the audit measured
+    90,165 of 250k rows 1-2 ULP apart at n_threads=1 vs 4.
+    """
+    monkeypatch.setattr(
+        pipeline_mod,
+        "ProcessPoolExecutor",
+        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+    )
+    monkeypatch.setattr(pipeline_mod, "_INGEST_MIN_CHUNK_ROWS", 1)
+    csv = tmp_path / "bigint.csv"
+    toks = _big_int_value_toks()
+    _write_value_csv(csv, toks)
+    tasks = _csv_chunk_tasks(str(csv), _WANTED, 4)
+    assert tasks is not None  # the fixture must actually drive the pool
+    assert len(tasks[0]) == 4
+
+    p1 = Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "o1"), n_threads=1)
+    v1, lon1, lat1 = p1._read_points(_WANTED)  # ruff: ignore[private-member-access]
+    p4 = Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "o4"), n_threads=4)
+    v4, lon4, lat4 = p4._read_points(_WANTED)  # ruff: ignore[private-member-access]
+
+    assert v1.shape == (len(toks),)
+    assert np.array_equal(v1, v4)  # bit-identical values, original row order
+    assert np.array_equal(lon1, lon4)
+    assert np.array_equal(lat1, lat4)
+    assert v4[-1] == 2**63 + 2048  # the 2**63-1 literal lands last, C-path value
+
+
+def test_ingest_bigint_serial_takes_c_float_path(tmp_path: Path) -> None:
+    """Serial read pins float64: n_threads=1 takes the C-parser float path.
+
+    Per token, exactly as the chunk workers do (audit P0-2, 2026-10-09,
+    decision (a)). Deliberate baseline change vs 0.4.1: pre-fix, an
+    all-integer column inferred int64 and converted with correct rounding,
+    so the serial value was float(token) for every literal. Post-fix, both
+    thread counts parse through the C-parser float path, which is not
+    correctly rounded in parts of the int64 range: on this fixture 1478 of
+    4097 literals (pandas 2.3.3) differ from float(token) by 1-2 ULP, e.g.
+    the 2**63-1 literal now parses to 0x43e0000000000001 (2**63+2048)
+    instead of the correctly rounded 0x43e0000000000000 (2**63).
+    """
+    csv = tmp_path / "bigint.csv"
+    toks = _big_int_value_toks()
+    _write_value_csv(csv, toks)
+
+    p = Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "o1"), n_threads=1)
+    v, _, _ = p._read_points(_WANTED)  # ruff: ignore[private-member-access]
+
+    # Reference: the C-parser float path on each token in isolation (one
+    # token per file, fresh tokenizer — xstrtod is stateless per token, so
+    # this is the value the column parse must produce).
+    per_tok = np.empty(len(toks), dtype=np.float64)
+    for i, t in enumerate(toks):
+        per_tok[i] = pd.read_csv(io.BytesIO(f"value\n{t}\n".encode()), dtype={"value": np.float64})["value"].iloc[0]
+    assert np.array_equal(v, per_tok)
+
+    exact = np.array([float(t) for t in toks], dtype=np.float64)
+    ulp = np.abs(v.view(np.int64) - exact.view(np.int64))
+    assert ulp.max() <= 2  # C path is at most 2 ULP off correct rounding here
+    assert int((v != exact).sum()) == 1478  # pandas 2.3.3: the announced change set
+    assert v[-1] == 2**63 + 2048  # audit headline: pre-fix the serial gave 2**63
+
+
+def test_ingest_float_pin_no_change_off_pattern(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard: the float64 pin changes nothing off the rare pattern.
+
+    (i) One decimal among integers: pre-fix, the serial parse already
+    inferred float64 and took the C float path on every token, so the pin
+    is a no-op — nt=1 and nt=4 must equal the plain unpinned parse.
+    (ii) All-integer column with |x| < 2**53: int64->f64 is exact there and
+    the C float path agrees with it, so the pin is a no-op — nt=1 values
+    must equal float(token) (the 0.4.1 baseline) and nt=4 must match nt=1.
+    """
+    monkeypatch.setattr(
+        pipeline_mod,
+        "ProcessPoolExecutor",
+        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+    )
+    monkeypatch.setattr(pipeline_mod, "_INGEST_MIN_CHUNK_ROWS", 1)
+
+    # (i) one decimal among integers
+    toks = ["1.5", "2", "3", "4", "5", "288230376151711744.0", "9223372036854775807", "-7", "0", "42"]
+    mixed = tmp_path / "mixed.csv"
+    _write_value_csv(mixed, toks)
+    v_ref = pd.read_csv(mixed, usecols=_WANTED)["value"].to_numpy(dtype=np.float64)
+    p1 = Pipeline(str(mixed), "value", "longitude", "latitude", str(tmp_path / "m1"), n_threads=1)
+    v1, _, _ = p1._read_points(_WANTED)  # ruff: ignore[private-member-access]
+    p4 = Pipeline(str(mixed), "value", "longitude", "latitude", str(tmp_path / "m4"), n_threads=4)
+    v4, _, _ = p4._read_points(_WANTED)  # ruff: ignore[private-member-access]
+    assert np.array_equal(v1, v_ref)  # no behaviour change vs the 0.4.1 serial parse
+    assert np.array_equal(v1, v4)
+
+    # (ii) all-integer, |x| < 2**53 (plus the 2**53 boundary literals)
+    rng = np.random.default_rng(21)
+    small_toks = [str(x) for x in rng.integers(-(2**53), 2**53, 2000).tolist()] + [
+        str(2**53 - 1),
+        str(2**53),
+        str(2**53 + 1),
+    ]
+    scsv = tmp_path / "smallint.csv"
+    _write_value_csv(scsv, small_toks)
+    p1 = Pipeline(str(scsv), "value", "longitude", "latitude", str(tmp_path / "s1"), n_threads=1)
+    v1, _, _ = p1._read_points(_WANTED)  # ruff: ignore[private-member-access]
+    p4 = Pipeline(str(scsv), "value", "longitude", "latitude", str(tmp_path / "s4"), n_threads=4)
+    v4, _, _ = p4._read_points(_WANTED)  # ruff: ignore[private-member-access]
+    assert np.array_equal(v1, np.array([float(t) for t in small_toks], dtype=np.float64))
+    assert np.array_equal(v1, v4)
 
 
 def test_pipeline_mt_end_to_end_sha256_equal(tmp_path: Path) -> None:
