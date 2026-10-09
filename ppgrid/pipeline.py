@@ -1102,6 +1102,12 @@ def _reproject_band_array(
         n_threads: Warp threads. 1 = fully serial (A8 path).
 
     """
+    # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
+    # pass 3, ported to the serial array reproject - audit #78 P1-3):
+    # reproject's ndarray source form copies the whole band into a fresh
+    # MEM dataset per warp call. The tuple form reads the shared handle;
+    # src_arr is not mutated during the warp.
+    src_ds = MemoryDataset(src_arr, transform=src_transform, crs=src_crs, copy=False)
 
     def make_warp(j0: int, band_h: int) -> Callable[[int], tuple[int, np.ndarray]]:
         return partial(
@@ -1115,6 +1121,7 @@ def _reproject_band_array(
             dst_width=dst_width,
             dst_transform=dst_transform,
             dst_crs=dst_crs,
+            src_ds=src_ds,
         )
 
     _reproject_core(
@@ -1290,6 +1297,13 @@ def _turbo_write_parallel(
 
     """
     warp_tile = 2048
+    # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
+    # pass 3, ported to the zstd writer - audit #78 P1-3): reproject's
+    # ndarray source form copies the whole band into a fresh MEM dataset
+    # per warp call (3.1 GB per 2048^2 block at full-AU; up to n_threads
+    # copies in flight). The tuple form reads the shared handle; arr is
+    # not mutated during the warp, so concurrent read-only access is safe.
+    src_ds = MemoryDataset(arr, transform=src_transform, crs=src_crs, copy=False)
     tiles: list[bytes] = []
     band_tiles: list[np.ndarray] = []
     coarse: dict[int, np.ndarray] = {}
@@ -1306,6 +1320,7 @@ def _turbo_write_parallel(
             dst_width=dst_width,
             dst_transform=dst_transform,
             dst_crs=dst_crs,
+            src_ds=src_ds,
         )
         coarse = {}
         if n_threads > 1:
@@ -1321,12 +1336,23 @@ def _turbo_write_parallel(
             for i in range(0, dst_width, TILE_PX):
                 w = min(TILE_PX, dst_width - i)
                 i0 = (i // warp_tile) * warp_tile
-                band_tiles.append(coarse[i0][j - j0 : j - j0 + h, i - i0 : i - i0 + w])
+                t = coarse[i0][j - j0 : j - j0 + h, i - i0 : i - i0 + w]
+                if h < TILE_PX or w < TILE_PX:
+                    # GDAL zero-pads partial edge tiles to the full block
+                    # before the codec runs (audit #81 F-1): unpadded
+                    # frames decompress to less than the declared tile
+                    # size, breaking S3 bit-identity on non-512-multiple
+                    # rasters. Pad to TILE_PX^2 first; predictor 2 then
+                    # runs over the padded row exactly as libtiff does.
+                    pad = np.zeros((TILE_PX, TILE_PX), dtype=np.int16)
+                    pad[:h, :w] = t
+                    t = pad
+                band_tiles.append(t)
         # Predictor 2 must be applied before compression: the stock codec
         # (and the oracle) compress the predicted bytes, not the raw tiles.
         band_tiles = [zstdmt.predictor2(t) for t in band_tiles]
         tiles.extend(zstdmt.compress_tiles(band_tiles, n_threads=n_threads))
-    del coarse, band_tiles
+    del coarse, band_tiles, src_ds
 
     ref_path = Path(dst_path + ".refhead.tif")
     try:
@@ -1512,8 +1538,11 @@ def _turbo_write_stock_parallel(
             dst.write(zero, 1, window=Window(0, 0, tw, th))
         data = ref_path.read_bytes()
     finally:
+        # No `del zero` here (audit #78 P1-1): if the reference head is not
+        # created, `zero` is unbound and the del raises UnboundLocalError,
+        # masking the root error. The 512^2 tile local dies at function
+        # return anyway; the del buys nothing.
         ref_path.unlink(missing_ok=True)
-        del zero
     try:
         info = _tif_parse_ifd(data)
     except ValueError as e:
@@ -2691,11 +2720,19 @@ class Pipeline:
         radius = round(self.cap_km_val * M_PER_KM / self.res)
         cap_gb, cap_source = self._resolve_turbo_cap()
         plan = turbop.plan(cap_gb, n_cells, self.nx_padded, radius)
+        # The process's actual memory ceiling (audit #78 P1-2): the 8 GB
+        # cap floor can plan a budget above it on a small cgroup slice;
+        # precheck names the OOM risk instead of staying green.
+        available_gb = min(
+            turbop._read_physical_gb(),  # ruff: ignore[private-member-access]
+            turbop._read_cgroup_max_gb(),  # ruff: ignore[private-member-access]
+        )
         decision = turbop.precheck(
             plan,
             strict=self.turbo_strict,
             cap_source=cap_source,
             per_box_peak_bytes=self._per_box_peak_bytes(),
+            available_gb=available_gb,
         )
         self._turbo_plan = plan
         self._turbo_decision = decision
@@ -2718,29 +2755,33 @@ class Pipeline:
     def _turbo_zstd_ok(self) -> bool:
         """A.7 calibration oracle gate for the parallel ZSTD write.
 
-        Writes one deterministic 512^2 int16 tile with the stock codec
-        settings, then asks zstdmt whether the turbo-compressed frame is
-        byte-equal to the bytes GDAL stored. Mismatch (or unavailable) ->
-        False: the caller writes with the stock-codec parallel path
-        (_turbo_write_stock_parallel); the serial per-band write runs only if
-        that writer's layout guards fail. Either way the output is byte-exact.
+        Writes one deterministic 500x512 int16 probe (partial width, so
+        the gate also covers GDAL's zero-padding of edge tiles - audit
+        #81 F-1) with the stock codec settings, then asks zstdmt whether
+        the turbo-compressed frame is byte-equal to the bytes GDAL
+        stored. Mismatch (or unavailable) -> False: the caller writes
+        with the stock-codec parallel path (_turbo_write_stock_parallel);
+        the serial per-band write runs only if that writer's layout guards
+        fail. Either way the output is byte-exact.
         """
-        if not zstdmt.available():
-            print("[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
-            return False
         # Deterministic compressible content: both axes differ to small
         # values, so predictor 2 output is near-zero structured data.
-        gx = np.arange(512, dtype=np.int16) * 13
+        gx = np.arange(500, dtype=np.int16) * 13
         gy = np.arange(512, dtype=np.int16) * 7
         tile = (gx[None, :] + gy[:, None]).astype(np.int16)
         probe = Path(self.out_dir) / "_zstd_oracle.tif"
         try:
+            # zstdmt.available() inside the try (audit #81 F-3): a gate
+            # failure must mean "stock parallel write", never a crash.
+            if not zstdmt.available():
+                print("[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
+                return False
             with rasterio.open(
                 probe,
                 "w",
                 driver="GTiff",
                 dtype="int16",
-                width=512,
+                width=500,
                 height=512,
                 count=1,
                 nodata=NODATA,
