@@ -1519,9 +1519,9 @@ def _read_csv_chunk(
     The parent split the file into complete records at newline offsets and
     this worker seeks its byte range. The wanted columns parse with explicit
     float64 dtypes and the per-chunk dtype equality is asserted (review F3):
-    a single whole-file parse infers per column, and per-chunk inference can
-    disagree on edge rows (int64 vs float64, divergent doubles for
-    |x| >= 2**53).
+    the serial read pins the same dtypes (audit P0-2, 2026-10-09, decision
+    (a)), so the assert is a structural invariant — a wanted column must
+    reach the worker as float64, never an inferred int64.
 
     Args:
         task: Tuple of (path, byte_start, byte_end, has_header, wanted, all_names).
@@ -1762,12 +1762,13 @@ class Pipeline:
 
         CSV input with n_threads > 1 and enough rows is split into complete
         row records and parsed in a process pool (S3.5): read_csv holds the
-        GIL, so threads cannot overlap the parse. Every chunk parses the
-        wanted columns with explicit float64 dtypes, asserts per-chunk dtype
-        equality, and the chunks are concatenated in original row order. Any
-        split uncertainty (small file, blank lines, quoted newlines, header
-        quirks) falls back to the single serial parse, so n_threads == 1
-        (the default) is byte-identical to before (A8).
+        GIL, so threads cannot overlap the parse. Every chunk — and the
+        serial fallback — parses the wanted columns with explicit float64
+        dtypes (audit P0-2, 2026-10-09, decision (a): one C-parser float
+        path for all n_threads, S3), the chunks assert per-chunk dtype
+        equality, and the chunks are concatenated in original row order.
+        Any split uncertainty (small file, blank lines, quoted newlines,
+        header quirks) falls back to the single serial parse.
 
         Raises:
             ValueError: If no valid points remain after filtering.
@@ -1816,13 +1817,19 @@ class Pipeline:
         lines, which pandas skips but the newline scan counts) re-runs the
         serial parse.
 
+        The serial read pins dtype=float64 on the wanted columns exactly as
+        the chunk workers do (audit P0-2, 2026-10-09, decision (a)): both
+        paths then take pandas' identical C-parser float path, so the values
+        are bit-identical at every n_threads (S3) by construction.
+
         Returns:
             Tuple of (value, lon, lat) float64 arrays in original row order.
 
         """
 
         def serial() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            df = pd.read_csv(self.input_path, usecols=wanted)
+            dtype = dict.fromkeys(wanted, np.float64)
+            df = pd.read_csv(self.input_path, usecols=wanted, dtype=dtype)
             return (
                 df[self.value_col].to_numpy(dtype=np.float64),
                 df[self.lng_col].to_numpy(dtype=np.float64),

@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Ingest (audit P0-2, 2026-10-09, decision (a)): the serial CSV read now pins `dtype=float64` on the wanted columns, mirroring the chunked parse. Both thread counts take pandas' identical C-parser float path, restoring the S3 bit-identity guarantee (pre-fix, `n_threads=1` vs `4` returned values 1-2 ULP apart on the pattern below). **Baseline change vs 0.4.1:** for columns that are entirely integer literals with |x| >= 2^58, `n_threads=1` results change by up to 2 ULP (1 ULP on most affected rows; e.g. the `9223372036854775807` literal now parses to 0x43e0000000000001 (2^63+2048) instead of the correctly-rounded 2^63). Columns with any non-integer literal, or all-integer with |x| < 2^53, are unchanged. Regression pins in `tests/test_turbo.py` (serial-vs-chunk bit-identity, per-token float-path reference, off-pattern guards).
 - CLI polish smalls (#52-#60), stacked on the help/logging PR (#51):
   - #52 `--quiet` / `-q`: suppress stderr below WARNING. Precedence: explicit `--log-level` > `--quiet` > `--verbose` > `LOGGING` > info.
   - #53 `--plan`: resolve the full run plan (input, grid extent/cells/levels, transform, saturation, turbo decision + RAM budget, workers, out dir) and print it, then exit 0 before running — creates no files or directories (new `Pipeline(dry_run=True)` skips the `calibration.json` and `_points.npy` writes; the turbo precheck stays silent, a `--turbo-strict` infeasibility still exits 3).
