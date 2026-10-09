@@ -208,3 +208,11 @@ def test_verbose_and_default_output_byte_identical(tmp_path: Path) -> None:
     main(_run_argv(tmp_path, tmp_path / "out_b", "--verbose"))
     for name in ("value.tif", "support_km.tif", "calibration.json"):
         assert _sha(tmp_path / "out_a" / name) == _sha(tmp_path / "out_b" / name), name
+
+
+def test_handler_idempotency_across_level_changes(tmp_path: Path) -> None:
+    """Repeated main() calls with different levels must not stack handlers."""
+    main(_run_argv(tmp_path, tmp_path / "o1"))
+    main(_run_argv(tmp_path, tmp_path / "o2", "--log-level", "error"))
+    main(_run_argv(tmp_path, tmp_path / "o3", "--verbose"))
+    assert len(logging.getLogger("ppgrid").handlers) == 1

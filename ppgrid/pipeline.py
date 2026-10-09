@@ -79,13 +79,15 @@ _LOG_LEVELS: tuple[str, ...] = ("error", "warning", "info", "debug")
 
 _EPILOG = """\
 examples:
-  # Basic run: 10 m cells, auto transform and fill cap, default 4 workers
-  ppgrid data/melb_houses.csv -o out/melb_10m --res 10000 --value-col price
+  # Basic run: 10 km cells, auto transform and fill cap, default 4 workers
+  ppgrid data/melb_houses.csv -o out/melb_10km --res 10000 --value-col price
 
   # Custom transform, CRS and DN scale: log10 values, WGS84 output, DN = 10*percentile
   ppgrid data/all_equakes.csv -o out/eq --transform log10 --out-crs 4326 --scale 10 --cap-km 20 --value-col mag
 
-  # Turbo / low-RAM: 32 GB budget, strict (exit 3 if the shared path is infeasible)
+  # Turbo / low-RAM: 32 GB budget, strict (exit 3 if infeasible).
+  # au_gcc_sparse.csv is the production dataset (not in the repo); any sparse
+  # CSV with lng/lat/value columns works.
   ppgrid data/au_gcc_sparse.csv -o out/au --turbo 32 --turbo-strict --workers 8
 
 logging:
@@ -2707,7 +2709,7 @@ class Pipeline:
 
         partial = False
         try:
-            with _prof.phase("write.dnfill"), _WallPhase("interpolate", self._phase_wall):
+            with _prof.phase("write.dnfill"), _WallPhase("dnfill", self._phase_wall):
                 # File-backed (tmpfs) DN fields, not anon RAM (issue #39
                 # pass 3): the warp pass re-reads every 2048^2 block once,
                 # and external ~15 GB memory hogs swap anon pages out of the
@@ -2733,7 +2735,10 @@ class Pipeline:
                     with _WallPhase("descent", self._phase_wall):
                         if self._prepare_shared():
                             cfg.shared = True
-                    with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                    with (
+                        _WallPhase("interpolate", self._phase_wall),
+                        ThreadPoolExecutor(max_workers=self.workers) as ex,
+                    ):
                         for bx, by, out in ex.map(_process_block, self.tasks):
                             w = _block_window(bx, by, self.cfg)
                             if out is None:
@@ -3051,7 +3056,8 @@ def main(argv: list[str] | None = None) -> None:
         print("error: missing input file (CSV or Parquet)", file=sys.stderr)  # ruff: ignore[print]
         print("hint: run 'ppgrid help' for usage and examples", file=sys.stderr)  # ruff: ignore[print]
         raise SystemExit(2)
-    if args.input == "help":
+    if args.input == "help" and not Path("help").exists():
+        # A literal file named "help" wins over the pseudo-command (use --help).
         parser.print_help()
         raise SystemExit(0)
 
