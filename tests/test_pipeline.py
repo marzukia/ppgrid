@@ -1,6 +1,8 @@
 """Tests for ppgrid.pipeline."""
 
+import hashlib
 import json
+import logging
 import math
 import sys
 import warnings
@@ -11,9 +13,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import rasterio
+from rasterio.transform import Affine
 
 from ppgrid.calibrate import PercentileTransform
-from ppgrid.pipeline import NODATA, WORK_CRS, Pipeline
+from ppgrid.pipeline import NODATA, WORK_CRS, Pipeline, _check_default_transform
 
 
 def _write_neg_values_csv(tmp_path: Path, n: int = 20) -> str:
@@ -959,3 +962,227 @@ def test_constant_csv_negative_value(tmp_path: Path) -> None:
     assert np.isfinite(dec).all()
     assert dec.max() < 0.0, f"negative constant must decode negative, got max {dec.max()}"
     assert abs(dec.min() + 3.5) < 0.5, f"data cells must decode to the constant, got {dec.min()}"
+
+
+# ---------------------------------------------------------------------------
+# Issues #74/#76: coordinate domain validation + transform-result validation
+# ---------------------------------------------------------------------------
+
+
+def _write_domain_csv(tmp_path: Path, name: str, rows: list[tuple[float, float, float]]) -> str:
+    """Write a (value, longitude, latitude) CSV for the domain tests."""
+    csv = tmp_path / name
+    pd.DataFrame(
+        {
+            "value": [r[0] for r in rows],
+            "longitude": [r[1] for r in rows],
+            "latitude": [r[2] for r in rows],
+        },
+    ).to_csv(csv, index=False)
+    return str(csv)
+
+
+def test_ingest_out_of_domain_lat_dropped_with_example(tmp_path: Path) -> None:
+    """#76: lat 95 is silently mapped to inf by pyproj; the row is dropped.
+
+    The counted, named summary replaces the pre-fix grid() crash (int64-cast
+    inf: 'ix indices out of range' / 'cannot convert float NaN to integer').
+    """
+    csv = _write_domain_csv(
+        tmp_path,
+        "lat95.csv",
+        [(10.0, 144.6, -37.7), (20.0, 144.7, -37.8), (30.0, 144.6, 95.0)],
+    )
+    p = Pipeline(csv, "value", "longitude", "latitude", str(tmp_path / "out"), res=500.0, cap_km=10.0)
+    p.ingest()
+    assert p.n == 2
+    assert p.n_dropped_out_of_domain == 1
+    assert p.n_dropped_nan_inf == 0
+    assert "out-of-domain lat 95.000000 outside [-90, 90] (row 2)" in p._drop_examples[0]  # ruff: ignore[private-member-access]
+    assert np.isfinite(p.x).all()
+    assert np.isfinite(p.y).all()
+    p.calibrate()
+    p.grid()  # pre-fix: ValueError, root cause never stated
+    assert p.nx * p.ny < 10000
+
+
+def test_ingest_out_of_domain_lon_grid_matches_in_domain_subset(tmp_path: Path) -> None:
+    """#76: lon 181 used to silently plan a global-span grid for 3 points.
+
+    Pre-fix: 2.5M+ cells at res 500. The row is now dropped and the grid is
+    identical to the one built from the in-domain points alone.
+    """
+    melb = [(10.0, 144.6, -37.7), (20.0, 144.7, -37.8)]
+    csv3 = _write_domain_csv(tmp_path, "lon181.csv", [*melb, (30.0, 181.0, -37.9)])
+    csv2 = _write_domain_csv(tmp_path, "lon181_in.csv", melb)
+    p3 = Pipeline(csv3, "value", "longitude", "latitude", str(tmp_path / "o3"), res=500.0, cap_km=10.0)
+    p3.ingest()
+    assert p3.n == 2
+    assert p3.n_dropped_out_of_domain == 1
+    assert "lon 181.000000 outside [-180, 180] (row 2)" in p3._drop_examples[0]  # ruff: ignore[private-member-access]
+    p2 = Pipeline(csv2, "value", "longitude", "latitude", str(tmp_path / "o2"), res=500.0, cap_km=10.0)
+    p2.ingest()
+    for p in (p3, p2):
+        p.calibrate()
+        p.grid()
+    assert (p3.nx, p3.ny, p3.x0, p3.y0) == (p2.nx, p2.ny, p2.x0, p2.y0)
+    assert p3.nx * p3.ny < 10000  # pre-fix: ~2.5M cells, global span
+
+
+def test_ingest_nonfinite_projection_dropped(tmp_path: Path) -> None:
+    """#76: in-domain 4326 input pyproj maps to non-finite in the work CRS.
+
+    APRS pole singularity at lat -90: dropped with a count + named source
+    coords, instead of reaching grid() as int64 min/max.
+    """
+    csv = _write_domain_csv(tmp_path, "aprs.csv", [(10.0, 0.0, -90.0), (20.0, 150.0, -37.0)])
+    p = Pipeline(csv, "value", "longitude", "latitude", str(tmp_path / "out"), res=500.0, cap_km=10.0, work_crs=3408)
+    p.ingest()
+    assert p.n == 1
+    assert p.n_dropped_nonfinite_proj == 1
+    assert p.n_dropped_out_of_domain == 0  # lat -90 is in-domain for 4326
+    assert "non-finite after projection to EPSG:3408" in p._drop_examples[0]  # ruff: ignore[private-member-access]
+    assert "row 0: lon 0.000000, lat -90.000000" in p._drop_examples[0]  # ruff: ignore[private-member-access]
+    assert np.isfinite(p.x).all()
+    assert np.isfinite(p.y).all()
+
+
+def test_ingest_all_rows_out_of_domain_names_first(tmp_path: Path) -> None:
+    """#76: all rows out of domain -> 'No valid points' naming the first offender.
+
+    Not just 'Check columns and data'.
+    """
+    csv = _write_domain_csv(
+        tmp_path,
+        "allbad.csv",
+        [(10.0, 144.6, 95.0), (20.0, 190.0, -37.0)],
+    )
+    p = Pipeline(csv, "value", "longitude", "latitude", str(tmp_path / "out"), res=500.0, cap_km=10.0)
+    with pytest.raises(ValueError, match="No valid points") as exc:
+        p.ingest()
+    assert "No valid points" in str(exc.value)
+    assert "out-of-domain lat 95.000000 outside [-90, 90] (row 0)" in str(exc.value)
+
+
+def test_check_default_transform_rejects_nonfinite_and_nonpositive() -> None:
+    """#74: the helper rejects the INT32_MIN/NaN GDAL result and zero-size rasters.
+
+    A sane transform is accepted.
+    """
+    bad = Affine(-2147483648.0, 0.0, float("nan"), 0.0, float("nan"), -2147483648.0)
+    with pytest.raises(ValueError, match="exceeds the output projection's domain"):
+        _check_default_transform(bad, -2147483648, -2147483648, 6933, 3857)
+    with pytest.raises(ValueError, match="exceeds the output projection's domain"):
+        _check_default_transform(Affine(1.0, 0.0, 0.0, 1.0, 0.0, 0.0), 0, 10, 6933, 3857)
+    with pytest.raises(ValueError, match="exceeds the output projection's domain"):
+        _check_default_transform(Affine(1.0, 0.0, 0.0, 1.0, float("nan"), 0.0), 10, 10, 6933, 3857)
+    _check_default_transform(Affine(1.0, 0.0, 0.0, 1.0, 0.0, 0.0), 10, 10, 6933, 3857)  # no raise
+
+
+@pytest.mark.parametrize("turbo", ["", "--turbo"], ids=["serial", "turbo"])
+def test_cli_out_of_domain_transform_named_error(
+    tmp_path: Path,
+    turbo: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#74 repro: a grid extent crossing the Wagner VII pole + default out-crs 3857.
+
+    Pre-fix: dies at the write phase with 'Attempt to create -2147483648x
+    -2147483648 dataset is illegal' (exit 1). Now: a named user-data error
+    (ValueError -> exit 2, the bad-data convention) that names the out-crs
+    and suggests fixes. Serial and turbo write paths.
+    """
+    from ppgrid.pipeline import main
+
+    csv = _write_domain_csv(
+        tmp_path,
+        "pole.csv",
+        [(10.0, 144.6, -37.7), (20.0, 144.7, -37.8), (30.0, 145.0, 89.9)],
+    )
+    out = tmp_path / "out"
+    old_argv = sys.argv
+    sys.argv = ["ppgrid", csv, "-o", str(out), "--res", "100000", *([turbo] if turbo else [])]
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main()
+    finally:
+        sys.argv = old_argv
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "exceeds the output projection's domain" in err
+    assert "EPSG:3857" in err
+    assert "EPSG:6933" in err
+    assert "--out-crs 4326" in err
+    assert "coarser --res" in err
+    assert "Attempt to create" not in err
+    assert "Traceback" not in err
+
+
+def test_cli_lat95_run_drops_named_no_int64_min(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#76 repro: the lat=95 file must run to completion (bad row dropped).
+
+    The ingest summary names the row; no int64-min / NaN-to-int error
+    anywhere in the output.
+    """
+    from ppgrid.pipeline import main
+
+    csv = _write_domain_csv(
+        tmp_path,
+        "lat95.csv",
+        [(10.0, 144.6, -37.7), (20.0, 144.7, -37.8), (30.0, 144.6, 95.0)],
+    )
+    out = tmp_path / "out"
+    old_argv = sys.argv
+    sys.argv = ["ppgrid", csv, "-o", str(out), "--res", "500", "--cap-km", "10"]
+    try:
+        with caplog.at_level(logging.INFO, logger="ppgrid"):
+            main()  # no SystemExit: the run completes
+    finally:
+        sys.argv = old_argv
+    assert (out / "value.tif").is_file()
+    msgs = [r.getMessage() for r in caplog.records if r.name == "ppgrid.pipeline"]
+    assert any(m.startswith("ingest: ") and "1 out-of-domain" in m and "lat 95.000000" in m for m in msgs)
+    alltext = "\n".join(msgs) + capsys.readouterr().err
+    assert "ix indices out of range" not in alltext
+    assert "9223372036854775808" not in alltext
+    assert "cannot convert float NaN" not in alltext
+
+
+def test_in_domain_run_value_band_bitexact_anchor(tmp_path: Path) -> None:
+    """#76: in-domain inputs are bit-identical before/after the drop change.
+
+    Anchor = value-band sha256 computed on 3793736 (pre-fix) for this exact
+    CSV (rng seed 1234, 50 pts, res 500, cap 10, workers 2, seed 0) and
+    verified equal on the fixed code. The in-domain ingest summary keeps the
+    pre-#76 format too.
+    """
+    rng = np.random.default_rng(1234)
+    n = 50
+    csv = tmp_path / "anchor.csv"
+    pd.DataFrame(
+        {
+            "value": 10 + 90 * rng.random(n),
+            "longitude": 144.6 + rng.uniform(-0.3, 0.3, n),
+            "latitude": -37.7 + rng.uniform(-0.3, 0.3, n),
+        },
+    ).to_csv(csv, index=False)
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(tmp_path / "out"),
+        res=500.0,
+        cap_km=10.0,
+        workers=2,
+        seed=0,
+    )
+    vpath, _ = p.run()
+    with rasterio.open(vpath) as ds:
+        digest = hashlib.sha256(ds.read(1).tobytes()).hexdigest()
+    assert digest == "21a77172bfece6208e4f0b00bd900d90568e64fbff72e1c53e6ce046446025d7"
+    assert p._drop_summary() == "0 NaN/inf dropped"  # ruff: ignore[private-member-access]
