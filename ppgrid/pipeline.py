@@ -385,7 +385,7 @@ def _workers_arg(text: str) -> int:
         argparse.ArgumentTypeError: If text is not an int or 'auto'.
 
     """
-    if text == "auto":
+    if text.lower() == "auto":
         return os.cpu_count() or 1
     try:
         return int(text)
@@ -3313,6 +3313,29 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         _die(str(e))
 
 
+def _sanitize_json(obj: Any) -> Any:
+    """Recursively replace non-finite floats with None (strict JSON, #55).
+
+    An external --calibration file may carry NaN/Infinity literals in
+    fields that are not pre-validated; json.dump(allow_nan=False) would
+    raise, so they become null in the summary.
+
+    Args:
+        obj: Summary structure (dict/list/scalar).
+
+    Returns:
+        A copy containing only finite floats.
+
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    return obj
+
+
 def _write_json_summary(p: Pipeline, args: argparse.Namespace, out: Path) -> None:
     """Write <out>/run_summary.json for --json (issue #55); stdout stays clean.
 
@@ -3327,7 +3350,7 @@ def _write_json_summary(p: Pipeline, args: argparse.Namespace, out: Path) -> Non
     summary["git_commit"] = _git_commit()
     path = out / "run_summary.json"
     with path.open("w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, allow_nan=False)
+        json.dump(_sanitize_json(summary), f, indent=2, allow_nan=False)
         f.write("\n")
     log.info("run summary: %s", path)
 
@@ -3586,7 +3609,7 @@ def main(argv: list[str] | None = None) -> None:
         # and grid from writing files, so nothing is created.
         # #57: column preflight first (same error as the run path).
         _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
-        p = _make_pipeline(args, dry_run=True)
+        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=True), args.input)
         _map_pipeline_errors(p.plan, args.input)
         print(p.plan_text(args))  # ruff: ignore[print]
         raise SystemExit(0)
@@ -3613,7 +3636,9 @@ def main(argv: list[str] | None = None) -> None:
     except OSError as e:
         _die(f"cannot create output directory {args.out}: {e}")
     try:
-        p = _make_pipeline(args, dry_run=False)
+        # Construction (init validation, e.g. --scale range) gets the same
+        # exit-code mapping as the run phase (review M-1, #56 contract).
+        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False), args.input)
         _map_pipeline_errors(p.run, args.input)
         if args.json:
             _write_json_summary(p, args, out)

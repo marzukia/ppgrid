@@ -319,6 +319,7 @@ def test_workers_auto() -> None:
     """--workers auto resolves to os.cpu_count(); ints stay valid; junk exits 2."""
     p = _build_parser()
     assert p.parse_args(["in.csv", "--workers", "auto"]).workers == os.cpu_count()
+    assert p.parse_args(["in.csv", "--workers", "Auto"]).workers == os.cpu_count()  # case-insensitive
     assert p.parse_args(["in.csv", "--workers", "7"]).workers == 7
     with pytest.raises(SystemExit) as exc:
         p.parse_args(["in.csv", "--workers", "x"])
@@ -326,6 +327,28 @@ def test_workers_auto() -> None:
     # --workers 0 still fails the >= 1 validation in main (exit 2).
     with pytest.raises(SystemExit) as exc:
         main(["in.csv", "--workers", "0"])
+    assert exc.value.code == 2
+
+
+def test_sanitize_json_replaces_nonfinite() -> None:
+    """--json summary must survive NaN/Inf from external cal files (m-2)."""
+    from ppgrid.pipeline import _sanitize_json
+
+    out = _sanitize_json({"a": float("nan"), "b": [1.0, float("inf")], "c": "x", "d": None})
+    assert out == {"a": None, "b": [1.0, None], "c": "x", "d": None}
+
+
+def test_scale_init_validation_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Pipeline.__init__ validation errors map to exit 2, not a traceback (M-1)."""
+    csv = tmp_path / "pts.csv"
+    csv.write_text("value,longitude,latitude\n1.0,149.0,-35.0\n2.0,149.1,-35.1\n")
+    with pytest.raises(SystemExit) as exc:
+        main([str(csv), "-o", str(tmp_path / "o"), "--scale", "400"])
+    assert exc.value.code == 2
+    assert "scale * 100 exceeds int16 max" in capsys.readouterr().err
+    # Same contract in --plan mode (construction is mapped there too).
+    with pytest.raises(SystemExit) as exc:
+        main([str(csv), "-o", str(tmp_path / "o2"), "--scale", "400", "--plan"])
     assert exc.value.code == 2
 
 
