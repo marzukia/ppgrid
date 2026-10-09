@@ -1186,6 +1186,8 @@ def test_in_domain_run_value_band_bitexact_anchor(tmp_path: Path) -> None:
         digest = hashlib.sha256(ds.read(1).tobytes()).hexdigest()
     assert digest == "21a77172bfece6208e4f0b00bd900d90568e64fbff72e1c53e6ce046446025d7"
     assert p._drop_summary() == "0 NaN/inf dropped"  # ruff: ignore[private-member-access]
+
+
 # Audit #83: connascence pins (transform choices, error mapping, parquet e2e)
 # ---------------------------------------------------------------------------
 
