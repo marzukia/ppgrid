@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -442,6 +443,85 @@ def test_resolve_cap_preset_clamp_cgroup_aware() -> None:
     cap, source = resolve_cap(16.0, physical_gb=134.9, cgroup_gb=24.0)
     assert cap == 16.0
     assert source == "preset 16 GB"
+
+
+def test_cap_floor_source_and_budget_ceiling_warning() -> None:
+    """The 8 GB floor is named in the source; the precheck names the budget.
+
+    Audit #78 P1-2: preset=6.0 used to report cap=8.0 budget=6.8 GB as
+    "preset 6 GB", and the precheck stayed green on a 6 GB cgroup slice
+    (budget 6.8 GB > ceiling 6 GB) until the run OOM-killed itself.
+
+    """
+    # Preset below the floor: the source names the floored cap it plans.
+    cap, source = resolve_cap(6.0, physical_gb=None)
+    assert cap == 8.0
+    assert source == "preset 6 GB (floored to 8 GB)"
+    cap, source = resolve_cap(6.0, physical_gb=64.0)
+    assert cap == 8.0
+    assert "floored to 8 GB" in source
+    # Clamped preset on a small slice: clamped then floored, both named.
+    cap, source = resolve_cap(32.0, physical_gb=134.9, cgroup_gb=6.0)
+    assert cap == 8.0
+    assert "cgroup 6 GB" in source
+    assert "floored to 8 GB" in source
+    # Auto on a 6 GB slice: the floor note is present (cap 8 > raw -2).
+    cap, source = detect_cap_gb(physical_gb=134.9, cgroup_gb=6.0)
+    assert cap == 8.0
+    assert "floored to 8 GB" in source
+    # No floor activity: the legacy strings stand (no false positives).
+    assert resolve_cap(32.0, physical_gb=64.0)[1] == "preset 32 GB"
+    assert detect_cap_gb(physical_gb=125.0, cgroup_gb=64.0)[1] == (
+        "auto min(physical 125.0 GB, cgroup 64.0 GB) - 8 GB headroom"
+    )
+
+    # Budget over the ceiling: the precheck warns, on every path.
+    pl = plan(8.0, 10_000_000, 1024, 64, cpu=8)  # regime A, budget 6.8 GB
+    assert pl.regime == "A"
+    dec = precheck(pl, available_gb=6.0)
+    assert dec.exit_code == 0
+    assert dec.message is not None
+    assert dec.message.startswith("[warn]")
+    assert "6.8 GB exceeds the process memory ceiling 6.0 GB" in dec.message
+    assert "OOM risk" in dec.message
+    # Under the ceiling: no note (the normal case).
+    assert precheck(pl, available_gb=64.0).message is None
+    # Default (no ceiling passed): no note.
+    assert precheck(pl).message is None
+    # Per-box path carries the note too (worst case: floor + per-box est).
+    pl16 = _plan_full_au(8.0)  # per_box at the floor cap
+    assert pl16.regime == "per_box"
+    dec = precheck(pl16, available_gb=6.0)
+    assert dec.exit_code == 0
+    assert "exceeds the process memory ceiling 6.0 GB" in dec.message
+    strict = precheck(pl16, strict=True, available_gb=6.0)
+    assert strict.exit_code == 3
+    assert strict.message is not None
+    assert "exceeds the process memory ceiling 6.0 GB" in strict.message
+
+
+def test_precheck_shared_ok_is_regime_only() -> None:
+    """Audit #78 P3-1: the regime selection is the gate, not an est re-check.
+
+    A plan whose est overshoots the budget (a float-epsilon case the 3.6.2
+    sizing cannot produce) is still shared: the old
+    `est <= budget*(1+1e-12) + 4096` comparison was a tautology and is
+    removed. The per-box regime is unaffected by any est value.
+
+    """
+    base = _plan_full_au(64.0)
+    assert base.regime == "A"
+    over = replace(base, est_peak_bytes=int(base.budget_bytes * 1.001))
+    dec = precheck(over, cap_source="test")
+    assert dec.path == "shared"
+    assert dec.regime == "A"
+    assert dec.exit_code == 0
+    assert dec.message is None
+    pb = _plan_full_au(16.0)
+    assert pb.regime == "per_box"
+    dec = precheck(replace(pb, est_peak_bytes=int(pb.budget_bytes * 1.001)), cap_source="test")
+    assert dec.path == "per_box"
+    assert dec.exit_code == 0
 
 
 def test_cgroup_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
