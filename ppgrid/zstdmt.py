@@ -411,6 +411,127 @@ def predictor2(tile: np.ndarray) -> np.ndarray:
     return out
 
 
+# Shared TIFF base type -> bytes per element. Both the oracle parser
+# (_tif_info) and the pipeline head parser (pipeline._tif_parse_ifd) size
+# tag values from this one table (audit #83: they each used to carry their
+# own copy with divergent coverage). 16/17/18 = BigTIFF 64-bit types
+# (LONG8, SLONG8, IFD8).
+TIFF_TYPE_SIZES: dict[int, int] = {
+    1: 1,
+    2: 1,
+    3: 2,
+    4: 4,
+    5: 8,
+    6: 8,
+    7: 8,
+    8: 1,
+    9: 2,
+    10: 4,
+    11: 4,
+    12: 8,
+    16: 8,
+    17: 8,
+    18: 8,
+}
+
+
+def parse_tiff_header(data: bytes) -> tuple[str, bool, str, int, int, int, int]:
+    """Parse the TIFF header (byte order, classic/BigTIFF, first IFD offset).
+
+    Shared by the oracle (_tif_info) and the pipeline head parser
+    (audit #83: one header rule, not two).
+
+    Returns:
+        Tuple of (e, big, off_fmt, entry_size, cnt_size, inline, ifd_off):
+        struct endian, BigTIFF flag, offset struct format, IFD entry size,
+        IFD entry-count field size, inline value capacity (4 classic /
+        8 BigTIFF: the entry's value-field width, per the TIFF spec), and
+        the first IFD offset.
+
+    Raises:
+        ValueError: On a too-small file, unknown byte order mark or magic,
+            or an unsupported BigTIFF offset size.
+
+    """
+    if len(data) < 8:
+        msg = f"file too small to be a TIFF ({len(data)} B)"
+        raise ValueError(msg)
+    if data[:2] == b"II":
+        e = "<"
+    elif data[:2] == b"MM":
+        e = ">"
+    else:
+        msg = f"bad TIFF byte order mark {data[:2]!r}"
+        raise ValueError(msg)
+    try:
+        magic = struct.unpack_from(e + "H", data, 2)[0]
+        if magic == 42:
+            big, offset_size = False, 4
+            ifd_off = struct.unpack_from(e + "I", data, 4)[0]
+        elif magic == 43:
+            offset_size = struct.unpack_from(e + "H", data, 4)[0]
+            if offset_size != 8:
+                msg = f"unsupported BigTIFF offset size {offset_size}"
+                raise ValueError(msg)
+            big = True
+            ifd_off = struct.unpack_from(e + "Q", data, 8)[0]
+        else:
+            msg = f"unknown TIFF magic {magic}"
+            raise ValueError(msg)
+    except struct.error as exc:
+        msg = f"corrupt TIFF structure: {exc}"
+        raise ValueError(msg) from exc
+    off_fmt = "I" if offset_size == 4 else "Q"
+    entry_size = 12 if offset_size == 4 else 20
+    cnt_size = 2 if offset_size == 4 else 8  # IFD entry-count field width
+    # Inline value capacity: the entry's value-field width (4 classic,
+    # 8 BigTIFF). Values wider than the field are stored at an offset.
+    inline = 4 if offset_size == 4 else 8
+    return e, big, off_fmt, entry_size, cnt_size, inline, ifd_off
+
+
+def parse_ifd_tags(
+    data: bytes,
+    e: str,
+    ifd_off: int,
+    off_fmt: str,
+    cnt_size: int,
+    entry_size: int,
+    inline: int,
+) -> dict[int, tuple[int, int, int]]:
+    """Parse one IFD into {tag: (type, count, value position)}.
+
+    Shared by the oracle (_tif_info) and the pipeline head parser
+    (audit #83). The value position is where the value bytes actually
+    live: the entry's value field when the value fits inline
+    (total <= inline), otherwise the target of the stored offset. Tags
+    with a type outside TIFF_TYPE_SIZES are skipped (lenient: exotic
+    tags the caller does not need must not fail the parse; the pipeline
+    parser raises its own errors on the tags it does need). A truncated
+    IFD propagates struct.error to the caller (callers wrap as needed).
+
+    """
+    cnt_fmt = "H" if cnt_size == 2 else "Q"
+    entries = struct.unpack_from(e + cnt_fmt, data, ifd_off)[0]
+    # Classic entries are 12 B (tag2 type2 count4 value4); BigTIFF entries
+    # are 20 B (tag2 type2 count8 value8), so the value field sits at
+    # entry_size - inline (inline = the value-field width).
+    val_at = entry_size - inline
+    tags: dict[int, tuple[int, int, int]] = {}
+    for i in range(entries):
+        off = ifd_off + cnt_size + i * entry_size
+        tag = struct.unpack_from(e + "H", data, off)[0]
+        typ = struct.unpack_from(e + "H", data, off + 2)[0]
+        count = struct.unpack_from(e + off_fmt, data, off + 4)[0]
+        per = TIFF_TYPE_SIZES.get(typ)
+        if per is None:
+            continue
+        total = per * count
+        pos = off + val_at if total <= inline else struct.unpack_from(e + off_fmt, data, off + val_at)[0]
+        tags[tag] = (typ, count, pos)
+    return tags
+
+
 @dataclass(frozen=True)
 class _TifInfo:
     """What the oracle needs from the first image IFD of a tiled GeoTIFF."""
@@ -444,33 +565,8 @@ def _tif_info(path: Path) -> _TifInfo:
 
     """
     data = path.read_bytes()
-    if len(data) < 8:
-        msg = f"file too small to be a TIFF ({len(data)} B)"
-        raise ZstdmtError(msg)
-    if data[:2] == b"II":
-        e = "<"
-    elif data[:2] == b"MM":
-        e = ">"
-    else:
-        msg = f"bad TIFF byte order mark {data[:2]!r}"
-        raise ZstdmtError(msg)
     try:
-        magic = struct.unpack_from(e + "H", data, 2)[0]
-        if magic == 42:
-            offset_size = 4
-            ifd_off = struct.unpack_from(e + "I", data, 4)[0]
-        elif magic == 43:
-            offset_size = struct.unpack_from(e + "H", data, 4)[0]
-            if offset_size != 8:
-                msg = f"unsupported BigTIFF offset size {offset_size}"
-                raise ZstdmtError(msg)
-            ifd_off = struct.unpack_from(e + "Q", data, 8)[0]
-        else:
-            msg = f"unknown TIFF magic {magic}"
-            raise ZstdmtError(msg)
-        off_fmt = "I" if offset_size == 4 else "Q"
-        entry_size = 12 if offset_size == 4 else 20
-        cnt_size = 2 if offset_size == 4 else 8  # IFD entry-count field width
+        e, _big, off_fmt, entry_size, cnt_size, inline, ifd_off = parse_tiff_header(data)
         visited: set[int] = set()
         while True:
             if ifd_off in visited:
@@ -480,9 +576,15 @@ def _tif_info(path: Path) -> _TifInfo:
                 msg = f"cyclic IFD chain at offset {ifd_off}"
                 raise ZstdmtError(msg)
             visited.add(ifd_off)
-            tags = _parse_ifd_tags(data, e, off_fmt, cnt_size, entry_size, ifd_off)
+            tags = parse_ifd_tags(data, e, ifd_off, off_fmt, cnt_size, entry_size, inline)
             if 324 in tags and 325 in tags:
-                return _tif_info_from_tags(data, e, tags)
+                # Slice the shared offset-based tag map to the raw-bytes
+                # form _tif_info_from_tags expects.
+                raw = {
+                    tag: (typ, count, data[pos : pos + TIFF_TYPE_SIZES[typ] * count])
+                    for tag, (typ, count, pos) in tags.items()
+                }
+                return _tif_info_from_tags(data, e, raw)
             next_off = _next_ifd(data, e, off_fmt, cnt_size, entry_size, ifd_off)
             if not next_off:
                 msg = "no tiled IFD found (strip TIFF?)"
@@ -491,40 +593,9 @@ def _tif_info(path: Path) -> _TifInfo:
     except struct.error as exc:
         msg = f"corrupt TIFF structure: {exc}"
         raise ZstdmtError(msg) from exc
-
-
-def _parse_ifd_tags(
-    data: bytes,
-    e: str,
-    off_fmt: str,
-    cnt_size: int,
-    entry_size: int,
-    ifd_off: int,
-) -> dict[int, tuple[int, int, bytes]]:
-    """Return {tag: (type, count, raw bytes)} for one IFD."""
-    cnt_fmt = "H" if cnt_size == 2 else "Q"
-    entries = struct.unpack_from(e + cnt_fmt, data, ifd_off)[0]
-    tags: dict[int, tuple[int, int, bytes]] = {}
-    for i in range(entries):
-        off = ifd_off + cnt_size + i * entry_size
-        tag = struct.unpack_from(e + "H", data, off)[0]
-        typ = struct.unpack_from(e + "H", data, off + 2)[0]
-        count = struct.unpack_from(e + off_fmt, data, off + 4)[0]
-        # Classic entries are 12 B (tag2 type2 count4 value4); BigTIFF entries
-        # are 20 B (tag2 type2 count8 value8), so the value field sits at +12.
-        val_off = off + (12 if cnt_size == 8 else 8)
-        per = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 11: 4, 12: 8, 16: 8}.get(typ)
-        if per is None:
-            continue
-        total = per * count
-        val_size = 4 if cnt_size == 2 else 8
-        if total <= val_size:
-            raw = data[val_off : val_off + total]
-        else:
-            ptr = struct.unpack_from(e + off_fmt, data, val_off)[0]
-            raw = data[ptr : ptr + total]
-        tags[tag] = (typ, count, raw)
-    return tags
+    except ValueError as exc:
+        # Header-level rejects (too small, bad BOM/magic, offset size).
+        raise ZstdmtError(str(exc)) from exc
 
 
 def _next_ifd(

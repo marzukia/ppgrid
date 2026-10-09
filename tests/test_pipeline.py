@@ -1186,3 +1186,77 @@ def test_in_domain_run_value_band_bitexact_anchor(tmp_path: Path) -> None:
         digest = hashlib.sha256(ds.read(1).tobytes()).hexdigest()
     assert digest == "21a77172bfece6208e4f0b00bd900d90568e64fbff72e1c53e6ce046446025d7"
     assert p._drop_summary() == "0 NaN/inf dropped"  # ruff: ignore[private-member-access]
+# Audit #83: connascence pins (transform choices, error mapping, parquet e2e)
+# ---------------------------------------------------------------------------
+
+
+def _small_df(n: int = 40, seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(
+        {
+            "value": rng.uniform(100000, 900000, n),
+            "longitude": 144.6 + rng.uniform(-0.3, 0.3, n),
+            "latitude": -37.7 + rng.uniform(-0.3, 0.3, n),
+        }
+    )
+
+
+def test_transform_choices_pinned(tmp_path: Path) -> None:
+    """--transform choices must equal auto + the calibrate.transforms() factory names."""
+    from ppgrid.calibrate import transforms
+    from ppgrid.pipeline import _build_parser
+
+    parser = _build_parser()
+    for name in ["auto"] + [t.name for t in transforms()]:
+        args = parser.parse_args(["x", "-o", str(tmp_path / "o"), "--transform", name])
+        assert args.transform == name
+    with pytest.raises(SystemExit):
+        parser.parse_args(["x", "-o", str(tmp_path / "o"), "--transform", "not_a_transform"])
+
+
+def test_map_pipeline_errors_widened() -> None:
+    """IndexError/OverflowError/ZeroDivisionError/RasterioIOError/RuntimeError -> clean exit 1."""
+    from rasterio.errors import RasterioIOError
+
+    from ppgrid.pipeline import _map_pipeline_errors
+
+    msg = "simulated"
+    io_msg = "simulated io"
+    for typ in (IndexError, OverflowError, ZeroDivisionError, RuntimeError):
+
+        def boom(t: type[Exception] = typ) -> NoReturn:
+            raise t(msg)
+
+        with pytest.raises(SystemExit) as ei:
+            _map_pipeline_errors(boom, "in.csv")
+        assert ei.value.code == 1
+
+    def boom_io() -> NoReturn:
+        raise RasterioIOError(io_msg)
+
+    with pytest.raises(SystemExit) as ei:
+        _map_pipeline_errors(boom_io, "in.csv")
+    assert ei.value.code == 1
+
+
+def test_parquet_input_e2e(tmp_path: Path) -> None:
+    """Parquet input runs the full pipeline (optional pyarrow extra)."""
+    pytest.importorskip("pyarrow")
+    df = _small_df()
+    pq = tmp_path / "pts.parquet"
+    df.to_parquet(pq, index=False)
+    out = tmp_path / "out"
+    p = Pipeline(
+        str(pq),
+        "value",
+        "longitude",
+        "latitude",
+        str(out),
+        res=1000.0,
+        cap_km=5.0,
+        workers=1,
+        out_crs=WORK_CRS,
+    )
+    vpath, spath = p.run()
+    assert Path(vpath).exists()
+    assert Path(spath).exists()
