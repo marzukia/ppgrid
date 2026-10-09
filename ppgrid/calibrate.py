@@ -15,6 +15,7 @@ Derive the fill cap from the data rather than hardcoding it.
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -194,6 +195,72 @@ def make_transform(state: dict[str, Any]) -> Transform:
     raise ValueError(msg)
 
 
+def _check_quantiles_list(q: Any, path: str, field: str) -> None:
+    """Assert a calibration quantiles field is a list of NQ finite numbers (issue #79).
+
+    Args:
+        q: The parsed JSON field value.
+        path: The calibration file path, for the error message.
+        field: The field name, for the error message.
+
+    Raises:
+        ValueError: Naming the file and the bad field.
+
+    """
+    nq = PercentileTransform.NQ
+    if not isinstance(q, list):
+        msg = f"calibration file {path}: {field} must be a list of {nq} finite numbers (got {type(q).__name__})"
+        raise ValueError(msg)  # ruff: ignore[type-check-without-type-error] — ValueError is the CLI-mapped error type (exit 2)
+    if len(q) != nq:
+        msg = f"calibration file {path}: {field} must be a list of {nq} finite numbers (got length {len(q)})"
+        raise ValueError(msg)
+    for i, x in enumerate(q):
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+            msg = f"calibration file {path}: {field}[{i}] is not a finite number ({x!r})"
+            raise ValueError(msg)
+
+
+def validate_calibration(cal: Any, path: str) -> None:
+    """Schema-validate a user-supplied calibration.json at load time (issue #79).
+
+    The file is user-controlled input (the documented reuse mechanism). Without
+    this guard a bad file dies mid-run with a raw traceback: an unfitted
+    percentile state hits AttributeError in PercentileTransform.state(), an
+    unknown transform name hits StopIteration in the refit branch, and a
+    wrong-length quantile list survives until the write phase (np.interp
+    fp/xp mismatch) after all the grid work.
+
+    Args:
+        cal: The parsed JSON.
+        path: The file path, for error messages.
+
+    Raises:
+        ValueError: One friendly message naming the file and the bad field.
+
+    """
+    if not isinstance(cal, dict):
+        msg = f"calibration file {path}: top level must be a JSON object (got {type(cal).__name__})"
+        raise ValueError(msg)  # ruff: ignore[type-check-without-type-error] — ValueError is the CLI-mapped error type (exit 2)
+    known = sorted(t.name for t in transforms())
+
+    def _known_name(value: Any, field: str) -> str:
+        if not isinstance(value, str) or value not in known:
+            msg = f"calibration file {path}: {field} has unknown transform name {value!r} (expected one of {known})"
+            raise ValueError(msg)
+        return value
+
+    _known_name(cal.get("transform", "identity"), "transform")
+    ts = cal.get("transform_state")
+    if ts is not None:
+        if not isinstance(ts, dict):
+            msg = f"calibration file {path}: transform_state must be a JSON object (got {type(ts).__name__})"
+            raise ValueError(msg)
+        if _known_name(ts.get("name"), "transform_state.name") == "percentile":
+            _check_quantiles_list(ts.get("quantiles"), path, "transform_state.quantiles")
+    if "percentile_quantiles" in cal:
+        _check_quantiles_list(cal["percentile_quantiles"], path, "percentile_quantiles")
+
+
 def _cell_key(x: np.ndarray, y: np.ndarray, res: float) -> np.ndarray:
     """Hash (x, y) coordinates to a unique integer per cell at the given resolution.
 
@@ -256,7 +323,14 @@ def choose_transform(
     Returns:
         Tuple of best transform and all scored results.
 
+    Raises:
+        ValueError: If values is empty, or every candidate is rejected
+            (non-finite input).
+
     """
+    if values.size == 0:
+        msg = "choose_transform: empty values"
+        raise ValueError(msg)
     inv_by_scale: dict[float, np.ndarray] = {}
     for s in scales:
         key = _cell_key(x, y, s)
@@ -273,6 +347,14 @@ def choose_transform(
             continue
         per_scale: dict[float, float] = {float(s): icc_from_inv(inv_by_scale[s], tv) for s in scales}
         results.append((fitted, float(np.mean(list(per_scale.values()))), per_scale))
+    if not results:
+        n_nan = int(np.isnan(values).sum())
+        n_inf = int(np.isinf(values).sum())
+        msg = (
+            f"choose_transform: all candidate transforms rejected (non-finite input: "
+            f"{n_nan} NaN, {n_inf} Inf of {values.size} values)"
+        )
+        raise ValueError(msg)
     results.sort(key=lambda r: -r[1])
     return results[0][0], results
 
@@ -392,18 +474,32 @@ def blocked_cv_skill(
         if nb < n:
             sub = rng.choice(n, nb, replace=False)
             e_m, e_b = e_m[sub], e_b[sub]
-        bs = np.empty(n_boot, dtype=np.float32)
-        for k in range(n_boot):
+        # A bootstrap draw where e_b is exactly 0 (act == global mean in
+        # float64, realistic on data with a dominant mode) is a 0/0 skill:
+        # skip the draw instead of letting NaN pollute the CI (issue #79).
+        # If every draw is skipped the CI is undefined: keep the point skill.
+        bs = np.full(n_boot, np.nan, dtype=np.float32)
+        nb_ok = 0
+        for _ in range(n_boot):
             s = rng.integers(0, nb, size=nb)
-            bs[k] = 1 - np.sqrt(np.mean(e_m[s] ** 2)) / np.sqrt(np.mean(e_b[s] ** 2))
+            b_rms2 = np.mean(e_b[s] ** 2)
+            if b_rms2 == 0.0:
+                continue
+            bs[nb_ok] = 1 - np.sqrt(np.mean(e_m[s] ** 2)) / np.sqrt(b_rms2)
+            nb_ok += 1
+        if nb_ok == 0:
+            ci_lo = ci_hi = float(skill)
+        else:
+            ci_lo = float(np.percentile(bs[:nb_ok], 5))
+            ci_hi = float(np.percentile(bs[:nb_ok], 95))
         rows.append(
             {
                 "lo_km": float(lo),
                 "hi_km": float(hi),
                 "n": n,
                 "skill": float(skill),
-                "ci_lo": float(np.percentile(bs, 5)),
-                "ci_hi": float(np.percentile(bs, 95)),
+                "ci_lo": ci_lo,
+                "ci_hi": ci_hi,
             },
         )
 
@@ -440,11 +536,16 @@ def calibrate_fill_cap(
         detail[bk] = {"overall_skill": overall, "rows": rows}
         for r in rows:
             if r["hi_km"] <= bk / 2.0 and r["hi_km"] not in curve:
-                curve[r["hi_km"]] = (r["ci_lo"], bk, r["n"])
+                curve[r["hi_km"]] = (r["ci_lo"], r["skill"], bk, r["n"])
 
     cap: float | None = None
     for hi in sorted(curve):
-        if curve[hi][0] > min_skill:
+        ci, skill, _bk, _n = curve[hi]
+        if not math.isfinite(ci):
+            # Non-finite CI (0/0 bootstrap): use the point skill instead of
+            # breaking the prefix loop on NaN (issue #79).
+            ci = skill
+        if ci > min_skill:
             cap = hi
         else:
             break

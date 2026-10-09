@@ -49,6 +49,7 @@ from .calibrate import (
     choose_transform,
     make_transform,
     transforms,
+    validate_calibration,
 )
 from .pullpush import (
     _descent_banded,
@@ -1573,7 +1574,10 @@ def _csv_chunk_tasks(
     """
     try:
         data = Path(path).read_bytes()
-        if not data:
+        # Empty or compressed input cannot be split by raw byte offsets: pandas
+        # cannot sniff compression from a byte buffer, so the serial parse
+        # (which reads via the path) is the only correct read (issue #80).
+        if not data or data[:2] == b"\x1f\x8b" or data[:3] == b"BZh" or data[:4] in (b"PK\x03\x04", b"\xfd7zXZ"):
             return None
         nl = np.flatnonzero(np.frombuffer(data, dtype=np.uint8) == 10)
         n_nl = int(nl.size)
@@ -1603,10 +1607,10 @@ def _csv_chunk_tasks(
             if data[start:end].count(b'"') % 2 != 0:
                 return None  # chunk boundary splits a quoted field
             tasks.append((path, start, end, r0 == 0, list(wanted), list(all_names)))
-    except (OSError, ValueError, IndexError):
+    except (OSError, ValueError, IndexError, MemoryError):
         # Planning is best effort: any surprise (odd encoding, ragged
-        # header, ...) falls back to the serial parse, which has the
-        # historical behaviour.
+        # header, memory pressure at plan time, ...) falls back to the
+        # serial parse, which has the historical behaviour (issue #80).
         return None
     else:
         return tasks, data_rows
@@ -1873,6 +1877,10 @@ class Pipeline:
         if cpath_obj is not None:
             with cpath_obj.open(encoding="utf-8") as f:
                 cal = json.load(f)
+            # User-supplied file: validate the schema before use so a bad
+            # file is a friendly exit-2 naming the file, not a raw
+            # traceback mid-run (issue #79).
+            validate_calibration(cal, str(cpath_obj))
         elif not self.skip_calibration:
             if self.n > self.calib_max_points:
                 sub = np.random.default_rng(self.seed).choice(self.n, self.calib_max_points, replace=False)

@@ -13,10 +13,12 @@
 - n_threads=1 regression: the default code path is the serial one (A8)
 """
 
+import gzip
 import hashlib
 import io
 import math
 import multiprocessing as mp
+import shutil
 import struct
 from concurrent.futures import ProcessPoolExecutor as _ProcessPoolExecutor
 from functools import partial
@@ -367,6 +369,80 @@ def test_ingest_float_pin_no_change_off_pattern(tmp_path: Path, monkeypatch: pyt
     v4, _, _ = p4._read_points(_WANTED)  # ruff: ignore[private-member-access]
     assert np.array_equal(v1, np.array([float(t) for t in small_toks], dtype=np.float64))
     assert np.array_equal(v1, v4)
+# ---------------------------------------------------------------------------
+# Issue #80: compressed CSV + planner MemoryError
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def big_csv_pair(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    """250k-row CSV (raw + gzipped) shared by the #80 fallback tests."""
+    n = 250_000
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(
+        {
+            "value": rng.random(n),
+            "longitude": 144.0 + rng.random(n) * 0.2,
+            "latitude": -38.0 + rng.random(n) * 0.2,
+        },
+    )
+    d = tmp_path_factory.mktemp("bigcsv")
+    raw = d / "big.csv"
+    df.to_csv(raw, index=False)
+    gz = d / "big.csv.gz"
+    with raw.open("rb") as fin, gzip.open(gz, "wb") as fout:
+        shutil.copyfileobj(fin, fout)
+    return raw, gz
+
+
+def test_csv_gz_chunk_planner_sniffs_magic(big_csv_pair: tuple[Path, Path]) -> None:
+    """#80: gzip magic in the planner -> None (serial fallback), not a byte-offset plan."""
+    raw, gz = big_csv_pair
+    assert _csv_chunk_tasks(str(gz), _WANTED, 4) is None
+    # The uncompressed file still plans (guard against an over-broad sniff).
+    tasks = _csv_chunk_tasks(str(raw), _WANTED, 4)
+    assert tasks is not None
+    assert tasks[1] == 250_000
+
+
+def test_csv_gz_n_threads_falls_back_to_serial(tmp_path: Path, big_csv_pair: tuple[Path, Path]) -> None:
+    """#80: .csv.gz + n_threads=4 parses via the serial fallback (was UnicodeDecodeError).
+
+    Row count and values must match the n_threads=1 serial read exactly.
+    """
+    _raw, gz = big_csv_pair
+    n = 250_000
+    p4 = Pipeline(str(gz), "value", "longitude", "latitude", str(tmp_path / "o4"), n_threads=4)
+    p4.ingest()
+    p1 = Pipeline(str(gz), "value", "longitude", "latitude", str(tmp_path / "o1"), n_threads=1)
+    p1.ingest()
+    assert p4.n == n
+    assert p1.n == n
+    np.testing.assert_array_equal(p4.v, p1.v)
+    np.testing.assert_array_equal(p4.x, p1.x)
+    np.testing.assert_array_equal(p4.y, p1.y)
+
+
+def test_chunk_planner_memoryerror_falls_back_to_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, big_csv_pair: tuple[Path, Path]
+) -> None:
+    """#80: MemoryError during planning (2x file-size allocation) -> serial parse, no crash."""
+    raw, _gz = big_csv_pair
+    n = 250_000
+    real_read_bytes = Path.read_bytes
+    state = {"raised": False}
+
+    def boom(self: Path) -> bytes:
+        if not state["raised"] and str(self) == str(raw):
+            state["raised"] = True
+            raise MemoryError
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    p = Pipeline(str(raw), "value", "longitude", "latitude", str(tmp_path / "omem"), n_threads=4)
+    p.ingest()
+    assert state["raised"]  # the planner really hit the MemoryError
+    assert p.n == n
 
 
 def test_pipeline_mt_end_to_end_sha256_equal(tmp_path: Path) -> None:

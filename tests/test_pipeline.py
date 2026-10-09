@@ -291,6 +291,81 @@ def test_auto_fallback_not_all_zero_surface(tmp_path: Path, bad_transform: str) 
     assert valid.mean() > 0
 
 
+# ---------------------------------------------------------------------------
+# Issue #79: malformed user-supplied calibration.json -> friendly exit 2
+# ---------------------------------------------------------------------------
+
+
+def _three_point_csv(tmp_path: Path) -> str:
+    csv = tmp_path / "pts3.csv"
+    csv.write_text("value,lng,lat\n1.0,144.0,-37.0\n2.0,144.01,-37.01\n3.0,144.02,-37.02\n")
+    return str(csv)
+
+
+@pytest.mark.parametrize(
+    ("cal", "match"),
+    [
+        # (a) percentile state without quantiles: was AttributeError (NoneType.tolist)
+        (
+            {"transform": "percentile", "transform_state": {"name": "percentile"}, "cap_km": 20.0},
+            "transform_state.quantiles",
+        ),
+        # (b) unknown transform name, no transform_state: was raw StopIteration
+        ({"transform": "bogus", "cap_km": 20.0}, "bogus"),
+        # (c) wrong-length percentile_quantiles: was np.interp fp/xp mismatch at write time
+        (
+            {
+                "transform": "identity",
+                "transform_state": {"name": "identity"},
+                "percentile_quantiles": [0.0, 1.0],
+                "cap_km": 20.0,
+            },
+            "percentile_quantiles",
+        ),
+    ],
+)
+def test_bad_calibration_file_exit2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], cal: dict[str, Any], match: str
+) -> None:
+    """#79: all three malformed-file modes are one friendly exit-2 naming the file.
+
+    No raw traceback text (AttributeError/StopIteration/np.interp) reaches stderr.
+    """
+    from ppgrid.pipeline import main
+
+    csv = _three_point_csv(tmp_path)
+    cal_path = tmp_path / "bad_calibration.json"
+    cal_path.write_text(json.dumps(cal))
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                csv,
+                "-o",
+                str(tmp_path / "out"),
+                "--value-col",
+                "value",
+                "--lng-col",
+                "lng",
+                "--lat-col",
+                "lat",
+                "--res",
+                "100",
+                "--block",
+                "2048",
+                "--workers",
+                "2",
+                "--calibration",
+                str(cal_path),
+            ]
+        )
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert str(cal_path) in err
+    assert match in err
+    for needle in ("AttributeError", "StopIteration", "fp and xp", "Traceback"):
+        assert needle not in err
+
+
 def test_cli_version_matches_package_version(capsys: pytest.CaptureFixture[str]) -> None:
     """`ppgrid --version` must report the real package version, not a hardcoded one (issue #2)."""
     from ppgrid import __version__

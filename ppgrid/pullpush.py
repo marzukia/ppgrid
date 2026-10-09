@@ -948,6 +948,12 @@ def bin_points_banded(
     _nohuge(order, xs, ys, ws)
     bounds = np.concatenate((np.zeros(1, xs.dtype), np.flatnonzero(np.diff(xs)) + 1, np.array([xs.size], xs.dtype)))
     if bounds.size < 2 or bounds[1] == 0:
+        # Zero points: fill both grids so a caller that skips its own
+        # pre-fill never reads an uninitialised memmap as data (issue #82;
+        # the flat twin bin_points raises on empty ix, this one is the
+        # silent-safe no-op).
+        s_out.fill(0)
+        c_out.fill(0)
         return
     rows = xs[bounds[:-1]]
     for k in range(bounds.size - 1):
