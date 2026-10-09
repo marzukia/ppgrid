@@ -943,7 +943,7 @@ def test_stale_outputs_warning_after_failed_run(tmp_path: Path, capsys: pytest.C
     sha_s = _sha(out / "support_km.tif")
 
     with pytest.raises(SystemExit) as ei:
-        pipeline_mod.main([str(csv), *_cli_base(out, "--value-col", "nonexistent")])
+        pipeline_mod.main([str(csv), *_cli_base(out, "--value-col", "nonexistent", "--force")])
     assert ei.value.code == 2
     err = capsys.readouterr().err
     assert "failed before writing outputs" in err
@@ -985,7 +985,7 @@ def test_midwrite_failure_keeps_finals(
 
     monkeypatch.setattr(pipeline_mod, "_reproject_band", _boom)
     with pytest.raises(RuntimeError, match="simulated mid-write crash"):
-        pipeline_mod.main([str(csv), *_cli_base(out)])
+        pipeline_mod.main([str(csv), *_cli_base(out, "--force")])
     err = capsys.readouterr().err
     assert "failed during write" in err
     assert "failed before writing outputs" in err
@@ -1020,7 +1020,7 @@ def test_turbo_midwrite_failure_keeps_finals(
     monkeypatch.setattr(pipeline_mod, "_turbo_write_stock_parallel", _boom)
     monkeypatch.setattr(pipeline_mod, "_reproject_band_array", _boom)
     with pytest.raises(RuntimeError, match="simulated mid-write crash"):
-        pipeline_mod.main([str(csv), *_cli_base(out, "--turbo", "32")])
+        pipeline_mod.main([str(csv), *_cli_base(out, "--turbo", "32", "--force")])
     err = capsys.readouterr().err
     assert "failed during write" in err
     assert "failed before writing outputs" in err

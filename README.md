@@ -117,22 +117,34 @@ ppgrid help
 | `--transform` | `auto` | auto, identity, log10, sqrt, percentile |
 | `--saturation` | `1.0` | Counts for a cell to fully self-trust |
 | `--block` | `2048` | Block size in cells |
-| `--workers` | `4` | Number of parallel workers |
+| `--workers` | `4` | Number of parallel workers (positive integer, or `auto` = `os.cpu_count()`) |
 | `--scale` | `100.0` | DN = percentile * scale |
 | `--percentile-step` | (none) | Round output percentiles to the nearest step (e.g. `5` -> 90/95/100) |
 | `--compress` | `ZSTD` | GeoTIFF compression |
 | `--calibration` | (none) | Path to existing calibration.json |
 | `--calib-max-points` | `2000000` | Max points to use for calibration |
-| `--src-crs` | `4326` | Input coordinate reference system |
-| `--work-crs` | `6933` | Working CRS for interpolation (equal-area) |
-| `--out-crs` | `3857` | Output CRS for final GeoTIFF |
+| `--src-crs` | `4326` | Input CRS (bare int or `EPSG:<code>` string) |
+| `--work-crs` | `6933` | Working CRS for interpolation (equal-area; bare int or `EPSG:<code>`) |
+| `--out-crs` | `3857` | Output CRS for final GeoTIFF (bare int or `EPSG:<code>`) |
 | `--skip-calibration` | False | Skip calibration, use defaults |
+| `--seed` | `0` | RNG seed for the calibration subsampling + blocked-CV bootstrap (same seed + same input → reproducible outputs) |
 | `--turbo` | (none) | Turbo mode: multithreaded pipeline sized to a RAM cap. Optional preset `16|32|64|128` (GB); bare `--turbo` = auto `min(physical, cgroup) - 8 GB` |
 | `--max-ram` | (none) | Explicit RAM cap in GB (overrides the `--turbo` preset). Implies `--turbo` |
 | `--ram-gb` | (none) | Alias of `--max-ram` |
 | `--turbo-strict` | False | Shared path infeasible under the budget: error + exit 3 instead of `[warn]` + per-box fallback (exit 0) |
+| `--plan` | False | Resolve the full run plan (grid, levels, transform, turbo decision, budget), print it, exit 0 — creates no files or directories |
+| `--force` | False | Overwrite existing outputs in the out dir (default: exit 2 when `value.tif` / `support_km.tif` / `calibration.json` / `run_summary.json` are present) |
+| `--json` | False | Write a machine-readable run summary to `<out>/run_summary.json` (phase timings, volumetrics, grid metadata, calibration, resolved CLI params, seed, git commit; stdout stays clean) |
 | `--verbose` | False | Debug logging: per-phase wall times + volumetric detail (shorthand for `--log-level debug`) |
 | `--log-level` | `info` | Progress log level on stderr: `error`, `warning`, `info`, `debug` (env `LOGGING`; `verbose` = debug) |
+| `-q, --quiet` | False | Suppress stderr below WARNING (beats `--verbose` / `LOGGING`; an explicit `--log-level` wins) |
+
+### Exit codes
+
+- `0` — success (also `ppgrid help` and `--plan`)
+- `1` — pipeline / I/O error (bad output path, missing input file, disk full)
+- `2` — validation error (bad flag value, missing input column, out dir not empty without `--force`)
+- `3` — `--turbo-strict`: shared path infeasible under the RAM budget
 
 ### Turbo mode
 
