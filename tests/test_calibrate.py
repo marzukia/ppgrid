@@ -228,6 +228,7 @@ def test_bootstrap_zero_baseline_draws_keep_finite_ci(monkeypatch: pytest.Monkey
         _train: np.ndarray,
         _res: float,
         _levels: int,
+        saturation: float = 1.0,  # ruff: ignore[unused-function-argument] - keyword-matched to the _fit_predict call
     ) -> tuple[np.ndarray, np.ndarray]:
         sup = np.where(np.arange(len(t)) < n // 2, 1.0, 5.0)
         return t, sup  # perfect prediction: e_m == 0 everywhere
@@ -273,6 +274,8 @@ def test_fill_cap_nonfinite_ci_uses_point_skill(monkeypatch: pytest.MonkeyPatch)
     cap, detail = cal.calibrate_fill_cap(np.empty(0), np.empty(0), np.empty(0), block_km=(100.0,))
     assert cap == 8.0  # not 25.0 (FILL_CAP_DEFAULT_KM) and not broken at the first bin
     assert detail[100.0]["cap_km"] == 8.0
+
+
 # Audit #83: saturation plumbing + CV edge derivation
 # ---------------------------------------------------------------------------
 
