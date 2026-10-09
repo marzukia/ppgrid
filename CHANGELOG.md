@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.1] - 2026-10-09
 - CLI: `ppgrid help` command (exit 0) and an examples epilog on `--help` (RawDescriptionHelpFormatter). Bare `ppgrid` with no input now exits 2 with a concise error + hint to `ppgrid help` (the positional `input` is `nargs="?"`; `--help`/`--version` unchanged).
 - Leveled logging: progress goes to stderr via the `ppgrid` logger (root untouched, stdout stays clean). `--verbose` (shorthand for debug) + `--log-level {error,warning,info,debug}` (default info); env `LOGGING` (value `verbose` = debug). Precedence: flag > LOGGING > info. INFO = one line per phase + final summary; DEBUG = per-phase wall-time (ms) breakdown (time.perf_counter in `Pipeline.run`), volumetric detail (rows read, points ingested, NaN/inf dropped, cells/level, output bytes raw vs compressed + ratio, resolved plan).
 - Tests: +18 (`tests/test_cli_logging.py`): parser flag tests, level-precedence table, `help`/no-input dispatch via capsys, caplog INFO/DEBUG line assertions, and byte-identical GeoTIFFs with and without `--verbose` (logging is side-channel).
