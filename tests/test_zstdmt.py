@@ -11,7 +11,10 @@ real CPL pfn on the committed stock-path fixture.
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -355,3 +358,103 @@ def test_tif_info_corrupt_body_raises_zstdmterror(tmp_path: Path) -> None:
     p.write_bytes(b"II\x2a\x00\x08\x00\x00\x00")
     with pytest.raises(ZstdmtError, match="corrupt TIFF"):
         zstdmt._tif_info(p)  # ruff: ignore[private-member-access]
+
+
+def test_oracle_pads_partial_edge_tile(tmp_path: Path) -> None:
+    """Audit #81 F-1: the oracle zero-pads a partial edge tile to the block.
+
+    A 300x300 raster in 512px blocks stores one partial tile. GDAL
+    padded it with zeros before the codec ran, so the oracle's turbo
+    side must feed the compressor the full 512x512 padded bytes - not
+    the 300x300 slice (pre-fix: frame size mismatch, S3 bit-identity
+    break on non-512-multiple rasters).
+
+    """
+    size, block = 300, 512
+    rng = np.random.default_rng(7)
+    arr = rng.integers(0, 1000, size=(size, size), dtype=np.int16)
+    p = tmp_path / "partial.tif"
+    xform = rasterio.transform.from_origin(0.0, size * 10.0, 10.0, 10.0)
+    with rasterio.open(
+        p,
+        "w",
+        driver="GTiff",
+        width=size,
+        height=size,
+        count=1,
+        dtype="int16",
+        crs="EPSG:3857",
+        transform=xform,
+        compress="ZSTD",
+        tiled=True,
+        blockxsize=block,
+        blockysize=block,
+        predictor=2,
+        nodata=-1,
+    ) as dst:
+        dst.write(arr, 1)
+    info = zstdmt._tif_info(p)  # ruff: ignore[private-member-access]
+    assert info.tilew == block
+    assert info.tileh == block
+    stock = info.tile_bytes[0]
+    seen: dict[str, bytes] = {}
+
+    def spy_compress(data: bytes) -> bytes:
+        seen["data"] = data
+        return stock
+
+    verdict = oracle_check(p, tile=0, compress=spy_compress)
+    # The compressor got the zero-padded full block, not the 300x300 slice.
+    assert len(seen["data"]) == block * block * 2
+    padded = np.zeros((block, block), dtype=np.int16)
+    padded[:size, :size] = arr
+    assert seen["data"] == predictor2(padded).tobytes()
+    assert verdict.ok
+
+
+def test_tif_info_cyclic_ifd_raises(tmp_path: Path) -> None:
+    """Audit #81 F-2: a self-referencing next-IFD pointer raises, not loops."""
+    p = tmp_path / "cyclic.tif"
+    # classic TIFF: header, one 1-entry IFD at 8 whose next-IFD is 8 again
+    p.write_bytes(
+        b"II\x2a\x00"
+        + struct.pack("<I", 8)  # first IFD offset
+        + struct.pack("<H", 1)  # one entry
+        + struct.pack("<HHI", 256, 3, 1)  # ImageWidth = SHORT
+        + struct.pack("<I", 64)  # width value
+        + struct.pack("<I", 8)  # next IFD = itself (cycle)
+    )
+    with pytest.raises(ZstdmtError, match="cyclic IFD chain"):
+        zstdmt._tif_info(p)  # ruff: ignore[private-member-access]
+
+
+def test_available_predicate_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit #81 F-3: available() is a true predicate (never raises).
+
+    A vanished libgdal mapping (OSError from CDLL) and an unreadable
+    /proc/self/maps must report False so callers can branch on the
+    result without their own exception handling.
+
+    """
+    st = zstdmt._STATE  # ruff: ignore[private-member-access]
+    saved = (st.gdal_path, st.lib, st.pfn, st.user_data)
+    try:
+        # Case 1: the gdal path no longer exists -> CDLL OSError.
+        st.lib, st.pfn = None, None
+        monkeypatch.setattr(zstdmt, "_gdal_path", lambda: "/nonexistent/libgdal.so")
+        assert zstdmt.available() is False
+        # Case 2: /proc/self/maps unreadable -> _gdal_path ZstdmtError.
+        st.lib, st.pfn = None, None
+        monkeypatch.setattr(zstdmt, "_gdal_path", lambda: "unreachable")
+
+        def _fake_path(_name: str) -> Any:
+            def read_text(*ra: object, **rk: object) -> str:  # ruff: ignore[unused-function-argument]
+                msg = "no /proc"
+                raise OSError(msg)
+
+            return SimpleNamespace(read_text=read_text)
+
+        monkeypatch.setattr(zstdmt, "Path", _fake_path)
+        assert zstdmt.available() is False
+    finally:
+        st.gdal_path, st.lib, st.pfn, st.user_data = saved
