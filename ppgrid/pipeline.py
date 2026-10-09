@@ -1577,7 +1577,13 @@ def _csv_chunk_tasks(
         # Empty or compressed input cannot be split by raw byte offsets: pandas
         # cannot sniff compression from a byte buffer, so the serial parse
         # (which reads via the path) is the only correct read (issue #80).
-        if not data or data[:2] == b"\x1f\x8b" or data[:3] == b"BZh" or data[:4] in (b"PK\x03\x04", b"\xfd7zXZ"):
+        if (
+            not data
+            or data[:2] == b"\x1f\x8b"  # gzip
+            or data[:3] == b"BZh"  # bzip2
+            or data[:4] == b"PK\x03\x04"  # zip
+            or data[:5] == b"\xfd7zXZ"  # xz (5-byte magic; review M-1)
+        ):
             return None
         nl = np.flatnonzero(np.frombuffer(data, dtype=np.uint8) == 10)
         n_nl = int(nl.size)
