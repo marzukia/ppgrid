@@ -530,7 +530,7 @@ def calibrate_fill_cap(
 
     """
     detail: dict[float, CVCurve] = {}
-    curve: dict[float, tuple[float, float, int]] = {}
+    curve: dict[float, tuple[float, float, int, int]] = {}
     for bk in sorted(block_km):
         overall, rows = blocked_cv_skill(x, y, tv, block_km=bk, **kw)
         detail[bk] = {"overall_skill": overall, "rows": rows}
