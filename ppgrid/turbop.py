@@ -669,9 +669,16 @@ def detect_cap_gb(physical_gb: float | None = None, cgroup_gb: float | None = No
         physical_gb = _read_physical_gb()
     if cgroup_gb is None:
         cgroup_gb = _read_cgroup_max_gb()
-    cap = max(min(physical_gb, cgroup_gb) - AUTO_HEADROOM_GB, CAP_FLOOR_GB)
+    avail = min(physical_gb, cgroup_gb)
+    raw = avail - AUTO_HEADROOM_GB
+    cap = max(raw, CAP_FLOOR_GB)
     cgroup_str = "unlimited" if math.isinf(cgroup_gb) else f"{cgroup_gb:.1f} GB"
     source = f"auto min(physical {physical_gb:.1f} GB, cgroup {cgroup_str}) - {AUTO_HEADROOM_GB:g} GB headroom"
+    if cap > raw:
+        # available < 16 GB: the 8 GB floor pushed the cap above the
+        # headroom-reduced value (and above the ceiling when avail < 8);
+        # the source must say so (audit #78 P1-2).
+        source += f" (floored to {CAP_FLOOR_GB:g} GB)"
     return cap, source
 
 
@@ -708,7 +715,11 @@ def resolve_cap(
     if preset_gb is None:
         return detect_cap_gb(physical_gb, cgroup_gb)
     if physical_gb is None:
-        return max(preset_gb, CAP_FLOOR_GB), f"preset {preset_gb:g} GB"
+        cap = max(preset_gb, CAP_FLOOR_GB)
+        source = f"preset {preset_gb:g} GB"
+        if cap > preset_gb:
+            source += f" (floored to {CAP_FLOOR_GB:g} GB)"
+        return cap, source
     available = min(physical_gb, cgroup_gb) if cgroup_gb is not None else physical_gb
     if preset_gb >= available:
         cap = available - AUTO_HEADROOM_GB
@@ -723,8 +734,17 @@ def resolve_cap(
                 f"preset {preset_gb:g} GB >= physical {physical_gb:g} GB; clamped to physical - {AUTO_HEADROOM_GB:g} GB"
             )
     else:
-        cap, source = preset_gb, f"preset {preset_gb:g} GB"
-    return max(cap, CAP_FLOOR_GB), source
+        cap = preset_gb
+        source = f"preset {preset_gb:g} GB"
+    # The 8 GB floor can push the cap above the requested preset (or the
+    # clamped value) - e.g. --max-ram 6 on any host, or a 6 GB cgroup
+    # slice: plan() then uses 8, not 6. The source must say so (audit
+    # #78 P1-2: it kept claiming the requested value while the plan
+    # used the floored one).
+    floored = max(cap, CAP_FLOOR_GB)
+    if floored > cap:
+        source += f" (floored to {CAP_FLOOR_GB:g} GB)"
+    return floored, source
 
 
 # ---------------------------------------------------------------------------
@@ -751,6 +771,7 @@ def precheck(
     strict: bool = False,
     cap_source: str = "auto",
     per_box_peak_bytes: int | None = None,
+    available_gb: float | None = None,
 ) -> PrecheckDecision:
     """Gate the selected regime's est peak against the 0.85*C budget.
 
@@ -773,6 +794,12 @@ def precheck(
         cap_source: Human-readable cap source from :func:`resolve_cap`.
         per_box_peak_bytes: Worst-case per-box fallback peak in bytes
             (:func:`per_box_peak_bytes`); None = not estimated.
+        available_gb: The process's actual memory ceiling in GB (min of
+            physical RAM and the cgroup limit; the pipeline passes it).
+            When the plan's budget 0.85 * cap exceeds it - the 8 GB floor
+            case on a small slice (audit #78 P1-2) - a [warn] naming the
+            budget-over-ceiling OOM risk is prepended to the decision
+            message. None (default) = no ceiling check.
 
     Returns:
         PrecheckDecision with exit_code 0 or 3 and the [warn]/error line.
@@ -785,17 +812,40 @@ def precheck(
         f"(box_chunks={plan.box_chunks}, descent_bands={plan.descent_bands}, workers={plan.workers}, "
         f"tile_cache={plan.tile_cache_tiles}, zstd_ctx={plan.zstd_ctx_bytes / 1e6:.0f} MB)"
     )
-    shared_ok = plan.regime in ("A", "B", "C") and plan.est_peak_bytes <= plan.budget_bytes * (1.0 + 1e-12) + 4096.0
+    # Regime selection is the gate (3.6.2): a feasible regime fits the
+    # budget BY CONSTRUCTION - A is admitted at n*24.5 <= Bt, B caps est
+    # at min(comp, Bt + B0), C sizes in-flight from Bt - floor. The old
+    # `est <= budget*(1+1e-12) + 4096` comparison was a tautology (audit
+    # #78 P3-1); it is removed - no est vs budget re-check binds here.
+    shared_ok = plan.regime in ("A", "B", "C")
+
+    # The 8 GB cap floor can plan a budget above the process's actual
+    # memory ceiling (0.85 * 8 = 6.8 GB > a 6 GB slice). Name that
+    # instead of letting a green precheck OOM the run (audit #78 P1-2).
+    ceiling_note = (
+        None
+        if available_gb is None or plan.budget_bytes <= available_gb * GB
+        else (
+            f"[warn] --turbo: pre-check budget {budget_gb:.1f} GB exceeds the process "
+            f"memory ceiling {available_gb:.1f} GB (cap {plan.cap_gb:g} GB); OOM risk"
+        )
+    )
+
+    def _note(m: str | None) -> str | None:
+        if ceiling_note is None:
+            return m
+        return f"{ceiling_note}; {m}" if m is not None else ceiling_note
+
     if shared_ok:
         est_gb = plan.est_peak_bytes / GB
         if plan.regime == "A":
-            return PrecheckDecision("shared", "A", est_gb, budget_gb, 0, None, summary)
+            return PrecheckDecision("shared", "A", est_gb, budget_gb, 0, _note(None), summary)
         est_a_gb = plan.n_cells * PHASE_A_B_PER_CELL / GB
         message = (
             f"[warn] --turbo: est peak {est_a_gb:.1f} GB (regime A, full in-RAM) "
             f"> budget {budget_gb:.1f} GB; using regime {plan.regime} shared"
         )
-        return PrecheckDecision("shared", plan.regime, est_gb, budget_gb, 0, message, summary)
+        return PrecheckDecision("shared", plan.regime, est_gb, budget_gb, 0, _note(message), summary)
 
     # Per-box fallback: the natural shared estimate (regime A, field-only,
     # 2.2 base) is what overran; the per-box plan itself peaks ~4-6 GB.
@@ -811,7 +861,7 @@ def precheck(
                 message += f"; per-box est peak {per_box_gb:.1f} GB also > budget (will OOM)"
             else:
                 message += f"; per-box est peak {per_box_gb:.1f} GB fits the budget"
-        return PrecheckDecision("per_box", "per_box", est_gb, budget_gb, 3, message, summary)
+        return PrecheckDecision("per_box", "per_box", est_gb, budget_gb, 3, _note(message), summary)
     if per_box_gb is not None and per_box_gb > budget_gb:
         message = (
             f"[warn] --turbo: per-box est peak {per_box_gb:.1f} GB > budget {budget_gb:.1f} GB; "
@@ -821,7 +871,7 @@ def precheck(
         message = (
             f"[warn] --turbo: est peak {est_a_gb:.1f} GB > budget {budget_gb:.1f} GB; using per-box (turbo warp/write)"
         )
-    return PrecheckDecision("per_box", "per_box", est_gb, budget_gb, 0, message, summary)
+    return PrecheckDecision("per_box", "per_box", est_gb, budget_gb, 0, _note(message), summary)
 
 
 # ---------------------------------------------------------------------------
