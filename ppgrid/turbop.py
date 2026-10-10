@@ -15,8 +15,6 @@ Implements sections 2.2, 3.5, and 3.6 (all) of the approved turbo design
   fallback with turbo warp/write. The 3.6.2 worked table is
   :data:`SIZING_TABLE`, the one source of truth for the derived row
   numbers (pending A/B validation, 3.6.5).
-- ``RssBackstop``: mid-run RSS hook on the shared path, a single [warn]
-  when resource.getrusage RSS exceeds budget x 0.95 (performance only).
 
 Stdlib only: no numpy/pandas/rasterio at import, so the pre-check can run
 before the first heavy allocation (and before heavy imports) once wired.
@@ -28,7 +26,6 @@ import contextlib
 import logging
 import math
 import os
-import resource
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,7 +34,6 @@ __all__ = [
     "B0_BYTES",
     "SIZING_TABLE",
     "PrecheckDecision",
-    "RssBackstop",
     "SizingRow",
     "TurboPlan",
     "box_chunk_bytes",
@@ -52,8 +48,8 @@ __all__ = [
     "resolve_cap",
     "sizing_budget_bytes",
     "table_row",
-    "tile_cache_tiles",
     "wall_model_s",
+    "write_scratch_tiles",
 ]
 
 log = logging.getLogger("ppgrid.turbop")
@@ -97,8 +93,6 @@ TILE_CACHE_MIN: int = 8
 TILE_CACHE_MAX: int = 256
 MAX_WORKERS: int = 8  # thread cap, min(8, os.process_cpu_count()) (3.1)
 PER_BOX_WORKERS: int = 4  # per-box pool, matches pipeline.DEFAULT_WORKERS
-
-RSS_BACKSTOP_FRAC: float = 0.95  # mid-run RSS warn threshold vs budget (3.5)
 
 # Wall model (3.6.2 table note, calibrated to the A4 target).
 ANCHOR_WALL_S: float = 479.6  # full-AU non-turbo anchor (DESIGN box, 4 workers)
@@ -263,8 +257,8 @@ def descent_band_bytes(wc: int) -> float:
     return (DESCENT_BAND_B_PER_CELL * DESCENT_BAND_ROWS + DESCENT_PARENT_B_PER_CELL * DESCENT_PARENT_ROWS) * wc
 
 
-def tile_cache_tiles(sizing_budget: float) -> int:
-    """Compute the write tile cache T = clamp(floor(0.1 * Bt / M_tile), 8, 256).
+def write_scratch_tiles(sizing_budget: float) -> int:
+    """Compute the write scratch reservation T = clamp(floor(0.1 * Bt / M_tile), 8, 256).
 
     Args:
         sizing_budget: Bt in bytes.
@@ -381,7 +375,7 @@ class TurboPlan:
     box_chunks: int  # in-flight box_count chunks (A/per_box: 0)
     descent_bands: int  # in-flight descent bands (A/per_box: 0)
     workers: int
-    tile_cache_tiles: int  # write tile cache depth (per_box: 0)
+    write_scratch_tiles: int  # parallel write scratch reservation (per_box: 0)
     val_sup_memmap: bool  # output val/sup file-backed (True) vs in RAM (False)
     zstd_ctx_bytes: int  # ZSTD context pool: workers x M_z
     est_peak_bytes: float  # regime est peak (3.6.2 per-regime formula)
@@ -449,7 +443,7 @@ def plan(
             0,
             0,
             workers,
-            tile_cache_tiles(sizing),
+            write_scratch_tiles(sizing),
             val_sup_memmap=False,
             est=est,
             budget=budget,
@@ -459,7 +453,7 @@ def plan(
 
     if sizing >= n_in + max(m_box, m_band):
         # Regime B: input in RAM, banded in-flight sized from the leftover.
-        t = tile_cache_tiles(sizing)
+        t = write_scratch_tiles(sizing)
         left = sizing - n_in - t * M_TILE_BYTES
         c = max(0, int(left // m_box))
         b = max(0, int(left // m_band))
@@ -515,7 +509,7 @@ def plan(
             c,
             b,
             workers,
-            tile_cache_tiles(sizing),
+            write_scratch_tiles(sizing),
             val_sup_memmap=True,
             est=est,
             budget=budget,
@@ -560,7 +554,7 @@ def _finish_plan(
     wall: float,
 ) -> TurboPlan:
     """Assemble a TurboPlan; wall range from the table row, else +/-15%."""
-    wall_range = row.wall_range_s if row is not None else (0.85 * wall, 1.15 * wall)
+    wall_range = row.wall_range_s if row is not None and row.regime == regime else (0.85 * wall, 1.15 * wall)
     return TurboPlan(
         cap_gb=cap_gb,
         n_cells=n_cells,
@@ -568,7 +562,7 @@ def _finish_plan(
         box_chunks=c,
         descent_bands=b,
         workers=workers,
-        tile_cache_tiles=t,
+        write_scratch_tiles=t,
         val_sup_memmap=val_sup_memmap,
         zstd_ctx_bytes=workers * int(M_Z_BYTES),
         est_peak_bytes=est,
@@ -810,7 +804,7 @@ def precheck(
         f"--turbo: cap {plan.cap_gb:g} GB ({cap_source}); budget 0.85*C = {budget_gb:.1f} GB; "
         f"sizing Bt = {plan.sizing_bytes / GB:.1f} GB; regime {plan.regime} "
         f"(box_chunks={plan.box_chunks}, descent_bands={plan.descent_bands}, workers={plan.workers}, "
-        f"tile_cache={plan.tile_cache_tiles}, zstd_ctx={plan.zstd_ctx_bytes / 1e6:.0f} MB)"
+        f"write_scratch={plan.write_scratch_tiles}, zstd_ctx={plan.zstd_ctx_bytes / 1e6:.0f} MB)"
     )
     # Regime selection is the gate (3.6.2): a feasible regime fits the
     # budget BY CONSTRUCTION - A is admitted at n*24.5 <= Bt, B caps est
@@ -872,49 +866,3 @@ def precheck(
             f"[warn] --turbo: est peak {est_a_gb:.1f} GB > budget {budget_gb:.1f} GB; using per-box (turbo warp/write)"
         )
     return PrecheckDecision("per_box", "per_box", est_gb, budget_gb, 0, _note(message), summary)
-
-
-# ---------------------------------------------------------------------------
-# Runtime RSS backstop (3.5, extended by 3.6.4)
-# ---------------------------------------------------------------------------
-
-
-class RssBackstop:
-    """Mid-run RSS hook for the shared path: a single [warn] at budget x 0.95.
-
-    Call :meth:`check` from phase loops. The first time resource.getrusage
-    RSS exceeds budget x 0.95, log one [warn] (performance only, the run
-    completes; the pre-check is the real gate). The 3.6.4 pre-emptive
-    step-down at 0.90 is a follow-up issue, not wired here.
-    """
-
-    def __init__(self, budget_gb: float) -> None:
-        """Create a backstop that warns once when RSS crosses budget x 0.95.
-
-        Args:
-            budget_gb: Pre-check budget in GB (0.85 * C).
-
-        """
-        self._limit_bytes = budget_gb * RSS_BACKSTOP_FRAC * GB
-        self._warned = False
-
-    @property
-    def limit_bytes(self) -> float:
-        """RSS limit in bytes (budget x 0.95)."""
-        return self._limit_bytes
-
-    def check(self) -> bool:
-        """Poll once; True exactly once, the first time the limit is crossed."""
-        if self._warned:
-            return False
-        rss_bytes = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024.0
-        if rss_bytes <= self._limit_bytes:
-            return False
-        self._warned = True
-        log.warning(
-            "[warn] turbo: rss %.2f GB > budget x %.2f = %.2f GB; performance only, run completes",
-            rss_bytes / GB,
-            RSS_BACKSTOP_FRAC,
-            self._limit_bytes / GB,
-        )
-        return True
