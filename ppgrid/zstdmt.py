@@ -147,9 +147,19 @@ def _gdal_path() -> str:
 
 
 def _exec_ranges(path: str) -> list[tuple[int, int]]:
-    """Return the executable (r-x) address ranges mapped from path."""
+    """Return the executable (r-x) address ranges mapped from path.
+
+    Raises:
+        ZstdmtError: If /proc/self/maps is unreadable.
+
+    """
+    try:
+        maps = Path("/proc/self/maps").read_text(encoding="utf-8")
+    except OSError as exc:
+        msg = "cannot read /proc/self/maps; zstdmt needs a Linux /proc"
+        raise ZstdmtError(msg) from exc
     ranges: list[tuple[int, int]] = []
-    for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines():
+    for line in maps.splitlines():
         parts = line.split(None, 5)
         if len(parts) < 6 or parts[5] != path or "x" not in parts[1]:
             continue
@@ -164,11 +174,24 @@ def _in_exec_ranges(addr: int, ranges: Sequence[tuple[int, int]]) -> bool:
 
 
 def _lib() -> ctypes.CDLL:
-    """Load (via the already-loaded mapping) and prepare the libgdal handle."""
+    """Load (via the already-loaded mapping) and prepare the libgdal handle.
+
+    Raises:
+        ZstdmtError: If the libgdal mapping is missing or dlopen fails
+            (audit #81 F-3: available() turns this into False).
+
+    """
     with _LOCK:
         if _STATE.lib is None:
             _STATE.gdal_path = _gdal_path()
-            lib = ctypes.CDLL(_STATE.gdal_path)
+            try:
+                lib = ctypes.CDLL(_STATE.gdal_path)
+            except OSError as exc:
+                # The mapping can vanish between the /proc read and the
+                # dlopen; available() must report False, not raise OSError
+                # (audit #81 F-3).
+                msg = f"cannot dlopen {_STATE.gdal_path}: {exc}"
+                raise ZstdmtError(msg) from exc
             lib.GDALAllRegister()
             lib.CPLGetCompressor.restype = ctypes.c_void_p
             lib.CPLGetCompressor.argtypes = [ctypes.c_char_p]
@@ -267,10 +290,17 @@ def _decompressor() -> tuple[ctypes.CDLL, _CPL_FN, int]:
 
 
 def available() -> bool:
-    """Return True if the CPL zstd compressor resolves and passes the self-checks."""
+    """Return True if the CPL zstd compressor resolves and passes the self-checks.
+
+    A true predicate: never raises. Any resolution failure (unreadable
+    /proc, missing libgdal mapping, dlopen failure, struct drift) is
+    reported as False so callers can branch on it without their own
+    exception handling (audit #81 F-3).
+
+    """
     try:
         _compressor()
-    except ZstdmtError:
+    except (ZstdmtError, OSError):
         return False
     return True
 
@@ -441,7 +471,15 @@ def _tif_info(path: Path) -> _TifInfo:
         off_fmt = "I" if offset_size == 4 else "Q"
         entry_size = 12 if offset_size == 4 else 20
         cnt_size = 2 if offset_size == 4 else 8  # IFD entry-count field width
+        visited: set[int] = set()
         while True:
+            if ifd_off in visited:
+                # A next-IFD pointer that revisits a parsed IFD (corrupt or
+                # cyclic chain) would loop forever; raise instead (audit
+                # #81 F-2).
+                msg = f"cyclic IFD chain at offset {ifd_off}"
+                raise ZstdmtError(msg)
+            visited.add(ifd_off)
             tags = _parse_ifd_tags(data, e, off_fmt, cnt_size, entry_size, ifd_off)
             if 324 in tags and 325 in tags:
                 return _tif_info_from_tags(data, e, tags)
@@ -542,10 +580,12 @@ def oracle_check(
     """Byte-compare one turbo-compressed tile against the stock tile stored in a raster.
 
     Reads one tile's raw array from the raster (stock decode path),
-    applies the TIFF predictor exactly as the stock encoder does,
-    compresses the result with `compress` (default: the CPL zstd pfn),
-    and byte-compares against the tile bytes actually stored in the file
-    by the stock GDAL write path.
+    zero-pads partial edge tiles to the full declared block (GDAL pads
+    them with zeros before the codec runs - audit #81 F-1), applies the
+    TIFF predictor exactly as the stock encoder does, compresses the
+    result with `compress` (default: the CPL zstd pfn), and byte-compares
+    against the tile bytes actually stored in the file by the stock GDAL
+    write path.
 
     Args:
         path: A GeoTIFF written by the stock GDAL path (tiled, int16,
@@ -580,6 +620,13 @@ def oracle_check(
     th = min(tif.tileh, tif.height - y0)
     with rasterio.open(path) as ds:
         arr = ds.read(1, window=Window(x0, y0, tw, th))
+    if tw < tif.tilew or th < tif.tileh:
+        # GDAL zero-pads partial edge tiles to the full declared block
+        # before the codec runs (audit #81 F-1): the turbo side must pad
+        # identically or the frames decompress to different sizes.
+        padded = np.zeros((tif.tileh, tif.tilew), dtype=arr.dtype)
+        padded[:th, :tw] = arr
+        arr = padded
     pre = predictor2(arr).tobytes() if tif.predictor == 2 else arr.tobytes()
     fn = compress or compress_tile
     turbo = fn(pre)
