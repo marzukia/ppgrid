@@ -51,6 +51,7 @@ from ppgrid.pipeline import (
     _reproject_band_array,
     _tif_parse_ifd,
     _turbo_write_parallel,
+    _turbo_write_stock_parallel,
 )
 from ppgrid.pullpush import bin_points, box_count_banded
 
@@ -914,6 +915,276 @@ def test_turbo_write_parallel_bigtiff_matches_serial(tmp_path: Path, monkeypatch
     assert _sha(out_ser) == _sha(out_par)
 
 
+def test_turbo_write_parallel_edge_tiles_padded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit #81 F-1: partial edge tiles are zero-padded to TILE_PX^2.
+
+    GDAL pads a 300-wide edge tile to the full 512^2 block with zeros
+    before the codec runs; the turbo zstd writer used to compress the
+    unpadded slice, so its frames decompress to less than the declared
+    tile size (S3 bit-identity break on non-512-multiple rasters). The
+    stock reference is a direct GDAL write of the same content; the
+    turbo assembly (stubbed with the stock frames) must match it byte
+    for byte, and every tile reaching the compressor must be full-size
+    with the exact zero padding.
+
+    """
+    height, width = 700, 900  # 2x2 tile grid: right + bottom edges partial
+    assert width % TILE_PX != 0
+    assert height % TILE_PX != 0
+    a, xform = _demo_field(width, height, 100.0, seed=31)
+    crs = f"EPSG:{WORK_CRS}"
+    # Stock reference: same write recipe as the turbo reference head
+    # (_reproject_core), identity warp so the stored content is exactly a.
+    out_ser = tmp_path / "ser.tif"
+    _reproject_band_array(
+        a,
+        xform,
+        crs,
+        str(out_ser),
+        _demo_profile(),
+        crs,
+        xform,
+        width,
+        height,
+        tags={},
+        scales=(1.0,),
+        offsets=(0.0,),
+        n_threads=1,
+    )
+    with rasterio.open(out_ser) as ds:
+        assert np.array_equal(ds.read(1), a)  # identity warp is bit-exact
+    stock_frames = _stock_frames(out_ser)
+    assert len(stock_frames) == 4  # 2x2 tile grid, all zstd
+    frames = iter(stock_frames)
+    raw_seen: list[np.ndarray] = []
+
+    def spy_predictor2(t: np.ndarray) -> np.ndarray:
+        raw_seen.append(t)
+        return t  # content-agnostic: the stubbed frames carry the bytes
+
+    def stub(tiles: list[np.ndarray], n_threads: int = 1) -> list[bytes]:  # ruff: ignore[unused-function-argument]
+        return [next(frames) for _ in tiles]
+
+    monkeypatch.setattr(pipeline_mod.zstdmt, "predictor2", spy_predictor2)
+    monkeypatch.setattr(pipeline_mod.zstdmt, "compress_tiles", stub)
+    out_par = tmp_path / "par.tif"
+    ok = _turbo_write_parallel(
+        a,
+        xform,
+        crs,
+        str(out_par),
+        _demo_profile(),
+        crs,
+        xform,
+        width,
+        height,
+        tags={},
+        scales=(1.0,),
+        offsets=(0.0,),
+        n_threads=2,
+    )
+    assert ok
+    assert _sha(out_ser) == _sha(out_par)
+    # 2x2 tile grid, raster-scan order; all four reach the compressor
+    # as full TILE_PX^2 blocks (identity warp: content == a's slices).
+    assert len(raw_seen) == 4
+    assert all(t.shape == (TILE_PX, TILE_PX) for t in raw_seen)
+    # Full top-left tile: unchanged by the padding.
+    assert np.array_equal(raw_seen[0], a[:TILE_PX, :TILE_PX])
+    # Top-right tile: partial width 388, zero-padded to 512.
+    t = raw_seen[1]
+    w = width - TILE_PX
+    assert np.array_equal(t[:, :w], a[:TILE_PX, TILE_PX : TILE_PX + w])
+    assert (t[:, w:] == 0).all()
+    # Bottom-right tile: partial in BOTH axes, zero-padded.
+    t = raw_seen[3]
+    h = height - TILE_PX
+    w = width - TILE_PX
+    assert np.array_equal(t[:h, :w], a[TILE_PX : TILE_PX + h, TILE_PX : TILE_PX + w])
+    assert (t[h:, :] == 0).all()
+    assert (t[:, w:] == 0).all()
+
+
+def test_turbo_writers_wrap_source_array_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit #78 P1-3: both sibling writers share ONE no-copy MemoryDataset.
+
+    The pass-3 fix (shared MemoryDataset, copy=False, MultiBand tuple
+    form) landed only in _turbo_write_stock_parallel; _turbo_write_
+    parallel and _reproject_band_array still passed bare ndarrays, so
+    reproject copied the whole band into a fresh MEM dataset per warp
+    call (3.1 GB each at full-AU). Each writer now wraps once before
+    the band loop: one construction per call, and the outputs stay
+    bit-identical across thread counts.
+
+    """
+    orig = pipeline_mod.MemoryDataset
+    counts = {"n": 0}
+
+    class Counting(orig):  # type: ignore[misc]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            counts["n"] += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "MemoryDataset", Counting)
+    # Spy the reproject source form: the MultiBand tuple form consumes the
+    # shared handle; a bare ndarray makes reproject copy the whole band
+    # into a fresh MEM dataset per warp call (the pre-P1-3 behaviour).
+    src_forms: list[Any] = []
+    orig_reproject = pipeline_mod.reproject
+
+    def spy_reproject(src: Any, *args: Any, **kwargs: Any) -> Any:
+        src_forms.append(src)
+        return orig_reproject(src, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "reproject", spy_reproject)
+    a, xform = _demo_field(1600, 1400, 100.0, seed=23)
+    dst_transform, dst_width, dst_height = _dst_grid(1600, 1400, 100.0)
+    work_crs, dst_crs = f"EPSG:{WORK_CRS}", f"EPSG:{OUT_CRS}"
+    tags, scales, offsets = {}, (1.0,), (0.0,)
+    out1 = tmp_path / "arr1.tif"
+    out4 = tmp_path / "arr4.tif"
+    _reproject_band_array(
+        a,
+        xform,
+        work_crs,
+        str(out1),
+        _demo_profile(),
+        dst_crs,
+        dst_transform,
+        dst_width,
+        dst_height,
+        tags=tags,
+        scales=scales,
+        offsets=offsets,
+        n_threads=1,
+    )
+    assert counts["n"] == 1  # one wrap, not one per warp tile
+    assert all(isinstance(s, tuple) for s in src_forms)  # tuple form: shared handle, no copy
+    src_forms.clear()
+    _reproject_band_array(
+        a,
+        xform,
+        work_crs,
+        str(out4),
+        _demo_profile(),
+        dst_crs,
+        dst_transform,
+        dst_width,
+        dst_height,
+        tags=tags,
+        scales=scales,
+        offsets=offsets,
+        n_threads=4,
+    )
+    assert counts["n"] == 2  # one more wrap for the whole second call
+    assert all(isinstance(s, tuple) for s in src_forms)
+    src_forms.clear()
+    assert _sha(out1) == _sha(out4)  # bit-identity still holds
+
+    frames = iter(_stock_frames(out1))
+
+    def stub(tiles: list[np.ndarray], n_threads: int = 1) -> list[bytes]:  # ruff: ignore[unused-function-argument]
+        return [next(frames) for _ in tiles]
+
+    monkeypatch.setattr(pipeline_mod.zstdmt, "compress_tiles", stub)
+    out_par = tmp_path / "par.tif"
+    ok = _turbo_write_parallel(
+        a,
+        xform,
+        work_crs,
+        str(out_par),
+        _demo_profile(),
+        dst_crs,
+        dst_transform,
+        dst_width,
+        dst_height,
+        tags=tags,
+        scales=scales,
+        offsets=offsets,
+        n_threads=4,
+    )
+    assert ok
+    assert counts["n"] == 3  # the zstd writer wraps once too
+    assert all(isinstance(s, tuple) for s in src_forms)
+    assert _sha(out1) == _sha(out_par)
+
+
+def test_stock_parallel_reference_head_failure_not_masked(tmp_path: Path) -> None:
+    """Audit #78 P1-1: a failed reference head raises the root error.
+
+    Negative dst dimensions make np.zeros raise before `zero` binds;
+    the old `finally: del zero` replaced the ValueError with an
+    UnboundLocalError, masking the root cause.
+
+    """
+    a, xform = _demo_field(800, 700, 100.0, seed=14)
+    with pytest.raises(ValueError, match="negative dimensions"):
+        _turbo_write_stock_parallel(
+            a,
+            xform,
+            f"EPSG:{WORK_CRS}",
+            str(tmp_path / "x.tif"),
+            _demo_profile(),
+            f"EPSG:{OUT_CRS}",
+            xform,
+            -5,
+            -5,
+            tags={},
+            scales=(1.0,),
+            offsets=(0.0,),
+            n_threads=1,
+            scratch_dir=str(tmp_path),
+        )
+
+
+def test_turbo_zstd_ok_catches_available_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit #81 F-3: an OSError from zstdmt.available() is caught.
+
+    The gate must fail closed (stock parallel writer), never crash:
+    the available() call sits inside _turbo_zstd_ok's try/except.
+
+    """
+    p = Pipeline(
+        str(DATA_CSV),
+        "price",
+        "longitude",
+        "latitude",
+        str(tmp_path / "o"),
+        res=500.0,
+        cap_km=10.0,
+        workers=1,
+        skip_calibration=True,
+    )
+
+    def boom() -> bool:
+        msg = "libgdal mapping vanished"
+        raise OSError(msg)
+
+    monkeypatch.setattr(pipeline_mod.zstdmt, "available", boom)
+    assert p._turbo_zstd_ok() is False  # ruff: ignore[private-member-access]
+
+
+def test_turbo_precheck_passes_memory_ceiling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit #78 P1-2: _turbo_precheck hands min(physical, cgroup) to precheck."""
+    monkeypatch.setattr(pipeline_mod.turbop, "resolve_cap", _identity_cap)
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_physical_gb", lambda: 134.9)
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_cgroup_max_gb", lambda: 6.0)
+    seen: dict[str, object] = {}
+    orig = pipeline_mod.turbop.precheck
+
+    def spy(plan: turbop.TurboPlan, **kw: object) -> Any:
+        seen.update(kw)
+        return orig(plan, **kw)
+
+    monkeypatch.setattr(pipeline_mod.turbop, "precheck", spy)
+    p = _a9_pipeline(tmp_path, 8.0)  # floor cap on full-AU: per_box, budget 6.8 GB
+    p._turbo_precheck()  # ruff: ignore[private-member-access]
+    assert seen["available_gb"] == 6.0  # the cgroup slice binds
+    assert p._turbo_decision is not None  # ruff: ignore[private-member-access]
+    assert p._turbo_decision.message is not None  # ruff: ignore[private-member-access]
+    assert "exceeds the process memory ceiling 6.0 GB" in p._turbo_decision.message  # ruff: ignore[private-member-access]
+
+
 def test_turbo_write_parallel_4gib_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Classic head + assembled size beyond 4 GiB -> False (serial fallback)."""
     a, xform = _demo_field(800, 700, 100.0, seed=12)
@@ -1268,9 +1539,12 @@ def test_midwrite_failure_keeps_finals(
     sha_s = _sha(out / "support_km.tif")
 
     monkeypatch.setattr(pipeline_mod, "_reproject_band", _boom)
-    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+    # RuntimeError maps to a clean exit 1 (audit #83 widening), not a traceback.
+    with pytest.raises(SystemExit) as excinfo:
         pipeline_mod.main([str(csv), *_cli_base(out, "--force")])
+    assert excinfo.value.code == 1
     err = capsys.readouterr().err
+    assert "simulated mid-write crash" in err
     assert "failed during write" in err
     assert "failed before writing outputs" in err
     assert _sha(out / "value.tif") == sha_v
@@ -1303,9 +1577,12 @@ def test_turbo_midwrite_failure_keeps_finals(
     monkeypatch.setattr(pipeline_mod, "_turbo_write_parallel", _boom)
     monkeypatch.setattr(pipeline_mod, "_turbo_write_stock_parallel", _boom)
     monkeypatch.setattr(pipeline_mod, "_reproject_band_array", _boom)
-    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+    # RuntimeError maps to a clean exit 1 (audit #83 widening), not a traceback.
+    with pytest.raises(SystemExit) as excinfo:
         pipeline_mod.main([str(csv), *_cli_base(out, "--turbo", "32", "--force")])
+    assert excinfo.value.code == 1
     err = capsys.readouterr().err
+    assert "simulated mid-write crash" in err
     assert "failed during write" in err
     assert "failed before writing outputs" in err
     assert _sha(out / "value.tif") == sha_v

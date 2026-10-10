@@ -7,8 +7,8 @@ all four box-size rows (16/32/64/128 GB) are reproduced by plan().
 
 from __future__ import annotations
 
-import logging
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,7 +20,6 @@ from ppgrid.turbop import (
     GB,
     M_IN_B_PER_CELL,
     SIZING_TABLE,
-    RssBackstop,
     _read_cgroup_max_gb,
     _read_physical_gb,
     box_chunk_bytes,
@@ -36,8 +35,8 @@ from ppgrid.turbop import (
     resolve_cap,
     sizing_budget_bytes,
     table_row,
-    tile_cache_tiles,
     wall_model_s,
+    write_scratch_tiles,
 )
 
 # Full-AU anchor geometry (design 2.2 / 3.6.2): 4100 x 3819 km @ 100 m,
@@ -101,10 +100,10 @@ def test_budget_reconciliation() -> None:
 
 def test_tile_cache_clamp() -> None:
     """T = clamp(floor(0.1 * Bt / M_tile), 8, 256)."""
-    assert tile_cache_tiles(5.0e7) == 8  # 5 tiles -> floor to min
-    assert tile_cache_tiles(1.5e8) == 15  # mid-range, no clamp
-    assert tile_cache_tiles(2.32e10) == 256  # C=32 Bt -> ceiling
-    assert tile_cache_tiles(1.0e11) == 256  # C=128 Bt -> ceiling
+    assert write_scratch_tiles(5.0e7) == 8  # 5 tiles -> floor to min
+    assert write_scratch_tiles(1.5e8) == 15  # mid-range, no clamp
+    assert write_scratch_tiles(2.32e10) == 256  # C=32 Bt -> ceiling
+    assert write_scratch_tiles(1.0e11) == 256  # C=128 Bt -> ceiling
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +138,7 @@ def test_worked_table_rows(
     assert pl.box_chunks == c
     assert pl.descent_bands == b
     assert pl.workers == workers
-    assert pl.tile_cache_tiles == t
+    assert pl.write_scratch_tiles == t
     assert pl.val_sup_memmap is val_memmap
     assert pl.zstd_ctx_bytes == workers * 2_000_000
     # Wall: central estimate inside the hand-widened row range.
@@ -156,6 +155,21 @@ def test_worked_table_rows(
     assert lo <= pl.est_peak_bytes / GB <= hi
     if peak_gb is not None:
         assert pl.est_peak_bytes / GB == pytest.approx(peak_gb, abs=0.05)
+
+
+def test_wall_range_regime_mismatch_fallback() -> None:
+    """A grid whose chosen regime differs from the table row takes the ±15% fallback.
+
+    Not the row's tabled range, which can exclude the central estimate
+    (the pre-fix bug at turbop.py wall_range_s).
+    """
+    pl = plan(cap_gb=32.0, n_cells=10_000, wc=100, radius=5, cpu=8)
+    row = table_row(32.0)
+    assert row is not None
+    assert pl.regime != row.regime  # small grid -> A, table row is B
+    lo, hi = pl.wall_range_s
+    assert (lo, hi) == pytest.approx((0.85 * pl.wall_s, 1.15 * pl.wall_s))
+    assert lo <= pl.wall_s <= hi
 
 
 def test_worked_table_anchor_ratios() -> None:
@@ -444,6 +458,85 @@ def test_resolve_cap_preset_clamp_cgroup_aware() -> None:
     assert source == "preset 16 GB"
 
 
+def test_cap_floor_source_and_budget_ceiling_warning() -> None:
+    """The 8 GB floor is named in the source; the precheck names the budget.
+
+    Audit #78 P1-2: preset=6.0 used to report cap=8.0 budget=6.8 GB as
+    "preset 6 GB", and the precheck stayed green on a 6 GB cgroup slice
+    (budget 6.8 GB > ceiling 6 GB) until the run OOM-killed itself.
+
+    """
+    # Preset below the floor: the source names the floored cap it plans.
+    cap, source = resolve_cap(6.0, physical_gb=None)
+    assert cap == 8.0
+    assert source == "preset 6 GB (floored to 8 GB)"
+    cap, source = resolve_cap(6.0, physical_gb=64.0)
+    assert cap == 8.0
+    assert "floored to 8 GB" in source
+    # Clamped preset on a small slice: clamped then floored, both named.
+    cap, source = resolve_cap(32.0, physical_gb=134.9, cgroup_gb=6.0)
+    assert cap == 8.0
+    assert "cgroup 6 GB" in source
+    assert "floored to 8 GB" in source
+    # Auto on a 6 GB slice: the floor note is present (cap 8 > raw -2).
+    cap, source = detect_cap_gb(physical_gb=134.9, cgroup_gb=6.0)
+    assert cap == 8.0
+    assert "floored to 8 GB" in source
+    # No floor activity: the legacy strings stand (no false positives).
+    assert resolve_cap(32.0, physical_gb=64.0)[1] == "preset 32 GB"
+    assert detect_cap_gb(physical_gb=125.0, cgroup_gb=64.0)[1] == (
+        "auto min(physical 125.0 GB, cgroup 64.0 GB) - 8 GB headroom"
+    )
+
+    # Budget over the ceiling: the precheck warns, on every path.
+    pl = plan(8.0, 10_000_000, 1024, 64, cpu=8)  # regime A, budget 6.8 GB
+    assert pl.regime == "A"
+    dec = precheck(pl, available_gb=6.0)
+    assert dec.exit_code == 0
+    assert dec.message is not None
+    assert dec.message.startswith("[warn]")
+    assert "6.8 GB exceeds the process memory ceiling 6.0 GB" in dec.message
+    assert "OOM risk" in dec.message
+    # Under the ceiling: no note (the normal case).
+    assert precheck(pl, available_gb=64.0).message is None
+    # Default (no ceiling passed): no note.
+    assert precheck(pl).message is None
+    # Per-box path carries the note too (worst case: floor + per-box est).
+    pl16 = _plan_full_au(8.0)  # per_box at the floor cap
+    assert pl16.regime == "per_box"
+    dec = precheck(pl16, available_gb=6.0)
+    assert dec.exit_code == 0
+    assert "exceeds the process memory ceiling 6.0 GB" in dec.message
+    strict = precheck(pl16, strict=True, available_gb=6.0)
+    assert strict.exit_code == 3
+    assert strict.message is not None
+    assert "exceeds the process memory ceiling 6.0 GB" in strict.message
+
+
+def test_precheck_shared_ok_is_regime_only() -> None:
+    """Audit #78 P3-1: the regime selection is the gate, not an est re-check.
+
+    A plan whose est overshoots the budget (a float-epsilon case the 3.6.2
+    sizing cannot produce) is still shared: the old
+    `est <= budget*(1+1e-12) + 4096` comparison was a tautology and is
+    removed. The per-box regime is unaffected by any est value.
+
+    """
+    base = _plan_full_au(64.0)
+    assert base.regime == "A"
+    over = replace(base, est_peak_bytes=int(base.budget_bytes * 1.001))
+    dec = precheck(over, cap_source="test")
+    assert dec.path == "shared"
+    assert dec.regime == "A"
+    assert dec.exit_code == 0
+    assert dec.message is None
+    pb = _plan_full_au(16.0)
+    assert pb.regime == "per_box"
+    dec = precheck(replace(pb, est_peak_bytes=int(pb.budget_bytes * 1.001)), cap_source="test")
+    assert dec.path == "per_box"
+    assert dec.exit_code == 0
+
+
 def test_cgroup_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_read_cgroup_max_gb: walk-up min over the process hierarchy, legacy fallback."""
     # Walk-up: service cgroup is 'max', parent slice is finite -> the slice binds.
@@ -491,23 +584,3 @@ def test_physical_reader(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # Runtime RSS backstop
 # ---------------------------------------------------------------------------
-
-
-def test_rss_backstop_warns_once(caplog: pytest.LogCaptureFixture) -> None:
-    """First cross of budget x 0.95 logs a single [warn]; later checks are quiet."""
-    bs = RssBackstop(budget_gb=1.0e-5)  # 10 MB budget: this process is over it
-    with caplog.at_level(logging.WARNING, logger="ppgrid.turbop"):
-        assert bs.check() is True
-        assert bs.check() is False  # single [warn]
-        assert bs.check() is False
-    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warns) == 1
-    assert warns[0].getMessage().startswith("[warn] turbo: rss")
-
-
-def test_rss_backstop_quiet_under_limit(caplog: pytest.LogCaptureFixture) -> None:
-    """Under the limit: no warn, check returns False."""
-    bs = RssBackstop(budget_gb=1.0e6)  # 1 PB budget: never crossed
-    with caplog.at_level(logging.WARNING, logger="ppgrid.turbop"):
-        assert bs.check() is False
-    assert caplog.records == []

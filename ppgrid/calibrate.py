@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-from .pullpush import bin_points, pad_to_pyramid, pull_push
+from .pullpush import _UNRESOLVED_M, bin_points, pad_to_pyramid, pull_push
 
 # Shared numeric constants (imported by the pipeline).
 PERCENTILE_MAX: float = 100.0  # largest output percentile (value band DN = percentile * scale)
@@ -30,6 +30,13 @@ M_PER_KM: float = 1000.0
 # (The pipeline's FILL_FALLBACK_CAP_KM is a different fallback: it applies
 # when there is no calibrated cap at all.)
 FILL_CAP_DEFAULT_KM: float = 25.0
+
+# Largest CV support-scale bin edge: the unresolved-support sentinel from
+# pullpush, expressed in km. A bin this wide is "no neighbor within the cap",
+# not a literal 1e9 km scale - the edge must track the sentinel so the two
+# cannot drift (audit #83).
+_CV_MAX_EDGE_KM: float = _UNRESOLVED_M / M_PER_KM
+_CV_EDGES: tuple[float, ...] = (0, 2, 4, 8, 16, 32, 64, 128, 256, _CV_MAX_EDGE_KM)
 
 # ---------------------------------------------------------------- transforms
 
@@ -366,8 +373,21 @@ def _fit_predict(
     train: np.ndarray,
     res: float,
     levels: int,
+    saturation: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Train on the given indices, predict at all (x, y) positions.
+
+    Args:
+        x: Working-CRS x coordinates of all points (m).
+        y: Working-CRS y coordinates of all points (m).
+        tv: Transformed values of all points.
+        train: Boolean mask of training points (held-out block excluded).
+        res: Grid resolution in m.
+        levels: Pyramid depth.
+        saturation: Cell counts for full self-trust, forwarded to
+            pull_push. Must match the run's own saturation or the CV skill
+            estimates a different model than the one the pipeline trains
+            (audit #83: the run's --saturation was dropped here).
 
     Returns:
         Tuple of predicted values and support in km.
@@ -379,7 +399,7 @@ def _fit_predict(
     nx = pad_to_pyramid(int(ix.max()) + 1, levels)
     ny = pad_to_pyramid(int(iy.max()) + 1, levels)
     s, c = bin_points(ix[train], iy[train], tv[train], nx, ny)
-    val, sup = pull_push(s, c, res, levels)
+    val, sup = pull_push(s, c, res, levels, saturation=saturation)
     return val[ix, iy], sup[ix, iy] / M_PER_KM
 
 
@@ -410,7 +430,8 @@ def blocked_cv_skill(
     block_km: float = 100.0,
     n_folds: int = 4,
     seed: int = 0,
-    edges: tuple[float, ...] = (0, 2, 4, 8, 16, 32, 64, 128, 256, 1e9),
+    edges: tuple[float, ...] = _CV_EDGES,
+    saturation: float = 1.0,
     n_boot: int = 200,
     min_n: int = 150,
     boot_max_n: int = 200_000,
@@ -442,7 +463,7 @@ def blocked_cv_skill(
         held = np.isin(bkey, blocks[f])
         if held.sum() == 0 or (~held).sum() == 0:
             continue
-        p, s = _fit_predict(x, y, tv, ~held, res, levels)
+        p, s = _fit_predict(x, y, tv, ~held, res, levels, saturation=saturation)
         preds[held] = p[held]
         sups[held] = s[held]
 
@@ -514,6 +535,7 @@ def calibrate_fill_cap(
     block_km: tuple[float, ...] = (50.0, 100.0, 200.0, 400.0),
     min_skill: float = 0.05,
     default_km: float = FILL_CAP_DEFAULT_KM,
+    saturation: float = 1.0,
     **kw: Any,
 ) -> tuple[float, dict[float, CVCurve]]:
     """Derive the fill cap from blocked CV across several held-out block sizes.
@@ -532,7 +554,7 @@ def calibrate_fill_cap(
     detail: dict[float, CVCurve] = {}
     curve: dict[float, tuple[float, float, int, int]] = {}
     for bk in sorted(block_km):
-        overall, rows = blocked_cv_skill(x, y, tv, block_km=bk, **kw)
+        overall, rows = blocked_cv_skill(x, y, tv, block_km=bk, saturation=saturation, **kw)
         detail[bk] = {"overall_skill": overall, "rows": rows}
         for r in rows:
             if r["hi_km"] <= bk / 2.0 and r["hi_km"] not in curve:

@@ -147,9 +147,19 @@ def _gdal_path() -> str:
 
 
 def _exec_ranges(path: str) -> list[tuple[int, int]]:
-    """Return the executable (r-x) address ranges mapped from path."""
+    """Return the executable (r-x) address ranges mapped from path.
+
+    Raises:
+        ZstdmtError: If /proc/self/maps is unreadable.
+
+    """
+    try:
+        maps = Path("/proc/self/maps").read_text(encoding="utf-8")
+    except OSError as exc:
+        msg = "cannot read /proc/self/maps; zstdmt needs a Linux /proc"
+        raise ZstdmtError(msg) from exc
     ranges: list[tuple[int, int]] = []
-    for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines():
+    for line in maps.splitlines():
         parts = line.split(None, 5)
         if len(parts) < 6 or parts[5] != path or "x" not in parts[1]:
             continue
@@ -164,11 +174,24 @@ def _in_exec_ranges(addr: int, ranges: Sequence[tuple[int, int]]) -> bool:
 
 
 def _lib() -> ctypes.CDLL:
-    """Load (via the already-loaded mapping) and prepare the libgdal handle."""
+    """Load (via the already-loaded mapping) and prepare the libgdal handle.
+
+    Raises:
+        ZstdmtError: If the libgdal mapping is missing or dlopen fails
+            (audit #81 F-3: available() turns this into False).
+
+    """
     with _LOCK:
         if _STATE.lib is None:
             _STATE.gdal_path = _gdal_path()
-            lib = ctypes.CDLL(_STATE.gdal_path)
+            try:
+                lib = ctypes.CDLL(_STATE.gdal_path)
+            except OSError as exc:
+                # The mapping can vanish between the /proc read and the
+                # dlopen; available() must report False, not raise OSError
+                # (audit #81 F-3).
+                msg = f"cannot dlopen {_STATE.gdal_path}: {exc}"
+                raise ZstdmtError(msg) from exc
             lib.GDALAllRegister()
             lib.CPLGetCompressor.restype = ctypes.c_void_p
             lib.CPLGetCompressor.argtypes = [ctypes.c_char_p]
@@ -267,10 +290,17 @@ def _decompressor() -> tuple[ctypes.CDLL, _CPL_FN, int]:
 
 
 def available() -> bool:
-    """Return True if the CPL zstd compressor resolves and passes the self-checks."""
+    """Return True if the CPL zstd compressor resolves and passes the self-checks.
+
+    A true predicate: never raises. Any resolution failure (unreadable
+    /proc, missing libgdal mapping, dlopen failure, struct drift) is
+    reported as False so callers can branch on it without their own
+    exception handling (audit #81 F-3).
+
+    """
     try:
         _compressor()
-    except ZstdmtError:
+    except (ZstdmtError, OSError):
         return False
     return True
 
@@ -381,6 +411,127 @@ def predictor2(tile: np.ndarray) -> np.ndarray:
     return out
 
 
+# Shared TIFF base type -> bytes per element. Both the oracle parser
+# (_tif_info) and the pipeline head parser (pipeline._tif_parse_ifd) size
+# tag values from this one table (audit #83: they each used to carry their
+# own copy with divergent coverage). 16/17/18 = BigTIFF 64-bit types
+# (LONG8, SLONG8, IFD8).
+TIFF_TYPE_SIZES: dict[int, int] = {
+    1: 1,
+    2: 1,
+    3: 2,
+    4: 4,
+    5: 8,
+    6: 8,
+    7: 8,
+    8: 1,
+    9: 2,
+    10: 4,
+    11: 4,
+    12: 8,
+    16: 8,
+    17: 8,
+    18: 8,
+}
+
+
+def parse_tiff_header(data: bytes) -> tuple[str, bool, str, int, int, int, int]:
+    """Parse the TIFF header (byte order, classic/BigTIFF, first IFD offset).
+
+    Shared by the oracle (_tif_info) and the pipeline head parser
+    (audit #83: one header rule, not two).
+
+    Returns:
+        Tuple of (e, big, off_fmt, entry_size, cnt_size, inline, ifd_off):
+        struct endian, BigTIFF flag, offset struct format, IFD entry size,
+        IFD entry-count field size, inline value capacity (4 classic /
+        8 BigTIFF: the entry's value-field width, per the TIFF spec), and
+        the first IFD offset.
+
+    Raises:
+        ValueError: On a too-small file, unknown byte order mark or magic,
+            or an unsupported BigTIFF offset size.
+
+    """
+    if len(data) < 8:
+        msg = f"file too small to be a TIFF ({len(data)} B)"
+        raise ValueError(msg)
+    if data[:2] == b"II":
+        e = "<"
+    elif data[:2] == b"MM":
+        e = ">"
+    else:
+        msg = f"bad TIFF byte order mark {data[:2]!r}"
+        raise ValueError(msg)
+    try:
+        magic = struct.unpack_from(e + "H", data, 2)[0]
+        if magic == 42:
+            big, offset_size = False, 4
+            ifd_off = struct.unpack_from(e + "I", data, 4)[0]
+        elif magic == 43:
+            offset_size = struct.unpack_from(e + "H", data, 4)[0]
+            if offset_size != 8:
+                msg = f"unsupported BigTIFF offset size {offset_size}"
+                raise ValueError(msg)
+            big = True
+            ifd_off = struct.unpack_from(e + "Q", data, 8)[0]
+        else:
+            msg = f"unknown TIFF magic {magic}"
+            raise ValueError(msg)
+    except struct.error as exc:
+        msg = f"corrupt TIFF structure: {exc}"
+        raise ValueError(msg) from exc
+    off_fmt = "I" if offset_size == 4 else "Q"
+    entry_size = 12 if offset_size == 4 else 20
+    cnt_size = 2 if offset_size == 4 else 8  # IFD entry-count field width
+    # Inline value capacity: the entry's value-field width (4 classic,
+    # 8 BigTIFF). Values wider than the field are stored at an offset.
+    inline = 4 if offset_size == 4 else 8
+    return e, big, off_fmt, entry_size, cnt_size, inline, ifd_off
+
+
+def parse_ifd_tags(
+    data: bytes,
+    e: str,
+    ifd_off: int,
+    off_fmt: str,
+    cnt_size: int,
+    entry_size: int,
+    inline: int,
+) -> dict[int, tuple[int, int, int]]:
+    """Parse one IFD into {tag: (type, count, value position)}.
+
+    Shared by the oracle (_tif_info) and the pipeline head parser
+    (audit #83). The value position is where the value bytes actually
+    live: the entry's value field when the value fits inline
+    (total <= inline), otherwise the target of the stored offset. Tags
+    with a type outside TIFF_TYPE_SIZES are skipped (lenient: exotic
+    tags the caller does not need must not fail the parse; the pipeline
+    parser raises its own errors on the tags it does need). A truncated
+    IFD propagates struct.error to the caller (callers wrap as needed).
+
+    """
+    cnt_fmt = "H" if cnt_size == 2 else "Q"
+    entries = struct.unpack_from(e + cnt_fmt, data, ifd_off)[0]
+    # Classic entries are 12 B (tag2 type2 count4 value4); BigTIFF entries
+    # are 20 B (tag2 type2 count8 value8), so the value field sits at
+    # entry_size - inline (inline = the value-field width).
+    val_at = entry_size - inline
+    tags: dict[int, tuple[int, int, int]] = {}
+    for i in range(entries):
+        off = ifd_off + cnt_size + i * entry_size
+        tag = struct.unpack_from(e + "H", data, off)[0]
+        typ = struct.unpack_from(e + "H", data, off + 2)[0]
+        count = struct.unpack_from(e + off_fmt, data, off + 4)[0]
+        per = TIFF_TYPE_SIZES.get(typ)
+        if per is None:
+            continue
+        total = per * count
+        pos = off + val_at if total <= inline else struct.unpack_from(e + off_fmt, data, off + val_at)[0]
+        tags[tag] = (typ, count, pos)
+    return tags
+
+
 @dataclass(frozen=True)
 class _TifInfo:
     """What the oracle needs from the first image IFD of a tiled GeoTIFF."""
@@ -414,37 +565,26 @@ def _tif_info(path: Path) -> _TifInfo:
 
     """
     data = path.read_bytes()
-    if len(data) < 8:
-        msg = f"file too small to be a TIFF ({len(data)} B)"
-        raise ZstdmtError(msg)
-    if data[:2] == b"II":
-        e = "<"
-    elif data[:2] == b"MM":
-        e = ">"
-    else:
-        msg = f"bad TIFF byte order mark {data[:2]!r}"
-        raise ZstdmtError(msg)
     try:
-        magic = struct.unpack_from(e + "H", data, 2)[0]
-        if magic == 42:
-            offset_size = 4
-            ifd_off = struct.unpack_from(e + "I", data, 4)[0]
-        elif magic == 43:
-            offset_size = struct.unpack_from(e + "H", data, 4)[0]
-            if offset_size != 8:
-                msg = f"unsupported BigTIFF offset size {offset_size}"
-                raise ZstdmtError(msg)
-            ifd_off = struct.unpack_from(e + "Q", data, 8)[0]
-        else:
-            msg = f"unknown TIFF magic {magic}"
-            raise ZstdmtError(msg)
-        off_fmt = "I" if offset_size == 4 else "Q"
-        entry_size = 12 if offset_size == 4 else 20
-        cnt_size = 2 if offset_size == 4 else 8  # IFD entry-count field width
+        e, _big, off_fmt, entry_size, cnt_size, inline, ifd_off = parse_tiff_header(data)
+        visited: set[int] = set()
         while True:
-            tags = _parse_ifd_tags(data, e, off_fmt, cnt_size, entry_size, ifd_off)
+            if ifd_off in visited:
+                # A next-IFD pointer that revisits a parsed IFD (corrupt or
+                # cyclic chain) would loop forever; raise instead (audit
+                # #81 F-2).
+                msg = f"cyclic IFD chain at offset {ifd_off}"
+                raise ZstdmtError(msg)
+            visited.add(ifd_off)
+            tags = parse_ifd_tags(data, e, ifd_off, off_fmt, cnt_size, entry_size, inline)
             if 324 in tags and 325 in tags:
-                return _tif_info_from_tags(data, e, tags)
+                # Slice the shared offset-based tag map to the raw-bytes
+                # form _tif_info_from_tags expects.
+                raw = {
+                    tag: (typ, count, data[pos : pos + TIFF_TYPE_SIZES[typ] * count])
+                    for tag, (typ, count, pos) in tags.items()
+                }
+                return _tif_info_from_tags(data, e, raw)
             next_off = _next_ifd(data, e, off_fmt, cnt_size, entry_size, ifd_off)
             if not next_off:
                 msg = "no tiled IFD found (strip TIFF?)"
@@ -453,40 +593,9 @@ def _tif_info(path: Path) -> _TifInfo:
     except struct.error as exc:
         msg = f"corrupt TIFF structure: {exc}"
         raise ZstdmtError(msg) from exc
-
-
-def _parse_ifd_tags(
-    data: bytes,
-    e: str,
-    off_fmt: str,
-    cnt_size: int,
-    entry_size: int,
-    ifd_off: int,
-) -> dict[int, tuple[int, int, bytes]]:
-    """Return {tag: (type, count, raw bytes)} for one IFD."""
-    cnt_fmt = "H" if cnt_size == 2 else "Q"
-    entries = struct.unpack_from(e + cnt_fmt, data, ifd_off)[0]
-    tags: dict[int, tuple[int, int, bytes]] = {}
-    for i in range(entries):
-        off = ifd_off + cnt_size + i * entry_size
-        tag = struct.unpack_from(e + "H", data, off)[0]
-        typ = struct.unpack_from(e + "H", data, off + 2)[0]
-        count = struct.unpack_from(e + off_fmt, data, off + 4)[0]
-        # Classic entries are 12 B (tag2 type2 count4 value4); BigTIFF entries
-        # are 20 B (tag2 type2 count8 value8), so the value field sits at +12.
-        val_off = off + (12 if cnt_size == 8 else 8)
-        per = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 11: 4, 12: 8, 16: 8}.get(typ)
-        if per is None:
-            continue
-        total = per * count
-        val_size = 4 if cnt_size == 2 else 8
-        if total <= val_size:
-            raw = data[val_off : val_off + total]
-        else:
-            ptr = struct.unpack_from(e + off_fmt, data, val_off)[0]
-            raw = data[ptr : ptr + total]
-        tags[tag] = (typ, count, raw)
-    return tags
+    except ValueError as exc:
+        # Header-level rejects (too small, bad BOM/magic, offset size).
+        raise ZstdmtError(str(exc)) from exc
 
 
 def _next_ifd(
@@ -542,10 +651,12 @@ def oracle_check(
     """Byte-compare one turbo-compressed tile against the stock tile stored in a raster.
 
     Reads one tile's raw array from the raster (stock decode path),
-    applies the TIFF predictor exactly as the stock encoder does,
-    compresses the result with `compress` (default: the CPL zstd pfn),
-    and byte-compares against the tile bytes actually stored in the file
-    by the stock GDAL write path.
+    zero-pads partial edge tiles to the full declared block (GDAL pads
+    them with zeros before the codec runs - audit #81 F-1), applies the
+    TIFF predictor exactly as the stock encoder does, compresses the
+    result with `compress` (default: the CPL zstd pfn), and byte-compares
+    against the tile bytes actually stored in the file by the stock GDAL
+    write path.
 
     Args:
         path: A GeoTIFF written by the stock GDAL path (tiled, int16,
@@ -580,6 +691,13 @@ def oracle_check(
     th = min(tif.tileh, tif.height - y0)
     with rasterio.open(path) as ds:
         arr = ds.read(1, window=Window(x0, y0, tw, th))
+    if tw < tif.tilew or th < tif.tileh:
+        # GDAL zero-pads partial edge tiles to the full declared block
+        # before the codec runs (audit #81 F-1): the turbo side must pad
+        # identically or the frames decompress to different sizes.
+        padded = np.zeros((tif.tileh, tif.tilew), dtype=arr.dtype)
+        padded[:th, :tw] = arr
+        arr = padded
     pre = predictor2(arr).tobytes() if tif.predictor == 2 else arr.tobytes()
     fn = compress or compress_tile
     turbo = fn(pre)

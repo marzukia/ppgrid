@@ -137,6 +137,7 @@ ppgrid help
 | `--json` | False | Write a machine-readable run summary to `<out>/run_summary.json` (phase timings, volumetrics, grid metadata, calibration, resolved CLI params, seed, git commit; stdout stays clean) |
 | `--verbose` | False | Debug logging: per-phase wall times + volumetric detail (shorthand for `--log-level debug`) |
 | `--log-level` | `info` | Progress log level on stderr: `error`, `warning`, `info`, `debug` (env `LOGGING`; `verbose` = debug) |
+| `--max-band-parallel` | (none) | Cap parallel row-band workers for the low-RAM shared descent (default: `--workers`) |
 | `-q, --quiet` | False | Suppress stderr below WARNING (beats `--verbose` / `LOGGING`; an explicit `--log-level` wins) |
 
 ### Exit codes
@@ -172,7 +173,12 @@ with open("calibration.json") as f:
     quantiles = np.array(json.load(f)["percentile_quantiles"])
 
 with rasterio.open("value.tif") as r:
-    percentiles = np.array(r.read(1), copy=True) / 100.0
+    # The value band carries its own scale tag (DN * scale = percentile), so a
+    # non-default --scale (e.g. 10) decodes correctly. rasterio reports (1.0,)
+    # when the tag is absent, so a legacy untagged raster decodes 100x high and
+    # np.interp clips it; re-run the pipeline for tagged output.
+    scale = r.scales[0] if r.scales else 0.01
+    percentiles = np.array(r.read(1), copy=True) * scale
 
 real_values = np.interp(percentiles, np.linspace(0, 100, len(quantiles)), quantiles)
 ```

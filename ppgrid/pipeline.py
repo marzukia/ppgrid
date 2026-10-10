@@ -37,7 +37,7 @@ from pyproj.exceptions import CRSError
 from rasterio._io import MemoryDataset
 from rasterio.crs import CRS
 from rasterio.errors import CRSError as RasterioCRSError
-from rasterio.errors import NotGeoreferencedWarning
+from rasterio.errors import NotGeoreferencedWarning, RasterioIOError
 from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
@@ -202,27 +202,37 @@ _SHARED_MEMMAP_CELLS = int(1e8)
 _TIFF_CLASSIC_MAX_BYTES: int = 0xFFFFFFFF
 
 # Temp files created in the output dir by a run; all removed on success and
-# on the failure path (issue #15). _val_lvl*.npy / _sup_lvl*.npy are written
-# by pullpush._descent_banded on the banded path.
-_RUN_TEMP_FILES = (
-    "_points.npy",
-    "_s0.npy",
-    "_c0.npy",
-    "_near.npy",
-    "_val_full.npy",
-    "_sup_full.npy",
-    "_val_dn.npy",
-    "_sup_dn.npy",
-    "_val_lvl1.npy",
-    "_sup_lvl1.npy",
+# on the failure path (issue #15). The list is generated from the write
+# sites, not hand-maintained (audit #83): _descent_banded (pullpush) writes
+# _val_lvl{k}.npy / _sup_lvl{k}.npy for every intermediate level
+# k = 1 .. levels-1, and the old literal kept only lvl1, so any run with
+# levels >= 3 leaked _val_lvl2.npy and up.
+# 64 covers cells up to 2**64 (levels = ceil(log2(cap_cells)); the shared
+# cell cap is 2.5e8 non-turbo, budget-derived in turbo).
+_RUN_LEVELS_MAX: int = 64
+
+
+def _run_temp_names(n_levels: int = _RUN_LEVELS_MAX) -> tuple[str, ...]:
+    """Names of every per-run temp file for a grid of up to n_levels."""
+    names = [
+        "_points.npy",
+        "_s0.npy",
+        "_c0.npy",
+        "_near.npy",
+        "_val_full.npy",
+        "_sup_full.npy",
+        "_val_dn.npy",
+        "_sup_dn.npy",
+    ]
+    names.extend(f"_{band}_lvl{k}.npy" for k in range(1, n_levels) for band in ("val", "sup"))
     # Write-phase staging files (issue #40): the final rasters are written
     # to these names and os.replace()'d over value.tif / support_km.tif
     # only on success, so a mid-write crash never truncates the finals.
-    "_value_tmp.tif",
-    "_support_tmp.tif",
-    "value.tif.tmp",
-    "support_km.tif.tmp",
-)
+    names.extend(("_value_tmp.tif", "_support_tmp.tif", "value.tif.tmp", "support_km.tif.tmp"))
+    return tuple(names)
+
+
+_RUN_TEMP_FILES = _run_temp_names()
 
 # Ingest parallelism (S3.5): minimum data rows per CSV chunk for the process
 # pool. Below this the pool overhead exceeds the parse time, so ingest stays
@@ -275,6 +285,9 @@ class _WorkerConfig:
 # Worker state, shared by all worker threads in this process (one
 # ThreadPoolExecutor, one object — not local to each process). Holds the
 # _WorkerConfig as-is under "cfg"; workers read attributes off it.
+# Single-run scope: the ONLY key is "cfg", and both writers clear() it before
+# repopulating, so a second Pipeline.run in the same process never sees stale
+# state (re-runs with varied configs are exercised across the test suite).
 _CTX: dict[str, Any] = {}
 
 
@@ -574,6 +587,8 @@ def _block_points(cfg: _WorkerConfig, bx: int, by: int) -> np.ndarray:
 # there). The int16 outputs are owned by the caller - returning scratch
 # raced the worker pool's ex.map prefetch (worker overwrote the buffer
 # before the main thread finished vd.write), corrupting blocks randomly.
+# Re-allocation when a block's shape differs (right/bottom raster edges) is
+# expected and perf-only: at most one realloc per thread per distinct shape.
 _QUANT_TLS = threading.local()
 
 
@@ -1102,6 +1117,12 @@ def _reproject_band_array(
         n_threads: Warp threads. 1 = fully serial (A8 path).
 
     """
+    # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
+    # pass 3, ported to the serial array reproject - audit #78 P1-3):
+    # reproject's ndarray source form copies the whole band into a fresh
+    # MEM dataset per warp call. The tuple form reads the shared handle;
+    # src_arr is not mutated during the warp.
+    src_ds = MemoryDataset(src_arr, transform=src_transform, crs=src_crs, copy=False)
 
     def make_warp(j0: int, band_h: int) -> Callable[[int], tuple[int, np.ndarray]]:
         return partial(
@@ -1115,6 +1136,7 @@ def _reproject_band_array(
             dst_width=dst_width,
             dst_transform=dst_transform,
             dst_crs=dst_crs,
+            src_ds=src_ds,
         )
 
     _reproject_core(
@@ -1136,27 +1158,12 @@ def _reproject_band_array(
 # overlap guard share it so a type can never be sized in one place and
 # mis-sized in the other. 16/17/18 = the BigTIFF 64-bit types (LONG8,
 # SLONG8, IFD8).
-_TIFF_TYPE_SIZES = {
-    1: 1,
-    2: 1,
-    3: 2,
-    4: 4,
-    5: 8,
-    6: 8,
-    7: 8,
-    8: 1,
-    9: 2,
-    10: 4,
-    11: 4,
-    12: 8,
-    16: 8,
-    17: 8,
-    18: 8,
-}
-
-
 def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
     """Parse the first IFD of a single-band classic or BigTIFF tiled raster.
+
+    Built on the shared zstdmt primitives (parse_tiff_header +
+    parse_ifd_tags) so there is exactly one IFD parser rule in the repo
+    (audit #83: this used to be an independent, subtly divergent copy).
 
     Args:
         data: Full file bytes.
@@ -1170,51 +1177,22 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
         struct formats.
 
     Raises:
-        ValueError: On unknown endian/magic, missing 324/325, an unknown
-            TIFF type, a non-LONG/LONG8 tile array type, inline tile
-            arrays, or a count mismatch.
+        ValueError: On unknown endian/magic, missing 324/325, a
+            non-LONG/LONG8 tile array type, inline tile arrays, or a
+            count mismatch. (Tags with a type the shared parser does not
+            size are now skipped rather than a hard error: the caller only
+            needs 324/325 and the head-overlap guard. Previously:
+            "unsupported TIFF type" ValueError.)
 
     """
-    if data[:2] == b"II":
-        e = "<"
-    elif data[:2] == b"MM":
-        e = ">"
-    else:
-        msg = f"not a little/big-endian TIFF: {data[:2]!r}"
-        raise ValueError(msg)
-    magic = struct.unpack_from(e + "H", data, 2)[0]
-    big = magic == 43
-    if not big and magic != 42:
-        msg = f"unexpected TIFF magic {magic}"
-        raise ValueError(msg)
-    if not big:
-        ifd = struct.unpack_from(e + "I", data, 4)[0]
-        cnt = struct.unpack_from(e + "H", data, ifd)[0]
-        # 12-byte entries: tag(2) type(2) count(4) value-or-offset(4).
-        ent_size, count_fmt, off_fmt, entry_off, val_at, inline = 12, "I", "I", 2, 8, 4
-    else:
-        # 16-byte BigTIFF header: first-IFD offset (8) at bytes 8-15; the
-        # IFD count is followed by 6 pad bytes; 20-byte entries: tag(2)
-        # type(2) count(8) value-or-offset(8, inline capacity 12).
-        ifd = struct.unpack_from(e + "Q", data, 8)[0]
-        cnt = struct.unpack_from(e + "H", data, ifd)[0]
-        ent_size, count_fmt, off_fmt, entry_off, val_at, inline = 20, "Q", "Q", 8, 12, 12
-    per_typ = _TIFF_TYPE_SIZES
-    tags: dict[int, tuple[int, int, int]] = {}
-    for i in range(cnt):
-        off = ifd + entry_off + i * ent_size
-        tag, typ = struct.unpack_from(e + "HH", data, off)
-        count = struct.unpack_from(e + count_fmt, data, off + 4)[0]
-        sz = per_typ.get(typ)
-        if sz is None:
-            msg = f"unsupported TIFF type {typ} for tag {tag}"
-            raise ValueError(msg)
-        total = sz * count
-        if total <= inline:
-            tags[tag] = (typ, count, off + val_at)
-        else:
-            voff = struct.unpack_from(e + off_fmt, data, off + val_at)[0]
-            tags[tag] = (typ, count, voff)
+    e, big, off_fmt, entry_size, cnt_size, inline, ifd = zstdmt.parse_tiff_header(data)
+    try:
+        tags: dict[int, tuple[int, int, int]] = zstdmt.parse_ifd_tags(
+            data, e, ifd, off_fmt, cnt_size, entry_size, inline
+        )
+    except struct.error as exc:
+        msg = f"corrupt TIFF structure: {exc}"
+        raise ValueError(msg) from exc
     if 324 not in tags or 325 not in tags:
         msg = "missing TileOffsets/TileByteCounts"
         raise ValueError(msg)
@@ -1228,6 +1206,7 @@ def _tif_parse_ifd(data: bytes) -> dict[str, Any]:
     n_tiles = t324[1]
     # Slot width is per tag (Y-1): BigTIFF stores 324 as LONG8 (8-byte
     # slots) but 325 as LONG (4-byte slots); classic stores both as LONG.
+    per_typ = zstdmt.TIFF_TYPE_SIZES
     sz324, sz325 = per_typ[t324[0]], per_typ[t325[0]]
     fmt324 = e + ("Q" if sz324 == 8 else "I")
     fmt325 = e + ("Q" if sz325 == 8 else "I")
@@ -1275,9 +1254,11 @@ def _turbo_write_parallel(
 
     1. Warp the full output raster from the work-CRS array (2048px tiles
        in a thread pool - same kernel as the serial path).
-    2. Compress every 512^2 tile in parallel (predictor 2 + zstdmt).
-    3. Write a zero-filled reference raster with the identical profile;
-       GDAL serialises the exact head (IFD + external tag arrays).
+    2. Compress every TILE_PX^2 tile in parallel (predictor 2 + zstdmt).
+    3. Write a reference raster with the identical profile holding ONE
+       TILE_PX^2 zero tile; GDAL serialises the exact head (IFD + external
+       tag arrays) from the raster dimensions alone, so the single tile
+       avoids a dst_height*dst_width int16 reference array.
     4. Assemble: reference head with the TileOffsets/TileByteCounts arrays
        patched to the real frames, then the frames appended in raster-scan
        order.
@@ -1290,6 +1271,13 @@ def _turbo_write_parallel(
 
     """
     warp_tile = 2048
+    # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
+    # pass 3, ported to the zstd writer - audit #78 P1-3): reproject's
+    # ndarray source form copies the whole band into a fresh MEM dataset
+    # per warp call (3.1 GB per 2048^2 block at full-AU; up to n_threads
+    # copies in flight). The tuple form reads the shared handle; arr is
+    # not mutated during the warp, so concurrent read-only access is safe.
+    src_ds = MemoryDataset(arr, transform=src_transform, crs=src_crs, copy=False)
     tiles: list[bytes] = []
     band_tiles: list[np.ndarray] = []
     coarse: dict[int, np.ndarray] = {}
@@ -1306,6 +1294,7 @@ def _turbo_write_parallel(
             dst_width=dst_width,
             dst_transform=dst_transform,
             dst_crs=dst_crs,
+            src_ds=src_ds,
         )
         coarse = {}
         if n_threads > 1:
@@ -1321,16 +1310,35 @@ def _turbo_write_parallel(
             for i in range(0, dst_width, TILE_PX):
                 w = min(TILE_PX, dst_width - i)
                 i0 = (i // warp_tile) * warp_tile
-                band_tiles.append(coarse[i0][j - j0 : j - j0 + h, i - i0 : i - i0 + w])
+                t = coarse[i0][j - j0 : j - j0 + h, i - i0 : i - i0 + w]
+                if h < TILE_PX or w < TILE_PX:
+                    # GDAL zero-pads partial edge tiles to the full block
+                    # before the codec runs (audit #81 F-1): unpadded
+                    # frames decompress to less than the declared tile
+                    # size, breaking S3 bit-identity on non-512-multiple
+                    # rasters. Pad to TILE_PX^2 first; predictor 2 then
+                    # runs over the padded row exactly as libtiff does.
+                    pad = np.zeros((TILE_PX, TILE_PX), dtype=np.int16)
+                    pad[:h, :w] = t
+                    t = pad
+                band_tiles.append(t)
         # Predictor 2 must be applied before compression: the stock codec
         # (and the oracle) compress the predicted bytes, not the raw tiles.
         band_tiles = [zstdmt.predictor2(t) for t in band_tiles]
         tiles.extend(zstdmt.compress_tiles(band_tiles, n_threads=n_threads))
-    del coarse, band_tiles
+    del coarse, band_tiles, src_ds
 
     ref_path = Path(dst_path + ".refhead.tif")
     try:
-        zero = np.zeros((dst_height, dst_width), dtype=np.int16)
+        # One TILE_PX^2 reference tile, not a full-raster zero write: the
+        # head (IFD + tag arrays) is sized from the raster dimensions at
+        # creation, so a single tile write yields the byte-identical head a
+        # full-band zero write would, without touching a
+        # dst_height*dst_width int16 array (~3 GB at full-AU) (audit #84
+        # P2-4; same property the stock parallel writer relies on).
+        th = min(TILE_PX, dst_height)
+        tw = min(TILE_PX, dst_width)
+        zero = np.zeros((th, tw), dtype=np.int16)
         with _open_tiff_staging(
             ref_path,
             **dict(
@@ -1346,10 +1354,13 @@ def _turbo_write_parallel(
                 dst.scales = scales
             if offsets:
                 dst.offsets = offsets
-            dst.write(zero, 1)
+            dst.write(zero, 1, window=Window(0, 0, tw, th))
         data = ref_path.read_bytes()
     finally:
         ref_path.unlink(missing_ok=True)
+        # No `del zero` here (audit #78 P1-1, as in the stock writer): if the
+        # allocation fails `zero` is unbound and the del would mask the root
+        # error. The 512^2 tile local dies at function return anyway.
 
     try:
         info = _tif_parse_ifd(data)
@@ -1364,7 +1375,7 @@ def _turbo_write_parallel(
     # the head cut keeps every array and drops every reference tile.
     head_end = info["first"]
     for typ, count, voff in info["tags"].values():
-        total = _TIFF_TYPE_SIZES[typ] * count
+        total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
             print("[warn] turbo zstd head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
             return False
@@ -1512,8 +1523,11 @@ def _turbo_write_stock_parallel(
             dst.write(zero, 1, window=Window(0, 0, tw, th))
         data = ref_path.read_bytes()
     finally:
+        # No `del zero` here (audit #78 P1-1): if the reference head is not
+        # created, `zero` is unbound and the del raises UnboundLocalError,
+        # masking the root error. The 512^2 tile local dies at function
+        # return anyway; the del buys nothing.
         ref_path.unlink(missing_ok=True)
-        del zero
     try:
         info = _tif_parse_ifd(data)
     except ValueError as e:
@@ -1522,7 +1536,7 @@ def _turbo_write_stock_parallel(
     t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
     head_end = info["first"]
     for typ, count, voff in info["tags"].values():
-        total = _TIFF_TYPE_SIZES[typ] * count
+        total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
             print("[warn] turbo stock head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
             return False
@@ -1623,7 +1637,7 @@ def _turbo_write_stock_parallel(
 
 def _read_csv_chunk(
     task: tuple[str, int, int, bool, list[str], list[str]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Parse one CSV row chunk in a worker process (S3.5).
 
     The parent split the file into complete records at newline offsets and
@@ -1637,7 +1651,10 @@ def _read_csv_chunk(
         task: Tuple of (path, byte_start, byte_end, has_header, wanted, all_names).
 
     Returns:
-        Tuple of (value, lon, lat) float64 arrays in original row order.
+        Dict of column name -> float64 array in original row order. The
+        caller indexes by name (audit #83: the chunk arrays used to be
+        returned positionally, so the order of `wanted` was an unspoken
+        value/lng/lat contract shared with the caller).
 
     Raises:
         RuntimeError: If a wanted column does not parse as float64 (schema pin).
@@ -1656,8 +1673,7 @@ def _read_csv_chunk(
         if df[c].dtype != np.dtype(np.float64):
             msg = f"ingest chunk dtype mismatch for column {c!r}: {df[c].dtype}"
             raise RuntimeError(msg)
-    out = df[wanted].to_numpy(dtype=np.float64)
-    return out[:, 0], out[:, 1], out[:, 2]
+    return {c: df[c].to_numpy(dtype=np.float64) for c in wanted}
 
 
 def _csv_chunk_tasks(
@@ -2064,9 +2080,11 @@ class Pipeline:
         task_list, expected = tasks
         with ProcessPoolExecutor(max_workers=len(task_list)) as ex:
             chunks = list(ex.map(_read_csv_chunk, task_list))
-        v = np.concatenate([c[0] for c in chunks])
-        lon = np.concatenate([c[1] for c in chunks])
-        lat = np.concatenate([c[2] for c in chunks])
+        # Index by column name, not position (audit #83): the chunk dicts
+        # carry the same names the serial path uses.
+        v = np.concatenate([c[self.value_col] for c in chunks])
+        lon = np.concatenate([c[self.lng_col] for c in chunks])
+        lat = np.concatenate([c[self.lat_col] for c in chunks])
         if v.size != expected:
             return serial()
         return v, lon, lat
@@ -2113,7 +2131,7 @@ class Pipeline:
                 # discarded anyway, and it dominates run time / memory).
                 cap, detail = float(self.cap_km), {}
             else:
-                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv), seed=self.seed)
+                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv), seed=self.seed, saturation=self.saturation)
 
             cal = {
                 "transform": tf.name,
@@ -2691,11 +2709,19 @@ class Pipeline:
         radius = round(self.cap_km_val * M_PER_KM / self.res)
         cap_gb, cap_source = self._resolve_turbo_cap()
         plan = turbop.plan(cap_gb, n_cells, self.nx_padded, radius)
+        # The process's actual memory ceiling (audit #78 P1-2): the 8 GB
+        # cap floor can plan a budget above it on a small cgroup slice;
+        # precheck names the OOM risk instead of staying green.
+        available_gb = min(
+            turbop._read_physical_gb(),  # ruff: ignore[private-member-access]
+            turbop._read_cgroup_max_gb(),  # ruff: ignore[private-member-access]
+        )
         decision = turbop.precheck(
             plan,
             strict=self.turbo_strict,
             cap_source=cap_source,
             per_box_peak_bytes=self._per_box_peak_bytes(),
+            available_gb=available_gb,
         )
         self._turbo_plan = plan
         self._turbo_decision = decision
@@ -2718,38 +2744,42 @@ class Pipeline:
     def _turbo_zstd_ok(self) -> bool:
         """A.7 calibration oracle gate for the parallel ZSTD write.
 
-        Writes one deterministic 512^2 int16 tile with the stock codec
-        settings, then asks zstdmt whether the turbo-compressed frame is
-        byte-equal to the bytes GDAL stored. Mismatch (or unavailable) ->
-        False: the caller writes with the stock-codec parallel path
-        (_turbo_write_stock_parallel); the serial per-band write runs only if
-        that writer's layout guards fail. Either way the output is byte-exact.
+        Writes one deterministic 500x512 int16 probe (partial width, so
+        the gate also covers GDAL's zero-padding of edge tiles - audit
+        #81 F-1) with the stock codec settings, then asks zstdmt whether
+        the turbo-compressed frame is byte-equal to the bytes GDAL
+        stored. Mismatch (or unavailable) -> False: the caller writes
+        with the stock-codec parallel path (_turbo_write_stock_parallel);
+        the serial per-band write runs only if that writer's layout guards
+        fail. Either way the output is byte-exact.
         """
-        if not zstdmt.available():
-            print("[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
-            return False
         # Deterministic compressible content: both axes differ to small
         # values, so predictor 2 output is near-zero structured data.
-        gx = np.arange(512, dtype=np.int16) * 13
-        gy = np.arange(512, dtype=np.int16) * 7
+        gx = np.arange(500, dtype=np.int16) * 13
+        gy = np.arange(TILE_PX, dtype=np.int16) * 7
         tile = (gx[None, :] + gy[:, None]).astype(np.int16)
         probe = Path(self.out_dir) / "_zstd_oracle.tif"
         try:
+            # zstdmt.available() inside the try (audit #81 F-3): a gate
+            # failure must mean "stock parallel write", never a crash.
+            if not zstdmt.available():
+                print("[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
+                return False
             with rasterio.open(
                 probe,
                 "w",
                 driver="GTiff",
                 dtype="int16",
-                width=512,
-                height=512,
+                width=500,
+                height=TILE_PX,
                 count=1,
                 nodata=NODATA,
                 crs=f"EPSG:{self.work_crs}",
-                transform=from_origin(0, 512 * self.res, self.res, self.res),
+                transform=from_origin(0, TILE_PX * self.res, self.res, self.res),
                 compress=self.compress,
                 tiled=True,
-                blockxsize=512,
-                blockysize=512,
+                blockxsize=TILE_PX,
+                blockysize=TILE_PX,
                 predictor=2,
                 BIGTIFF="IF_SAFER",
             ) as dst:
@@ -3559,6 +3589,17 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         _die(f"input file not found: {e.filename or input_path}")
     except pd.errors.ParserError as e:
         _die(f"malformed input file: {e}")
+    except RasterioIOError as e:
+        # A GDAL I/O failure mid-run (corrupt/short raster, driver error).
+        # Subclass of OSError; named here so the exit-1 group reads as the
+        # full list of pipeline/IO errors (audit #83).
+        _die(str(e))
+    except (IndexError, OverflowError, ZeroDivisionError, RuntimeError) as e:
+        # Invariant-style failures (a bad shape, a div-by-zero in a derived
+        # constant, a worker signalling failure via RuntimeError): pipeline
+        # bugs or a broken run, not user input errors, so exit 1 like the
+        # other pipeline failures rather than exit 2 (audit #83).
+        _die(f"{type(e).__name__}: {e} (input: {input_path})")
     except (KeyError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
         raise SystemExit(2) from None
@@ -3707,7 +3748,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transform",
         default="auto",
-        choices=["auto", "identity", "log10", "sqrt", "percentile"],
+        # Pinned to the calibrate.transforms() factory names (audit #83):
+        # adding a transform there adds its name here, nothing else to update.
+        choices=["auto", *(t.name for t in transforms())],
     )
     parser.add_argument(
         "--saturation",
