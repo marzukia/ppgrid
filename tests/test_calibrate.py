@@ -78,6 +78,7 @@ def test_blocked_cv_skill_clamps_grid_resolution(monkeypatch: pytest.MonkeyPatch
     tv = rng.normal(0.0, 1.0, n)
 
     seen: list[float] = []
+    sats: list[float] = []
     orig = cal._fit_predict  # ruff: ignore[private-member-access]
 
     def spy(
@@ -87,9 +88,11 @@ def test_blocked_cv_skill_clamps_grid_resolution(monkeypatch: pytest.MonkeyPatch
         train: np.ndarray,
         res: float,
         levels: int,
+        saturation: float = 1.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         seen.append(res)
-        return orig(xx, yy, t, train, res, levels)
+        sats.append(saturation)
+        return orig(xx, yy, t, train, res, levels, saturation=saturation)
 
     monkeypatch.setattr(cal, "_fit_predict", spy)
     cal.blocked_cv_skill(x, y, tv, res=1000.0, block_km=100.0)
@@ -225,6 +228,7 @@ def test_bootstrap_zero_baseline_draws_keep_finite_ci(monkeypatch: pytest.Monkey
         _train: np.ndarray,
         _res: float,
         _levels: int,
+        saturation: float = 1.0,  # ruff: ignore[unused-function-argument] - keyword-matched to the _fit_predict call
     ) -> tuple[np.ndarray, np.ndarray]:
         sup = np.where(np.arange(len(t)) < n // 2, 1.0, 5.0)
         return t, sup  # perfect prediction: e_m == 0 everywhere
@@ -270,3 +274,54 @@ def test_fill_cap_nonfinite_ci_uses_point_skill(monkeypatch: pytest.MonkeyPatch)
     cap, detail = cal.calibrate_fill_cap(np.empty(0), np.empty(0), np.empty(0), block_km=(100.0,))
     assert cap == 8.0  # not 25.0 (FILL_CAP_DEFAULT_KM) and not broken at the first bin
     assert detail[100.0]["cap_km"] == 8.0
+
+
+# Audit #83: saturation plumbing + CV edge derivation
+# ---------------------------------------------------------------------------
+
+
+def test_cv_max_edge_derived_from_unresolved() -> None:
+    """Top CV edge is derived from _UNRESOLVED_M (was a literal 1e9 km)."""
+    from itertools import pairwise
+
+    from ppgrid import calibrate
+    from ppgrid.pullpush import _UNRESOLVED_M
+
+    edges = calibrate._CV_EDGES  # ruff: ignore[private-member-access]
+    assert edges[-1] == pytest.approx(_UNRESOLVED_M / 1000.0)  # 1e6 km
+    assert all(b > a for a, b in pairwise(edges))
+
+
+def test_saturation_plumbed_to_pull_push(monkeypatch: pytest.MonkeyPatch) -> None:
+    """blocked_cv_skill forwards saturation to pull_push (audit #83)."""
+    from collections.abc import Callable
+
+    import ppgrid.calibrate as cal
+
+    rng = np.random.default_rng(0)
+    n = 200
+    x = rng.uniform(0.0, 1.0e6, n)
+    y = rng.uniform(0.0, 1.0e6, n)
+    tv = rng.normal(0.0, 1.0, n)
+
+    seen: list[float] = []
+    orig_pp = cal.pull_push
+
+    def spy_pp(
+        s: np.ndarray,
+        c: np.ndarray,
+        res: float,
+        levels: int,
+        upsample: Callable[[np.ndarray], np.ndarray] | None = None,
+        saturation: float = 1.0,
+        unresolved_m: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        del upsample, unresolved_m
+        seen.append(saturation)
+        return orig_pp(s, c, res, levels, saturation=saturation)
+
+    monkeypatch.setattr(cal, "pull_push", spy_pp)
+    cal.blocked_cv_skill(x, y, tv, res=1000.0, block_km=100.0, saturation=1.7)
+
+    assert len(seen) > 0, "CV did not run any folds"
+    assert all(s == pytest.approx(1.7) for s in seen), f"saturation not forwarded: {seen}"

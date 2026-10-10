@@ -1539,9 +1539,12 @@ def test_midwrite_failure_keeps_finals(
     sha_s = _sha(out / "support_km.tif")
 
     monkeypatch.setattr(pipeline_mod, "_reproject_band", _boom)
-    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+    # RuntimeError maps to a clean exit 1 (audit #83 widening), not a traceback.
+    with pytest.raises(SystemExit) as excinfo:
         pipeline_mod.main([str(csv), *_cli_base(out, "--force")])
+    assert excinfo.value.code == 1
     err = capsys.readouterr().err
+    assert "simulated mid-write crash" in err
     assert "failed during write" in err
     assert "failed before writing outputs" in err
     assert _sha(out / "value.tif") == sha_v
@@ -1574,9 +1577,12 @@ def test_turbo_midwrite_failure_keeps_finals(
     monkeypatch.setattr(pipeline_mod, "_turbo_write_parallel", _boom)
     monkeypatch.setattr(pipeline_mod, "_turbo_write_stock_parallel", _boom)
     monkeypatch.setattr(pipeline_mod, "_reproject_band_array", _boom)
-    with pytest.raises(RuntimeError, match="simulated mid-write crash"):
+    # RuntimeError maps to a clean exit 1 (audit #83 widening), not a traceback.
+    with pytest.raises(SystemExit) as excinfo:
         pipeline_mod.main([str(csv), *_cli_base(out, "--turbo", "32", "--force")])
+    assert excinfo.value.code == 1
     err = capsys.readouterr().err
+    assert "simulated mid-write crash" in err
     assert "failed during write" in err
     assert "failed before writing outputs" in err
     assert _sha(out / "value.tif") == sha_v
