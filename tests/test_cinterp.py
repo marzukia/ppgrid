@@ -8,7 +8,9 @@ where the C module is required, skip cleanly when no compiler is present.
 
 from __future__ import annotations
 
+import os
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -91,6 +93,21 @@ def test_bit_identity_tied_and_nonmonotonic_xp() -> None:
     check_bits(rng.uniform(0.0, 10.0, 50_000), xp_bad, rng.uniform(0.0, 10.0, 128))
 
 
+def test_bit_identity_nan_xp() -> None:
+    """NaN in xp (lenxp > 1) routes to the verbatim clone; bits match np.interp."""
+    # M2 repro: np.interp -> 15.0, old chunked kernel -> nan.
+    check_bits(
+        np.array([1.5, 2.5, 4.0, 6.0, 100.0]),
+        np.array([1.0, 2.0, np.nan, 5.0, 9.0]),
+        np.array([10.0, 20.0, 30.0, 40.0, 80.0]),
+    )
+    rng = np.random.default_rng(SEED + 11)
+    for i in range(5):
+        xpn = np.sort(rng.uniform(0.0, 10.0, 64))
+        xpn[0 if i == 4 else 10 + 12 * i] = np.nan
+        check_bits(rng.uniform(0.0, 10.0, 50_000), xpn, rng.uniform(0.0, 10.0, 64))
+
+
 def test_bit_identity_special_values() -> None:
     """Bit-identity with NaN/inf/exact-node/out-of-range/0.0/tiny/huge keys."""
     rng = np.random.default_rng(SEED + 4)
@@ -133,6 +150,23 @@ def test_bit_identity_f32() -> None:
     x = rng.lognormal(17.0, 0.4, 200_000).astype(np.float32)
     x = np.concatenate([x, np.array([np.nan, np.inf, -np.inf, 0.0], dtype=np.float32)])
     check_bits(x, q, p)
+
+
+def test_interp_f32_tables_fall_back() -> None:
+    """f32 xp/fp/slopes fall back to np.interp instead of C-level TypeErrors."""
+    rng = np.random.default_rng(SEED + 12)
+    x = rng.uniform(0.0, 10.0, 50_000)
+    for which in ("xp", "fp", "slopes"):
+        xp = np.sort(rng.uniform(0.0, 10.0, 128))
+        fp = rng.uniform(0.0, 10.0, 128)
+        slopes = _slopes(xp, fp)
+        if which == "xp":
+            xp = xp.astype(np.float32)
+        elif which == "fp":
+            fp = fp.astype(np.float32)
+        else:
+            slopes = slopes.astype(np.float32)
+        check_bits(x, xp, fp, slopes)
 
 
 def test_bit_identity_strided_view() -> None:
@@ -181,6 +215,34 @@ def test_fallback_when_c_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     assert np.array_equal(_bits(np.interp(xi, np.arange(100.0), np.arange(100.0))), _bits(out_i))
 
 
+def test_tmpdir_owner_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> None:
+    """A shared tmpdir cache dir owned by another uid is treated as absent."""
+    root = tmp_path / "ppgrid-cinterp"
+    root.mkdir()
+    foe = root / f"_cinterp_c-{'0' * 12}{ci._SO_SUFFIX}"
+    foe.write_bytes(b"placeholder")
+    imports: list = []
+    real_stat = os.stat
+
+    def fake_stat(path: object, *a: object, **k: object) -> object:
+        st = real_stat(path, *a, **k)
+        if str(path) == str(root):
+            return SimpleNamespace(st_uid=(os.geteuid() + 1) % 2**32)
+        return st
+
+    monkeypatch.setattr(ci, "_TMPDIR_ROOT", root)
+    monkeypatch.setattr(ci, "_candidate_paths", lambda: [foe])
+    monkeypatch.setattr(ci, "_mod", None)
+    monkeypatch.setattr(ci, "_reason", None)
+    monkeypatch.setattr(ci, "_build_err", None)
+    monkeypatch.setattr(ci, "_try_import", lambda path: imports.append(path) or True)
+    monkeypatch.setattr(os, "stat", fake_stat)
+    ci._load()
+    assert imports == []  # the other-user .so was never imported
+    assert ci._mod is None
+    assert ci._reason is not None
+
+
 def _pct() -> PercentileTransform:
     """Fit a PercentileTransform on a realistic 2M-point lognormal sample."""
     rng = np.random.default_rng(SEED + 8)
@@ -217,6 +279,32 @@ def test_percentile_transform_state_roundtrip() -> None:
     x = np.linspace(1e4, 1e5, 10_000)
     assert np.array_equal(_bits(t.fwd(x)), _bits(t2.fwd(x)))
     assert np.array_equal(_bits(t.inv(x / 1e4)), _bits(t2.inv(x / 1e4)))
+
+
+def test_percentile_transform_refit_resets_cprep() -> None:
+    """Fit -> fwd -> re-fit -> fwd: slope cache reset, bits match np.interp on new q."""
+    rng = np.random.default_rng(SEED + 13)
+    v1 = rng.lognormal(2.0, 1.0, 500_000)
+    t = PercentileTransform().fit(v1)
+    q1 = t.q
+    assert q1 is not None
+    x1 = np.array([float(np.median(v1))])
+    assert np.array_equal(_bits(np.interp(x1, q1, t._p)), _bits(t.fwd(x1)))
+    if ci.available():
+        assert t._c_ready  # C tables built from the first fit
+    v2 = rng.lognormal(5.0, 1.0, 500_000)
+    t.fit(v2)
+    q2 = t.q
+    assert q2 is not None
+    if ci.available():
+        assert not t._c_ready  # re-fit invalidated the old slope tables
+    x2 = np.array([float(np.median(v2))])
+    got = t.fwd(x2)
+    want = np.interp(x2, q2, t._p)
+    assert np.array_equal(_bits(want), _bits(got))
+    # A stale cache evaluates the new median on the OLD grid (reviewer repro:
+    # ~51.83); the correct value is the ~50 class on the new grid.
+    assert float(got[0]) == pytest.approx(50.0, abs=1.5)
 
 
 def test_percentile_transform_no_c(monkeypatch: pytest.MonkeyPatch) -> None:
