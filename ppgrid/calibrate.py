@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 
+from . import _cinterp
 from .pullpush import _UNRESOLVED_M, bin_points, pad_to_pyramid, pull_push
 
 # Shared numeric constants (imported by the pipeline).
@@ -104,6 +105,31 @@ class PercentileTransform(Transform):
         self.name: str = "percentile"
         self.valid: Callable[[np.ndarray], bool] = lambda _v: True
         self.q: np.ndarray | None = None if q is None else np.asarray(q, np.float64)
+        # C-interp slope tables, filled lazily by _cprep on first use.
+        self._c_ready: bool = False
+        self._slopes_q_to_p: np.ndarray | None = None
+        self._slopes_p_to_q: np.ndarray | None = None
+
+    def _cprep(self) -> bool:
+        """Prepare C-interp slope tables on first use.
+
+        Returns:
+            True when the C path may be used.
+
+        Idempotent and safe under concurrent first calls (block workers share
+        this instance): every racer computes the same tables and attribute
+        stores are atomic under the GIL.
+
+        """
+        if self.q is None or not _cinterp.available():
+            return False
+        if not self._c_ready:
+            p = self._p
+            with np.errstate(divide="ignore", invalid="ignore"):
+                self._slopes_q_to_p = (p[1:] - p[:-1]) / (self.q[1:] - self.q[:-1])
+                self._slopes_p_to_q = (self.q[1:] - self.q[:-1]) / (p[1:] - p[:-1])
+            self._c_ready = True
+        return True
 
     def fit(self, v: np.ndarray) -> PercentileTransform:
         """Fit quantiles from data.
@@ -146,6 +172,9 @@ class PercentileTransform(Transform):
             Percentile values in range 0-100.
 
         """
+        q = self.q
+        if q is not None and self._cprep():
+            return _cinterp.interp(v, q, self._p, self._slopes_q_to_p)
         return np.interp(v, self.q, self._p)
 
     def inv(self, p: np.ndarray) -> np.ndarray:
@@ -155,6 +184,9 @@ class PercentileTransform(Transform):
             Original-scale values.
 
         """
+        q = self.q
+        if q is not None and self._cprep():
+            return _cinterp.interp(p, self._p, q, self._slopes_p_to_q)
         return np.interp(p, self._p, self.q)
 
     def state(self) -> dict[str, Any]:

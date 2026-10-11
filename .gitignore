@@ -10,3 +10,6 @@ __pycache__/
 out/
 # Full-AU sparse point set (53 MB, generated; not shipped in the sdist either)
 data/au_gcc_sparse.csv
+
+# JIT-built C interop (ppgrid._cinterp); rebuilt on demand from cinterp.c
+ppgrid/_cinterp_c-*.so
