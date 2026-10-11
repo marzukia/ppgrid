@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.2] - 2026-10-11
 - Ingest (audit P0-2, 2026-10-09, decision (a)): the serial CSV read now pins `dtype=float64` on the wanted columns, mirroring the chunked parse. Both thread counts take pandas' identical C-parser float path, restoring the S3 bit-identity guarantee (pre-fix, `n_threads=1` vs `4` returned values 1-2 ULP apart on the pattern below). **Baseline change vs 0.4.1:** for columns that are entirely integer literals with |x| >= 2^58, `n_threads=1` results change by up to 2 ULP (1 ULP on most affected rows; e.g. the `9223372036854775807` literal now parses to 0x43e0000000000001 (2^63+2048) instead of the correctly-rounded 2^63). Columns with any non-integer literal, or all-integer with |x| < 2^53, are unchanged. Regression pins in `tests/test_turbo.py` (serial-vs-chunk bit-identity, per-token float-path reference, off-pattern guards).
 - CLI contract fixes (#77):
   - "stdout stays clean" now holds for every run: the turbo precheck summary goes through the `ppgrid` logger (stderr, INFO; suppressed by `--quiet` like all other progress lines) instead of stdout, and the sparse-output tile-skip counter in `_reproject_band` is a DEBUG log line (visible with `--verbose`), not a print.
@@ -52,7 +52,9 @@ All notable changes to this project will be documented in this file.
   - `turbop`: dead `RssBackstop` wiring removed; `tile_cache_tiles` renamed `write_scratch_tiles` (no runtime tile cache exists); `wall_range_s` is only used when the chosen regime matches the table row's regime (before, the tabled range could exclude the central estimate).
   - `_prof`: the `resource` import is defensive (non-Unix degrades to wall-only timing); the phase-line docstring matches the actual output format.
   - Docs: README CLI table gained `--max-band-parallel` and `--quiet`; the decode snippet reads the raster's scale tag instead of a hardcoded 100; design docs marked LANDED; stale test-count deltas in 0.4.1/[Unreleased] corrected; the 5 drifted melb example rasters regenerated (25/50/100/250m `value.tif` + 100m `support_km.tif`; the pinned 10m/500m anchors are unchanged).
-  - Tests: +5 (transform-choices pin, widened error map, parquet e2e via `importorskip`, CV edge derivation, saturation plumbing), −2 (dead `RssBackstop` pins), 3 updated for the exit-1 mid-write contract. Suite: 254.## [0.4.1] - 2026-10-09
+  - Tests: +5 (transform-choices pin, widened error map, parquet e2e via `importorskip`, CV edge derivation, saturation plumbing), −2 (dead `RssBackstop` pins), 3 updated for the exit-1 mid-write contract. Suite: 298.
+
+## [0.4.1] - 2026-10-09
 - CLI: `ppgrid help` command (exit 0) and an examples epilog on `--help` (RawDescriptionHelpFormatter). Bare `ppgrid` with no input now exits 2 with a concise error + hint to `ppgrid help` (the positional `input` is `nargs="?"`; `--help`/`--version` unchanged).
 - Leveled logging: progress goes to stderr via the `ppgrid` logger (root untouched, stdout stays clean). `--verbose` (shorthand for debug) + `--log-level {error,warning,info,debug}` (default info); env `LOGGING` (value `verbose` = debug). Precedence: flag > LOGGING > info. INFO = one line per phase + final summary; DEBUG = per-phase wall-time (ms) breakdown (time.perf_counter in `Pipeline.run`), volumetric detail (rows read, points ingested, NaN/inf dropped, cells/level, output bytes raw vs compressed + ratio, resolved plan).
 - Tests: +19 (`tests/test_cli_logging.py`): parser flag tests, level-precedence table, `help`/no-input dispatch via capsys, caplog INFO/DEBUG line assertions, and byte-identical GeoTIFFs with and without `--verbose` (logging is side-channel).
