@@ -90,6 +90,21 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# ppgrid/_cinterp.py is JIT-build glue: a subprocess cc call and module-level
+# backend state are the whole point; the strict rules fit its callers, not it.
+"ppgrid/_cinterp.py" = [
+    "suspicious-subprocess-import",   # S404: cc with fixed flags, no shell
+    "global-statement",     # module-level backend state (_mod/_reason/_build_err)
+    "subprocess-without-shell-equals-true",   # no shell, fixed argv
+    "subprocess-run-without-check",   # returncode checked explicitly
+    "raise-within-try",     # import-failure diagnostics
+    "try-consider-else",    # diagnostic bookkeeping
+    "type-check-without-type-error",    # capability probe (callable check)
+]
+# tests/test_cinterp.py pokes at private state (_mod, _p) on purpose.
+"tests/test_cinterp.py" = [
+    "private-member-access",    # fallback simulation + transform internals
+]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
 # tests/fixtures/*.py are runnable fixture generators; prints are the output.
