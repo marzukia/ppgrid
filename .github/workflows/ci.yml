@@ -38,6 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+        with:
+          # Pinned explicitly: CI must not depend on the runner's ambient
+          # Python. 3.13 = the version this repo develops on.
+          python-version: "3.13"
       - run: uv sync --all-extras --locked
       - run: uv run --extra dev ruff check .
       - run: uv run --extra dev ruff format --check .
