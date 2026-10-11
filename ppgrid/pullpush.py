@@ -333,18 +333,25 @@ def box_count_mt(
        each row's cumsum is the identical sequential op, and while the total
        stays below 2**24 the float32 partial sums are exactly representable
        (the int64 regime is exact in any order).
-    2. Column-window pass: the row prefix of the window sums, computed as a
-       contiguous cumsum over the transposed array instead of the strided
-       axis-0 cumsum (same addition sequence per element; the layout fix is
-       most of the speedup).
+    2. Column-window pass: the exclusive row prefix of the window sums.
+       Wide window (2r+1 <= n1): in place along axis 0 over the shared
+       workspace. numpy's cumsum is a sequential scan per output element,
+       so the in-place q[i+1, j] = q[i, j] + w[i, j] chain is the identical
+       addition sequence the old transpose -> cumsum -> transpose round
+       trip computed (bit-identical in both regimes).
+       Narrow window (r > (n1-1)/2): the fancy-gather window sum is
+       F-contiguous and a strided write into the C-order workspace is ~10x
+       slower than the no-out ufunc form, so the old fast layout is kept
+       there: materialized sum, contiguous per-row cumsum on the transposed
+       view, one final strided write (bit-identical, one buffer fewer).
     3. Final window subtract: elementwise, parallel over row chunks.
 
     n_threads=1 is bit-identical to box_count (A8). Peak transient memory,
-    tracemalloc-measured: float32 regime ~2 full arrays vs box_count's ~4
-    (each buffer is freed as soon as the next pass owns the data); int64
-    regime on float32 input (the pipeline case) ~5 vs ~5, parity, because
-    the int64 cast is held across pass 1 and the fancy-index copies set the
-    peak.
+    tracemalloc-measured: ~2 full arrays at any point (the prefix buffer and
+    the window/prefix workspace in passes 1-2, the workspace and the output
+    in pass 3). The wide branch first-touches three fresh buffers in total
+    (prefix, workspace, output) vs six before; the narrow branch five vs
+    six (the transposed cumsum buffer stays - see pass 2 note).
 
     Returns:
         Box-count array with the same shape as input. float32 (exact integer
@@ -368,38 +375,40 @@ def box_count_mt(
     p[:, 0] = 0
     _thread_bands(_split_bands(n0, n_threads), partial(_row_prefix_rows, p, c), n_threads)
 
-    lo = np.clip(np.arange(n1) - radius, 0, n1)
-    hi = np.clip(np.arange(n1) + radius + 1, 0, n1)
-    # Window sums into one preallocated buffer (issue #39). The index offsets
-    # are linear in the column position except at the clamped edges, so the
-    # interior and both edges are contiguous slice subtractions - no
-    # fancy-index gather temporaries. Bit-identical to p[:, hi] - p[:, lo]:
-    # same elementwise subtractions, same order.
-    w = np.empty((n0, n1), dtype)
-    _nohuge(w)
+    # Window sums + row prefix share one (n0+1, n1) workspace in the wide
+    # case: the body rows hold the window sums, row 0 (seeded 0) starts the
+    # exclusive prefix. The index offsets are linear in the column position
+    # except at the clamped edges, so the interior and both edges are
+    # contiguous slice subtractions - no fancy-index gather temporaries.
+    # Bit-identical to p[:, hi] - p[:, lo]: same elementwise subtractions,
+    # same order.
+    q = np.empty((n0 + 1, n1), dtype)
+    _nohuge(q)
+    q[0] = 0
+    w = q[1:]
     r = radius
     if 2 * r + 1 <= n1:
         np.subtract(p[:, r + 1 : 2 * r + 1], p[:, :1], out=w[:, :r])
         np.subtract(p[:, 2 * r + 1 :], p[:, : n1 - 2 * r], out=w[:, r : n1 - r])
         np.subtract(p[:, n1 : n1 + 1], p[:, n1 - 2 * r : n1 - r], out=w[:, n1 - r :])
+        del p
+        # Pass 2 (wide): in place along axis 0 (sequential scan per column =
+        # the old round trip's addition sequence).
+        np.cumsum(w, axis=0, dtype=dtype, out=w)
     else:
-        w = p[:, hi] - p[:, lo]
-    del p
-
-    # Pass 2: row prefix of the window sums, contiguous via the transpose.
-    wt = np.empty((n1, n0), dtype)
-    _nohuge(wt)
-    wt[:] = w.T
-    del w
-    qt = np.empty((n1, n0 + 1), dtype)
-    _nohuge(qt)
-    qt[:, 0] = 0
-    qt[:, 1:] = np.cumsum(wt, axis=1, dtype=dtype)
-    del wt
-    q = np.empty((n0 + 1, n1), dtype)
-    _nohuge(q)
-    q[:] = qt.T
-    del qt
+        # Pass 2 (narrow): materialized F-contiguous window sum + contiguous
+        # per-row cumsum on the transposed view + one final strided write.
+        lo = np.clip(np.arange(n1) - r, 0, n1)
+        hi = np.clip(np.arange(n1) + r + 1, 0, n1)
+        wsum = p[:, hi] - p[:, lo]
+        del p
+        qt = np.empty((n1, n0 + 1), dtype)
+        _nohuge(qt)
+        qt[:, 0] = 0
+        qt[:, 1:] = np.cumsum(wsum.T, axis=1, dtype=dtype)
+        del wsum
+        q[:] = qt.T
+        del qt
 
     # Pass 3: window subtract, elementwise over row chunks.
     lo = np.clip(np.arange(n0) - radius, 0, n0)
