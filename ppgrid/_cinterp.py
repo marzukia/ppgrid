@@ -54,19 +54,38 @@ _SRC: Path = Path(__file__).with_name("cinterp.c")
 _mod: object | None = None  # the imported C module, or None (fallback)
 _reason: str | None = None  # why the C module is unavailable (None = available)
 _build_err: str | None = None  # last compiler stderr, for diagnostics
+_TMPDIR_ROOT: Path = Path(tempfile.gettempdir()) / "ppgrid-cinterp"  # shared-tmpdir cache
 
 
 def _candidate_paths() -> list[Path]:
     """Where a compiled module may live, or be built (first writable wins)."""
     if not _SRC.is_file():
         return []
-    digest = hashlib.md5(_SRC.read_bytes()).hexdigest()[:12]  # ruff: ignore[hashlib-md5]
+    digest = hashlib.md5(_SRC.read_bytes()).hexdigest()[:12]  # ruff: ignore[hashlib-insecure-hash-function]
     name = f"_cinterp_c-{digest}{_SO_SUFFIX}"
     paths = [_SRC.parent / name]
     with suppress(OSError, RuntimeError):
         paths.append(Path.home() / ".cache" / "ppgrid" / name)
-    paths.append(Path(tempfile.gettempdir()) / "ppgrid-cinterp" / name)
+    paths.append(_TMPDIR_ROOT / name)
     return paths
+
+
+def _tmpdir_owned(path: Path) -> bool:
+    """Shared-tmpdir guard: the cache dir must be owned by our effective uid.
+
+    A sticky /tmp lets any local user create ``ppgrid-cinterp/`` first and
+    pre-place a file with our exact .so name; importing it would run their
+    code as the importing user. On mismatch, treat the candidate as absent.
+    """
+    if path.parent != _TMPDIR_ROOT:
+        return True
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return True  # no uid concept (non-POSIX): guard not applicable
+    try:
+        return path.parent.stat().st_uid == geteuid()
+    except OSError:
+        return True  # missing dir: the build loop creates it
 
 
 def _try_import(path: Path) -> bool:
@@ -134,11 +153,15 @@ def _load() -> None:
     # 1. existing build (delete a broken one and rebuild below)
     for path in cands:
         if path.is_file():
+            if not _tmpdir_owned(path):
+                continue  # shared tmpdir dir not owned by us: treat as absent
             if _try_import(path):
                 return
             path.unlink(missing_ok=True)
     # 2. JIT build into the first writable location
     for path in cands:
+        if not _tmpdir_owned(path):
+            continue
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -160,10 +183,10 @@ def interp(x: np.ndarray, xp: np.ndarray, fp: np.ndarray, slopes: np.ndarray) ->
 
     Args:
         x: f64 or f32 array (any shape); other dtypes fall back to np.interp.
-        xp: 1-D C-contiguous f64 sample points.
-        fp: 1-D C-contiguous f64 values, same length as xp.
+        xp: 1-D C-contiguous f64 sample points; non-f64 falls back to np.interp.
+        fp: 1-D C-contiguous f64 values, same length as xp; non-f64 falls back.
         slopes: 1-D C-contiguous f64, ``(fp[1:]-fp[:-1]) / (xp[1:]-xp[:-1])``,
-            precomputed by the caller.
+            precomputed by the caller; non-f64 falls back to np.interp.
 
     Returns:
         New f64 ndarray, same shape as x, bit-identical to
@@ -182,6 +205,8 @@ def interp(x: np.ndarray, xp: np.ndarray, fp: np.ndarray, slopes: np.ndarray) ->
         call = mod.interp_f32  # type: ignore[attr-defined]
     else:
         return np.interp(x, xp, fp)
+    if xp.dtype != np.float64 or fp.dtype != np.float64 or slopes.dtype != np.float64:
+        return np.interp(x, xp, fp)  # C kernel takes f64 tables only
     xp_c = _as_contig(xp)
     fp_c = _as_contig(fp)
     sl_c = _as_contig(slopes)

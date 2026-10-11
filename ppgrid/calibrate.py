@@ -154,11 +154,17 @@ class PercentileTransform(Transform):
             c = float(v[0])
             sp = max(np.spacing(abs(c) + 1.0), abs(c) * 2e-2)
             self.q = c + (np.arange(self.NQ) - self.NQ // 2) * sp
-            return self
-        q = np.quantile(v, np.linspace(0, 1, self.NQ))
-        self.q = np.maximum.accumulate(q)
-        eps = np.arange(self.NQ) * np.spacing(np.abs(self.q).max() + 1.0)
-        self.q += eps
+        else:
+            q = np.quantile(v, np.linspace(0, 1, self.NQ))
+            self.q = np.maximum.accumulate(q)
+            eps = np.arange(self.NQ) * np.spacing(np.abs(self.q).max() + 1.0)
+            self.q += eps
+        # A re-fit invalidates the C-interp slope tables built from the old q;
+        # reset them so _cprep rebuilds before the next fwd/inv (silent wrong
+        # values otherwise: new q mixed with old slopes).
+        self._c_ready = False
+        self._slopes_q_to_p = None
+        self._slopes_p_to_q = None
         return self
 
     @property

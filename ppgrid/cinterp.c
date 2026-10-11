@@ -242,7 +242,9 @@ static int
 is_nondecreasing(const double *dx, const intp lenxp)
 {
     for (intp i = 1; i < lenxp; ++i) {
-        if (dx[i] < dx[i - 1]) {
+        /* NaN-aware: !(a >= b) is true when either operand is NaN, so a
+         * NaN-containing xp routes to the verbatim numpy search clone. */
+        if (!(dx[i] >= dx[i - 1])) {
             return 0;
         }
     }
