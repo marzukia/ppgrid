@@ -693,40 +693,59 @@ def _process_block(
         Tuple of block coords and the (value, support) DN grids, or None when
         the block neighbourhood has no points (written as nodata).
 
+    When the run set ``_CTX["dn"]`` to the (value, support) tmpfs DN-field
+    pair (the turbo write path), the DN grids are written from this worker
+    thread straight into the block's disjoint window. The main thread used to
+    write them back as results arrived and sat on the critical path ahead of
+    the pool (issue #84); block windows are disjoint, so the writes are
+    thread-safe and the final fields are byte-identical.
+
     """
     bx, by = args
     cfg = _CTX["cfg"]
     if cfg.shared:
-        return bx, by, _block_shared(cfg, bx, by)
-    i0, j0, i1, j1 = _block_bounds(bx, by, cfg.bsize, cfg.nx, cfg.ny)
-    hi0, hj0, hi1, hj1 = _snapped_box(i0, j0, i1, j1, cfg.halo, 1 << cfg.levels, cfg.nx_padded, cfg.ny_padded)
+        grids = _block_shared(cfg, bx, by)
+    else:
+        i0, j0, i1, j1 = _block_bounds(bx, by, cfg.bsize, cfg.nx, cfg.ny)
+        hi0, hj0, hi1, hj1 = _snapped_box(i0, j0, i1, j1, cfg.halo, 1 << cfg.levels, cfg.nx_padded, cfg.ny_padded)
 
-    sel = _block_points(cfg, bx, by)
-    if sel.shape[1] == 0:
-        return bx, by, None
+        sel = _block_points(cfg, bx, by)
+        if sel.shape[1] == 0:
+            return bx, by, None
 
-    ix = ((sel[PTS_X] - cfg.x0) // cfg.res).astype(np.int64)
-    iy = ((sel[PTS_Y] - cfg.y0) // cfg.res).astype(np.int64)
-    m = (ix >= hi0) & (ix < hi1) & (iy >= hj0) & (iy < hj1)
-    if not m.any():
-        return bx, by, None
+        ix = ((sel[PTS_X] - cfg.x0) // cfg.res).astype(np.int64)
+        iy = ((sel[PTS_Y] - cfg.y0) // cfg.res).astype(np.int64)
+        m = (ix >= hi0) & (ix < hi1) & (iy >= hj0) & (iy < hj1)
+        if not m.any():
+            return bx, by, None
 
-    iloc = ix[m] - hi0
-    jloc = iy[m] - hj0
-    tv = sel[PTS_TV][m]
+        iloc = ix[m] - hi0
+        jloc = iy[m] - hj0
+        tv = sel[PTS_TV][m]
 
-    s, c_grid = bin_points(iloc, jloc, tv, hi1 - hi0, hj1 - hj0)
-    val, sup = pull_push(s, c_grid, cfg.res, cfg.levels, saturation=cfg.sat)
+        s, c_grid = bin_points(iloc, jloc, tv, hi1 - hi0, hj1 - hj0)
+        val, sup = pull_push(s, c_grid, cfg.res, cfg.levels, saturation=cfg.sat)
 
-    # Mask from exact radius query
-    cap_cells = round(cfg.cap_km * M_PER_KM / cfg.res)
-    near = box_count(c_grid, cap_cells) > 0
+        # Mask from exact radius query
+        cap_cells = round(cfg.cap_km * M_PER_KM / cfg.res)
+        near = box_count(c_grid, cap_cells) > 0
 
-    # Extract output window
-    a0 = i0 - hi0
-    b0 = j0 - hj0
-    sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
-    return bx, by, _quantize(cfg, val[sl], sup[sl], near[sl])
+        # Extract output window
+        a0 = i0 - hi0
+        b0 = j0 - hj0
+        sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
+        grids = _quantize(cfg, val[sl], sup[sl], near[sl])
+
+    dn = _CTX.get("dn")
+    if dn is not None:
+        vq, rq = grids
+        val_dn, sup_dn = dn
+        w = _block_window(bx, by, cfg)
+        rows = slice(w.row_off, w.row_off + w.height)
+        cols = slice(w.col_off, w.col_off + w.width)
+        val_dn[rows, cols] = vq.T[::-1, :]
+        sup_dn[rows, cols] = rq.T[::-1, :]
+    return bx, by, grids
 
 
 def _block_neighbourhood_nonempty(
@@ -3259,19 +3278,21 @@ class Pipeline:
                     with _WallPhase("descent", self._phase_wall):
                         if self._prepare_shared():
                             cfg.shared = True
-                    with (
-                        _WallPhase("interpolate", self._phase_wall),
-                        ThreadPoolExecutor(max_workers=self.workers) as ex,
-                    ):
-                        for bx, by, out in ex.map(_process_block, self.tasks):
-                            w = _block_window(bx, by, self.cfg)
-                            if out is None:
-                                continue  # already NODATA
-                            rows = slice(w.row_off, w.row_off + w.height)
-                            cols = slice(w.col_off, w.col_off + w.width)
-                            vq, rq = out
-                            val_dn[rows, cols] = vq.T[::-1, :]
-                            sup_dn[rows, cols] = rq.T[::-1, :]
+                    # The workers write the DN grids straight into the tmpfs
+                    # fields (issue #84): the main thread used to do those
+                    # copies as results arrived and sat on the critical path
+                    # ahead of the pool. Block windows are disjoint, so the
+                    # writes are thread-safe and the fields are byte-identical.
+                    _CTX["dn"] = (val_dn, sup_dn)
+                    try:
+                        with (
+                            _WallPhase("interpolate", self._phase_wall),
+                            ThreadPoolExecutor(max_workers=self.workers) as ex,
+                        ):
+                            for _ in ex.map(_process_block, self.tasks):
+                                pass
+                    finally:
+                        del _CTX["dn"]
                     # The shared field is dead after the block loop: free it
                     # before the reproject/write (val/sup f32 + near bool,
                     # ~13.7 GB at full-AU scale) (issue #39).
