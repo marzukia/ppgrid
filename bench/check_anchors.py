@@ -10,8 +10,8 @@ compiler FP differences in the C interp) that array-compare would miss
 
 Config selection is by name against bench/bench_tier2.py's CONFIGS table,
 so bigger configs (equakes500, equakes_auto) can be added where RAM allows:
-they peak at 8.1-8.4 GB on hydrogen (measured 2026-10-12) and do not fit
-the 4 GB windows-latest runner; they stay Linux/hydrogen-anchored via
+they peak at 8.1-8.4 GB on hydrogen (measured 2026-10-12) and stay out of
+the CI anchor scope; they remain Linux/hydrogen-anchored via
 compare_tier2.py.
 
 Usage (from the repo root, or anywhere — it chdirs itself):
@@ -102,6 +102,10 @@ def main() -> int:
             for band, anchor_rel in zip(("value.tif", "support_km.tif"), ANCHORS[name], strict=True):
                 got = outdir / name / band
                 want = REPO / anchor_rel
+                if not want.is_file():
+                    print(f"[FAIL] {name}/{band}: missing committed anchor {anchor_rel}")
+                    ok = False
+                    continue
                 if not got.is_file():
                     print(f"[FAIL] {name}/{band}: no output file")
                     ok = False

@@ -25,9 +25,12 @@ byte differs from the committed `examples/` anchors.
   - CI: macos-latest, all 4 Pythons + anchor gate (proves the cross-OS
     C-build bytes).
 - **Windows** (amd64 CI)
-  - No C compiler on the stock runner: the bit-identical np.interp
-    fallback is the verified path. If a C compiler is on PATH the JIT
-    engages automatically; outputs stay byte-identical either way.
+  - windows-latest (windows-2025) ships MinGW-w64 gcc (15.x) on the
+    machine PATH, so the CI leg JIT-builds cinterp.c: the verified path
+    on Windows is the C build, including its anchor bytes. The
+    bit-identical np.interp fallback is exercised by unit tests on every
+    OS and engages automatically where no compiler exists; outputs stay
+    byte-identical either way.
   - CI: windows-latest, all 4 Pythons + anchor gate.
 
 The interpolation math is backend-agnostic by construction (the C kernel is

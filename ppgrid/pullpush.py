@@ -41,7 +41,10 @@ _MADV_NOHUGEPAGE = 15
 try:
     _PAGE = os.sysconf("SC_PAGE_SIZE")
 except (AttributeError, OSError, ValueError):
-    _PAGE = 4096  # non-POSIX fallback (Windows supports sysconf; this is belt and braces)
+    # SC_PAGE_SIZE is documented Unix-only (ValueError possible on Windows);
+    # the try/except above covers every failure mode, and _PAGE is unused
+    # there anyway (_MADVISE is None, so _nohuge returns before touching it).
+    _PAGE = 4096
 # Windows: CDLL(None) is kernel32, which has no madvise — the advice is a
 # no-op there, so probe once and skip (byte-identical on POSIX: same
 # function pointer, same call; on macOS madvise(15) returns EINVAL and is
