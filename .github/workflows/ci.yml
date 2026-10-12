@@ -23,9 +23,11 @@ jobs:
   # `uv sync --all-extras --locked` never needs a source build.
   #
   # Anchor gate: every leg re-runs the CI-safe configs (melb10 + melb500,
-  # 2.4 GB peak RSS measured) and fails on any byte difference vs the
-  # committed examples/ anchors — cross-OS writer drift (GDAL/zstd/libtiff
-  # build deltas) is a leg failure, not a warning. equakes-scale anchors
+  # 2.4 GB peak RSS measured) and fails when outputs drift from the
+  # committed examples/ anchors — byte-exact on canonical x86_64 Linux,
+  # functional-equivalence (grid/metadata + decoded pixels) on the other
+  # legs. Cross-OS writer drift (GDAL/zstd/libtiff build deltas) is a leg
+  # failure, not a warning. equakes-scale anchors
   # (8.1-8.4 GB peak) stay out of the CI anchor scope (Linux/hydrogen-
   # verified via compare_tier2.py); melb10+melb500 are the conservative
   # CI-safe choice.
@@ -46,7 +48,7 @@ jobs:
       - run: uv run --extra dev ruff check .
       - run: uv run --extra dev ruff format --check .
       - run: uv run pytest
-      - name: Anchor gate (outputs must be byte-identical to committed examples)
+      - name: Anchor gate (byte-exact on canonical x86_64 Linux; functional-equivalence elsewhere)
         run: uv run python bench/check_anchors.py
 
   # Pushes to main: GitHub-hosted, single leg (review m6: matrix is PR-only).

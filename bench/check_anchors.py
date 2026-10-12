@@ -14,9 +14,9 @@ On non-canonical platforms (macOS arm64, Windows, aarch64 Linux) the vendored
 PROJ/GDAL/zstd wheels emit different (functionally equivalent) tile bytes, so a
 byte gate would always fail. There the gate falls back to functional
 equivalence: identical grid/metadata (crs, size, dtype, nodata; transform
-within last-ulp tolerance — cross-OS PROJ builds drift ~1 ULP) and
-near-identical decoded pixels (<=0.5% of cells, each by <=4 DN). A sha match
-still passes on any platform (the fast path).
+within the measured cross-OS drift bound — cross-OS PROJ builds drift up to
+thousands of ULP) and near-identical decoded pixels (<=0.5% of cells, each
+by <=4 DN). A sha match still passes on any platform (the fast path).
 
 Config selection is by name against bench/bench_tier2.py's CONFIGS table,
 so bigger configs (equakes500, equakes_auto) can be added where RAM allows:
@@ -76,17 +76,19 @@ def _sha256(path: Path) -> str:
 
 
 def _transforms_equivalent(t_a: rasterio.transform.Affine, t_b: rasterio.transform.Affine) -> bool:
-    """Per-coefficient transform compare with last-ulp tolerance.
+    """Per-coefficient transform compare with a measured cross-OS drift bound.
 
-    Cross-OS PROJ/warp builds drift the pixel-size coefficients by ~1 ULP
-    (e.g. 538.1210527474219 vs 538.121052747422 on macOS arm64, CI run
-    38205315707); an exact transform match is unachievable across PROJ
-    builds. Measured drift: 1 ULP (5.7e-14) on macOS arm64, 3.9e-8 m on
-    Windows x64 (CI run 38215575734 C2). abs_tol=1e-7 (0.1 um) covers the
-    Windows drift with ~2.5x headroom while staying far below physical
-    meaning at pixel scale. rel_tol=1e-8 bounds the measured windows-3.11
-    pyproj origin drift (coef f, 1.13e-3 m at ~1.1e6 m, rel ~1e-9, CI run
-    38218917436) with 10x margin — still ~1e-6 of a 538 m pixel.
+    The bound is the worst measured cross-OS drift plus margin, not a
+    last-ulp bound: cross-OS PROJ/warp builds drift the transform
+    coefficients by 1 ULP on macOS arm64 (538.1210527474219 vs
+    538.121052747422, CI run 38205315707) and by thousands of ULP on
+    windows-3.11 (origin coef f, 1.13e-3 m at ~1.1e6 m, rel ~1e-9, CI run
+    38218917436); an exact transform match is unachievable across PROJ
+    builds. abs_tol=1e-7 (0.1 um) covers the windows x64 pixel-size drift
+    (3.9e-8 m, CI run 38215575734 C2) with ~2.5x headroom while staying
+    far below physical meaning at pixel scale. rel_tol=1e-8 bounds the
+    measured windows-3.11 origin drift with 10x margin — still ~1e-6 of a
+    538 m pixel.
 
     """
     return all(math.isclose(x, y, rel_tol=1e-8, abs_tol=1e-7) for x, y in zip(t_a[:6], t_b[:6], strict=True))
@@ -98,10 +100,12 @@ def _functional_equivalent(got: Path, want: Path) -> bool:
     Cross-OS tile bytes differ (vendored GDAL/zstd encoder), so compare the
     decoded arrays with a tight tolerance instead of raw bytes: grid, CRS,
     dtype and nodata must match exactly, and the transform must match within
-    last-ulp tolerance (cross-OS PROJ/warp builds compute the grid transform
-    ~1 ULP apart — exact transform match is unachievable across PROJ builds).
+    the measured cross-OS drift bound (cross-OS PROJ/warp builds compute the
+    grid transform up to thousands of ULP apart — exact transform match is
+    unachievable across PROJ builds).
     The DN values may differ only in a vanishing fraction of cells by a
-    vanishing amount (last-ulp FP drift from the platform PROJ/warp build).
+    vanishing amount (cross-OS encoder/FP drift from the platform PROJ/warp
+    build).
     A real regression moves many cells or moves them far; encoder/FP drift
     moves almost none by almost nothing.
 

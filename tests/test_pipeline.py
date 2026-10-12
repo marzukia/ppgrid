@@ -96,6 +96,55 @@ def test_halo_exceeds_block_error(tmp_path: Path) -> None:
         p.grid()
 
 
+def test_halo_exceeds_block_run_survives_finally(tmp_path: Path) -> None:
+    """Halo > bsize via run(): the original ValueError survives the finally.
+
+    run()'s finally calls _remove_run_temps() -> _release_run_fields(),
+    which touches self.cfg — only assigned at the end of grid(). When
+    grid() raises the halo check, cfg must be None (initialised in
+    __init__), not absent: the pre-fix AttributeError in the finally
+    masked the original ValueError and the CLI mapped it to exit 1
+    instead of 2 (review rev-os2 M1).
+    """
+    csv = tmp_path / "data.csv"
+    csv.write_text("value,longitude,latitude\n1.0,0.0,0.0\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # same halo/bsize setup as test_halo_exceeds_block_error
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out_dir),
+        cap_km=1.0,
+        block_size=3,
+        skip_calibration=True,
+    )
+    with pytest.raises(ValueError, match=r"halo.*exceeds block size"):
+        p.run()
+    assert not (out_dir / "_points.npy").exists()
+
+
+def test_cli_halo_exceeds_block_exit_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16/M1: halo > bsize via CLI is a clean validation error, exit 2."""
+    csv = tmp_path / "data.csv"
+    csv.write_text("value,longitude,latitude\n1.0,0.0,0.0\n")
+    code, err = _run_cli(
+        capsys,
+        str(csv),
+        "-o",
+        str(tmp_path / "out"),
+        "--cap-km",
+        "1",
+        "--block",
+        "3",
+        "--skip-calibration",
+    )
+    assert code == 2, f"expected exit 2 (validation), got {code}: {err!r}"
+    _assert_clean_error(code, err, "exceeds block size")
+
+
 def test_percentile_step_validation(tmp_path: Path) -> None:
     """Pipeline rejects percentile_step outside (0, 100]."""
     csv = tmp_path / "data.csv"
@@ -819,18 +868,19 @@ ANCHOR = Path(__file__).parent / "fixtures" / "auto_anchor"
 
 
 def _assert_transform_equivalent(t_a: Affine, t_b: Affine, name: str) -> None:
-    """Per-coefficient transform compare with last-ulp tolerance.
+    """Per-coefficient transform compare with a measured cross-OS drift bound.
 
-    Cross-OS PROJ/warp builds drift the pixel-size coefficients by ~1 ULP
-    (e.g. 538.1210527474219 vs 538.121052747422 on macOS arm64, CI run
-    38205315707); an exact transform assert is unachievable across PROJ
-    builds. Measured drift: 1 ULP (5.7e-14) on macOS arm64, 3.9e-8 m on
-    Windows x64 (CI run 38215575734 C2). abs_tol=1e-7 (0.1 um) covers the
-    Windows drift with ~2.5x headroom while staying far below physical
-    meaning at pixel scale (hundreds of metres per pixel). rel_tol=1e-8
-    bounds the measured windows-3.11 pyproj origin drift (coef f, 1.13e-3 m
-    at ~1.1e6 m, rel ~1e-9, CI run 38218917436) with 10x margin — still
-    ~1e-6 of a 538 m pixel.
+    The bound is the worst measured cross-OS drift plus margin, not a
+    last-ulp bound: cross-OS PROJ/warp builds drift the transform
+    coefficients by 1 ULP on macOS arm64 (538.1210527474219 vs
+    538.121052747422, CI run 38205315707) and by thousands of ULP on
+    windows-3.11 (origin coef f, 1.13e-3 m at ~1.1e6 m, rel ~1e-9, CI run
+    38218917436); an exact transform assert is unachievable across PROJ
+    builds. abs_tol=1e-7 (0.1 um) covers the windows x64 pixel-size drift
+    (3.9e-8 m, CI run 38215575734 C2) with ~2.5x headroom while staying
+    far below physical meaning at pixel scale (hundreds of metres per
+    pixel). rel_tol=1e-8 bounds the measured windows-3.11 origin drift
+    with 10x margin — still ~1e-6 of a 538 m pixel.
 
     """
     for coef, (x, y) in zip("abcdef", zip(t_a[:6], t_b[:6], strict=True), strict=True):
@@ -843,11 +893,11 @@ def _assert_rasters_equivalent(out_path: Path, ref_path: Path) -> None:
     Cross-OS tile bytes differ (vendored GDAL/zstd encoder), so compare the
     decoded arrays with a tight tolerance instead of raw bytes: width, height,
     count, dtype, CRS and nodata must match exactly, the transform must match
-    within last-ulp tolerance (cross-OS PROJ/warp builds compute the grid
-    transform ~1 ULP apart — exact transform match is unachievable across
-    PROJ builds), and the DN values may differ only in a vanishing fraction
-    of cells by a vanishing amount (last-ulp FP drift from the platform
-    PROJ/warp build).
+    within the measured cross-OS drift bound (cross-OS PROJ/warp builds
+    compute the grid transform up to thousands of ULP apart — exact transform
+    match is unachievable across PROJ builds), and the DN values may differ
+    only in a vanishing fraction of cells by a vanishing amount (cross-OS
+    encoder/FP drift from the platform PROJ/warp build).
 
     """
     with rasterio.open(out_path) as a, rasterio.open(ref_path) as b:
