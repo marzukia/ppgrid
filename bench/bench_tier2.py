@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
-import resource
+import sys
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -27,6 +27,24 @@ from pyproj import Transformer
 
 import ppgrid.idwgrid as ig
 from ppgrid.idwgrid import Pipeline
+
+# POSIX-only stdlib module; the bench degrades to no-RSS reporting elsewhere.
+# (Windows CI runs the anchor configs through this harness.)
+try:
+    import resource
+except ImportError:  # pragma: no cover - platform specific
+    resource = None  # type: ignore[assignment]
+
+
+def _peak_rss_mb() -> float:
+    """Process peak RSS in MB (0 where the platform cannot report it)."""
+    if resource is None:
+        return 0.0
+    v = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return round(v / 1_000_000, 1)  # macOS reports bytes
+    return round(v / 1024, 1)  # Linux reports KiB
+
 
 TR = Transformer.from_crs(4326, 6933, always_xy=True)
 
@@ -182,7 +200,7 @@ def run_config(name: str, csv: str, kw: dict, outdir: Path) -> dict:
         "t_blockloop_cpu": round(_TIMERS["block_cpu"], 3),
         "t_write_total": round(t_write, 3),
         "t_total": round(total, 3),
-        "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),
+        "peak_rss_mb": _peak_rss_mb(),
     }
 
 

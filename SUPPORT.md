@@ -7,11 +7,32 @@
   classifiers 3.11-3.14). Versions outside 3.11-3.14 are unsupported: the
   lockfile is only verified to resolve there, and no fixes will be targeted at
   them.
-- **OS**: Linux is the primary target and is covered by CI on every PR; macOS
-  is a supported target but has no CI leg yet (declare it in release notes only
-  after a macOS leg is green). The C-interp extension
-  JIT-builds via `cc`/`gcc`/`clang` and falls back to `np.interp` (bit-identical)
-  when no compiler is available.
+
+## Operating Systems
+
+Every OS runs the full test suite in CI on all four Pythons, plus a byte-
+identity anchor gate (`bench/check_anchors.py`) that re-runs the CI-safe
+configs (melb10 + melb500, 2.4 GB peak) and fails the leg if any output
+byte differs from the committed `examples/` anchors.
+
+- **Linux** (primary target)
+  - C interp JIT active (cc/gcc); np.interp fallback if no compiler.
+  - CI: ubuntu-latest, all 4 Pythons + anchor gate.
+  - equakes-scale runs verified here (8.1-8.4 GB peak RSS on hydrogen;
+    too big for the CI runners).
+- **macOS** (arm64 CI)
+  - C interp JIT active (clang); np.interp fallback if no compiler.
+  - CI: macos-latest, all 4 Pythons + anchor gate (proves the cross-OS
+    C-build bytes).
+- **Windows** (amd64 CI)
+  - No C compiler on the stock runner: the bit-identical np.interp
+    fallback is the verified path. If a C compiler is on PATH the JIT
+    engages automatically; outputs stay byte-identical either way.
+  - CI: windows-latest, all 4 Pythons + anchor gate.
+
+The interpolation math is backend-agnostic by construction (the C kernel is
+bit-identical to np.interp, pinned by the test suite), so results do not
+depend on which OS or backend produced them.
 
 ## Getting Help
 
