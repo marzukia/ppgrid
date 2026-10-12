@@ -2303,6 +2303,14 @@ class Pipeline:
             pts[PTS_Y] = self.y[order]
             pts[PTS_TV] = self.tv[order]
             pts.flush()
+            # Drop the reference now, not at frame end: the write phase
+            # re-opens the file (mmap read). On Windows the OS handle
+            # stays open while the mmap object is alive, and a frame
+            # pinned by an in-flight traceback would keep _points.npy
+            # locked past _remove_run_temps (WinError 32, CI run
+            # 38207801346 W1). numpy 2.4+ has no memmap.close() API;
+            # CPython refcounting releases the handle.
+            pts = None
 
         # Task list (one pass: blocks whose 3x3 neighbourhood holds points
         # are computed, the rest are written as nodata)
@@ -2673,10 +2681,39 @@ class Pipeline:
         except Exception:  # ruff: ignore[blind-except, try-except-pass] — logging must never fail a successful run
             pass
 
-    def _remove_run_temps(self) -> None:
-        """Remove every run temp file in out_dir (idempotent, best effort)."""
+    def _remove_run_temps(self, keep: tuple[str, ...] = ()) -> None:
+        """Remove every run temp file in out_dir (idempotent, best effort).
+
+        `keep` names files that the caller still holds open (the turbo DN
+        fields are live memmaps through the write phase; the final cleanup
+        from run()'s finally removes them once the run ends).
+
+        The main process's own memmaps are released first: on Windows an
+        mmap holds an OS file handle until close(), and unlinking a held
+        file raises WinError 32, which would mask the real run error and
+        break the CLI exit codes (CI run 38207801346 W1). The unlink
+        errors themselves are never swallowed.
+
+        """
+        self._release_run_fields()
+        out = Path(self.out_dir)
         for fname in _RUN_TEMP_FILES:
-            (Path(self.out_dir) / fname).unlink(missing_ok=True)
+            if fname in keep:
+                continue
+            (out / fname).unlink(missing_ok=True)
+
+    def _release_run_fields(self) -> None:
+        """Drop the main-process references held on cfg (idempotent).
+
+        Worker-pool handles are per-process and die with the workers; only
+        the main process's fields can still be open at cleanup time. The
+        fields are plain ndarrays in the in-RAM regime and memmaps in the
+        memmap regime; dropping the last reference releases the OS handle
+        (numpy 2.4+ has no memmap.close() API; CPython refcounting).
+
+        """
+        for field in ("pts", "val_full", "sup_full", "near_full"):
+            setattr(self.cfg, field, None)
 
     def _resolve_turbo_cap(self) -> tuple[float, str]:
         """Resolve the turbo RAM cap with the cgroup-aware preset clamp (M-2).
@@ -2937,6 +2974,13 @@ class Pipeline:
             else:
                 with _prof.phase("shared.boxcount"):
                     near_full = box_count(c0, cap_cells) > 0
+
+        # pts is fully consumed above (ix/iy copies + the binned TV row).
+        # Drop the reference here, not at frame end: on Windows the OS
+        # handle stays open while the mmap object is alive, and a frame
+        # pinned by an in-flight traceback would keep _points.npy locked
+        # past _remove_run_temps (WinError 32, CI run 38207801346 W1).
+        pts = None
 
         with _prof.phase("shared.pyramid"):
             sums: list[np.ndarray] = [s0]
@@ -3320,8 +3364,11 @@ class Pipeline:
                     cfg.val_full = cfg.sup_full = cfg.near_full = None
             # Same position as before the restructure: the DN fields are
             # still open memmaps (the inode outlives the unlink), but the
-            # tmpfs space is freed while the write phase runs.
-            self._remove_run_temps()
+            # tmpfs space is freed while the write phase runs. The two DN
+            # files stay out of this mid-removal: on Windows an unlink of a
+            # held mmap is WinError 32; run()'s final cleanup removes them
+            # once the warp phase has dropped the handles.
+            self._remove_run_temps(keep=("_val_dn.npy", "_sup_dn.npy"))
 
             # Both bands share the same work-CRS source grid (identical
             # bounds/size), so the output grid is identical too: compute the

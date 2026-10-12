@@ -113,6 +113,11 @@ ignore = [
     "subprocess-without-shell-equals-true",   # no shell, fixed argv
     "subprocess-run-without-check",   # returncode checked explicitly
 ]
+# tests/test_tier2_shared.py wraps _prepare_shared to capture the per-box refs
+# before the write phase releases cfg.pts (Windows WinError 32 fix).
+"tests/test_tier2_shared.py" = [
+    "private-member-access",    # harness wraps _prepare_shared
+]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
 # tests/fixtures/*.py are runnable fixture generators; prints are the output.
