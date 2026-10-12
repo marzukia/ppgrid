@@ -7,7 +7,9 @@
   classifiers 3.11-3.14). Versions outside 3.11-3.14 are unsupported: the
   lockfile is only verified to resolve there, and no fixes will be targeted at
   them.
-- **OS**: Linux and macOS are the primary targets; the C-interp extension
+- **OS**: Linux is the primary target and is covered by CI on every PR; macOS
+  is a supported target but has no CI leg yet (declare it in release notes only
+  after a macOS leg is green). The C-interp extension
   JIT-builds via `cc`/`gcc`/`clang` and falls back to `np.interp` (bit-identical)
   when no compiler is available.
 
