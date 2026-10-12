@@ -215,6 +215,36 @@ def test_fallback_when_c_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     assert np.array_equal(_bits(np.interp(xi, np.arange(100.0), np.arange(100.0))), _bits(out_i))
 
 
+def test_no_compiler_on_path_falls_back(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> None:
+    """No cc/gcc/clang on PATH (stock Windows runners): clean fallback.
+
+    The probe's subprocess.run raises FileNotFoundError; _load() records a
+    named reason and the package keeps working via np.interp, bit-for-bit.
+    """
+    cache = tmp_path / "ppgrid-cinterp"
+    cache.mkdir()
+    monkeypatch.setattr(ci, "_candidate_paths", lambda: [cache / f"_cinterp_c-{'0' * 12}{ci._SO_SUFFIX}"])
+    monkeypatch.setattr(ci, "_mod", None)
+    monkeypatch.setattr(ci, "_reason", None)
+    monkeypatch.setattr(ci, "_build_err", None)
+
+    def _no_compiler(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(ci.subprocess, "run", _no_compiler)
+    ci._load()
+    assert not ci.available()
+    assert ci._mod is None
+    assert "no working C compiler" in ci.reason()
+    # the fallback stays bit-exact with np.interp
+    rng = np.random.default_rng(SEED + 8)
+    q = _fitted_q(10_000)
+    p = np.linspace(0.0, 100.0, 1001)
+    x = rng.lognormal(17.0, 0.4, 50_000)
+    assert np.array_equal(_bits(np.interp(x, q, p)), _bits(ci.interp(x, q, p, _slopes(q, p))))
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="uid-based guard is POSIX-only (a no-op on Windows)")
 def test_tmpdir_owner_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> None:
     """A shared tmpdir cache dir owned by another uid is treated as absent."""
     root = tmp_path / "ppgrid-cinterp"

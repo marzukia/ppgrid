@@ -58,6 +58,20 @@ from ppgrid.pullpush import bin_points, box_count_banded
 DATA_CSV = Path(pipeline_mod.__file__).resolve().parent.parent / "data" / "melb_houses.csv"
 
 
+def _ingest_pool_context() -> mp.context:
+    """Start method for the ingest-pool tests.
+
+    forkserver where the platform has it (review m11: the pytest parent is
+    multithreaded, and fork() from a multithreaded process raises
+    DeprecationWarning on Python 3.13+). Windows has no forkserver — spawn
+    is the only start method there and re-executes the identical parse.
+    """
+    try:
+        return mp.get_context("forkserver")
+    except ValueError:
+        return mp.get_context("spawn")
+
+
 def _sha(p: str | Path) -> str:
     """sha256 hex digest of a file."""
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
@@ -169,7 +183,7 @@ def test_ingest_mt_matches_single_parse(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(
         pipeline_mod,
         "ProcessPoolExecutor",
-        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+        partial(_ProcessPoolExecutor, mp_context=_ingest_pool_context()),
     )
     csv = tmp_path / "edge.csv"
     n = 500_000
@@ -272,7 +286,7 @@ def test_ingest_bigint_serial_bit_identical_to_chunk(tmp_path: Path, monkeypatch
     monkeypatch.setattr(
         pipeline_mod,
         "ProcessPoolExecutor",
-        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+        partial(_ProcessPoolExecutor, mp_context=_ingest_pool_context()),
     )
     monkeypatch.setattr(pipeline_mod, "_INGEST_MIN_CHUNK_ROWS", 1)
     csv = tmp_path / "bigint.csv"
@@ -342,7 +356,7 @@ def test_ingest_float_pin_no_change_off_pattern(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(
         pipeline_mod,
         "ProcessPoolExecutor",
-        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+        partial(_ProcessPoolExecutor, mp_context=_ingest_pool_context()),
     )
     monkeypatch.setattr(pipeline_mod, "_INGEST_MIN_CHUNK_ROWS", 1)
 
