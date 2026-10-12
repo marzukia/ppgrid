@@ -105,6 +105,14 @@ ignore = [
 "tests/test_cinterp.py" = [
     "private-member-access",    # fallback simulation + transform internals
 ]
+# tests/test_os_portability.py simulates other OSes: it pokes private state
+# (_MADVISE, _STATE, _read_physical_gb) and runs the venv interpreter directly.
+"tests/test_os_portability.py" = [
+    "private-member-access",    # degraded-state pokes
+    "suspicious-subprocess-import",   # S404: own interpreter, fixed argv
+    "subprocess-without-shell-equals-true",   # no shell, fixed argv
+    "subprocess-run-without-check",   # returncode checked explicitly
+]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
 # tests/fixtures/*.py are runnable fixture generators; prints are the output.
