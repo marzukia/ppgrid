@@ -20,6 +20,7 @@ import subprocess  # ruff: ignore[suspicious-subprocess-import] — git rev-pars
 import sys
 import threading
 import time
+import traceback
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -1936,7 +1937,10 @@ class Pipeline:
         self.tasks: list[tuple[int, int]]
         self.empty_blocks: list[tuple[int, int]]
         self.pts_path: Path
-        self.cfg: _WorkerConfig
+        # None until grid() builds the worker config: run()'s finally
+        # cleanup must not raise AttributeError when grid() failed first
+        # (review rev-os2 M1: the mask hid the original ValueError).
+        self.cfg: _WorkerConfig | None = None
         self._cal: dict[str, Any] | None
 
     @property
@@ -2711,7 +2715,13 @@ class Pipeline:
         memmap regime; dropping the last reference releases the OS handle
         (numpy 2.4+ has no memmap.close() API; CPython refcounting).
 
+        cfg is None when grid() raised before building it (halo > bsize
+        etc.); the finally cleanup must release what exists, not raise
+        AttributeError on the absent config (review rev-os2 M1).
+
         """
+        if self.cfg is None:
+            return
         for field in ("pts", "val_full", "sup_full", "near_full"):
             setattr(self.cfg, field, None)
 
@@ -3468,10 +3478,18 @@ class Pipeline:
             # not reached (os.replace is last). Warn so nobody consumes an
             # earlier run's files as this run's output (issues #15, #40).
             partial = True
-            # Drop the traceback before the finally cleanup: it pins the
+            # Copy the full stack to stderr for exceptions the CLI does not
+            # map to a clean 'error: <msg>' (unmapped -> exit 1 + raw
+            # traceback): the tb is dropped below because it pins the
             # writer frames, whose args still reference the DN memmaps
-            # (Windows: a held mmap keeps the OS file handle and the unlink
-            # raises WinError 32, CI run 38215575734 C1).
+            # (Windows: a held mmap keeps the OS file handle and the
+            # finally's unlink raises WinError 32, CI run 38215575734 C1).
+            # Without the print, the displayed stack for unmapped errors is
+            # flattened (review rev-os2 M2). Mapped exceptions (#16: clean
+            # error line, no stack) are untouched. Exception type/message
+            # are unchanged, so the CLI exit-code mapping is unaffected.
+            if not isinstance(exc, _CLI_MAPPED_EXCEPTIONS):
+                traceback.print_exception(exc, file=sys.stderr)
             exc.__traceback__ = None
             raise
         finally:
@@ -3652,6 +3670,31 @@ def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
         seed=args.seed,
         dry_run=dry_run,
     )
+
+
+# Exception types the CLI maps to a clean named exit (see
+# _map_pipeline_errors below): reported as an 'error: <msg>' line + exit
+# code, no stack trace (#16). Shared with _write_rasters_turbo's failure
+# path, which must know which exceptions already get clean reporting (so
+# no full stack is pre-printed before the traceback is released). SystemExit
+# is included too: pass-through control flow (e.g. --turbo-strict exit 3),
+# not a failure warranting a stack.
+_CLI_MAPPED_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    CRSError,
+    RasterioCRSError,
+    ImportError,
+    FileNotFoundError,
+    pd.errors.ParserError,
+    RasterioIOError,
+    IndexError,
+    OverflowError,
+    ZeroDivisionError,
+    RuntimeError,
+    KeyError,
+    ValueError,
+    OSError,
+    SystemExit,
+)
 
 
 def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:

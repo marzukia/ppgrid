@@ -24,7 +24,7 @@ ZstdmtError); with the fix they pass.
   pixel-size coefficients 1 ULP apart from the x86_64 Linux anchor (CI run
   38205315707). The non-canonical raster gates in tests/test_pipeline.py and
   bench/check_anchors.py now compare transform coefficients with
-  math.isclose(rel_tol=1e-12, abs_tol=1e-9); the 1-ULP sim passes, and a real
+  math.isclose(rel_tol=1e-8, abs_tol=1e-7); the 1-ULP sim passes, and a real
   1 m grid shift still fails both gates (tolerance not vacuous).
 
 - Windows (round 3, CI run 38207801346): _remove_run_temps unlinked run temps
@@ -303,7 +303,7 @@ def test_macos_transform_1ulp_drift_sim(tmp_path: Path) -> None:
     computed the pixel-size coefficients 1 ULP apart from the x86_64 Linux
     anchor (538.1210527474219 vs 538.121052747422). Pre-fix, the exact
     `a.transform == b.transform` assert in both gate helpers failed; the fix
-    compares per coefficient with math.isclose(rel_tol=1e-12, abs_tol=1e-9).
+    compares per coefficient with math.isclose(rel_tol=1e-8, abs_tol=1e-7).
     A real 1 m grid shift still fails both gates (tolerance not vacuous).
 
     """

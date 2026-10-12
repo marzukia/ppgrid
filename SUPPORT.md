@@ -10,10 +10,12 @@
 
 ## Operating Systems
 
-Every OS runs the full test suite in CI on all four Pythons, plus a byte-
-identity anchor gate (`bench/check_anchors.py`) that re-runs the CI-safe
-configs (melb10 + melb500, 2.4 GB peak) and fails the leg if any output
-byte differs from the committed `examples/` anchors.
+Every OS runs the full test suite in CI on all four Pythons, plus an
+anchor gate (`bench/check_anchors.py`) that re-runs the CI-safe configs
+(melb10 + melb500, 2.4 GB peak) and fails the leg if the outputs drift
+from the committed `examples/` anchors: byte-exact on the canonical
+x86_64 Linux platform, functional-equivalence (identical grid/metadata,
+near-identical decoded pixels) on the other legs.
 
 - **Linux** (primary target)
   - C interp JIT active (cc/gcc); np.interp fallback if no compiler.
