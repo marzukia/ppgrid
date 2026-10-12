@@ -10,7 +10,8 @@
 
 ## Operating Systems
 
-Every OS runs the full test suite in CI on all four Pythons, plus an
+Every OS in the CI matrix runs the full test suite in CI on all four
+Pythons (Windows is currently excluded from the matrix — see below), plus an
 anchor gate (`bench/check_anchors.py`) that re-runs the CI-safe configs
 (melb10 + melb500, 2.4 GB peak) and fails the leg if the outputs drift
 from the committed `examples/` anchors: byte-exact on the canonical
@@ -26,14 +27,14 @@ near-identical decoded pixels) on the other legs.
   - C interp JIT active (clang); np.interp fallback if no compiler.
   - CI: macos-latest, all 4 Pythons + anchor gate (proves the cross-OS
     C-build bytes).
-- **Windows** (amd64 CI)
-  - windows-latest (windows-2025) ships MinGW-w64 gcc (15.x) on the
-    machine PATH, so the CI leg JIT-builds cinterp.c: the verified path
-    on Windows is the C build, including its anchor bytes. The
-    bit-identical np.interp fallback is exercised by unit tests on every
-    OS and engages automatically where no compiler exists; outputs stay
-    byte-identical either way.
-  - CI: windows-latest, all 4 Pythons + anchor gate.
+- **Windows** (NOT in the CI matrix — excluded 2026-10-12, Unix-only scope)
+  - Portability fixes from this wave are in the tree (CDLL guard,
+    O_NOFOLLOW/ELOOP defaults, memmap-holder releases, platform-aware
+    gates) as the re-enable base. Last windows-latest run: all legs passed
+    except one anchor test (melb10 DN data drift on the 3.11 pyproj wheel).
+  - Re-enable: add windows-latest back to the CI matrix once that anchor
+    question is resolved (grid-origin quantization or a non-canonical DN
+    bound).
 
 The interpolation math is backend-agnostic by construction (the C kernel is
 bit-identical to np.interp, pinned by the test suite), so results do not
