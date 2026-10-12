@@ -11,22 +11,24 @@ jobs:
   # (requires-python >=3.11, classifiers 3.11-3.14; review m6).
   #
   # OS matrix (2026-10-12): explicit Linux/macOS/Windows pathways.
-  # - ubuntu-latest  (x86_64, ~7 GB) — primary; C interp JIT via cc/gcc.
+  # - ubuntu-latest  (x86_64, 4 vCPU, 16 GB) — primary; C interp JIT via cc/gcc.
   # - macos-latest   (arm64, ~16 GB) — C interp JIT via clang; proves the
   #   cross-OS C-build bytes in the anchor gate below.
-  # - windows-latest (x86_64, ~4 GB, 2 cores) — no C compiler preinstalled,
-  #   so the np.interp fallback is the verified path (bit-identical by
-  #   construction; the C build engages automatically if a compiler exists).
-  # All 32 locked deps have wheels for cp311-cp314 x every platform above
-  # (verified against uv.lock 2026-10-12), so `uv sync --all-extras --locked`
-  # never needs a source build.
+  # - windows-latest (x86_64, 4 vCPU, 16 GB) — ships MinGW-w64 gcc (15.x)
+  #   on the machine PATH, so the leg JIT-builds cinterp.c and verifies the
+  #   C path; the bit-identical np.interp fallback is unit-verified on
+  #   every leg and engages automatically where no compiler exists.
+  # All 34 unique packages (36 lock entries) have wheels for cp311-cp314
+  # x every platform above (verified against uv.lock 2026-10-12), so
+  # `uv sync --all-extras --locked` never needs a source build.
   #
   # Anchor gate: every leg re-runs the CI-safe configs (melb10 + melb500,
   # 2.4 GB peak RSS measured) and fails on any byte difference vs the
   # committed examples/ anchors — cross-OS writer drift (GDAL/zstd/libtiff
   # build deltas) is a leg failure, not a warning. equakes-scale anchors
-  # (8.1-8.4 GB peak) stay Linux/hydrogen-verified: they do not fit the
-  # 4 GB Windows runner.
+  # (8.1-8.4 GB peak) stay out of the CI anchor scope (Linux/hydrogen-
+  # verified via compare_tier2.py); melb10+melb500 are the conservative
+  # CI-safe choice.
   test:
     if: github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
@@ -53,7 +55,7 @@ jobs:
   # named 'nf' is registered on the marzukia account, so the first main
   # push (#39 merge) queued 9.5h starved. Wire real self-hosted runners
   # to this account before switching back.
-  # Anchor gate added 2026-10-12: melb10+melb500 fit the 7 GB runner
+  # Anchor gate added 2026-10-12: melb10+melb500 fit the 16 GB runner
   # (2.4 GB peak RSS, measured on hydrogen).
   test-main:
     if: github.event_name == 'push'

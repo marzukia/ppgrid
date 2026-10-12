@@ -36,13 +36,13 @@ except ImportError:  # pragma: no cover - platform specific
     resource = None  # type: ignore[assignment]
 
 
-def _peak_rss_mb() -> float:
-    """Process peak RSS in MB (0 where the platform cannot report it)."""
+def _peak_rss_mib() -> float:
+    """Process peak RSS in MiB (0 where the platform cannot report it)."""
     if resource is None:
         return 0.0
     v = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
-        return round(v / 1_000_000, 1)  # macOS reports bytes
+        return round(v / 1_048_576, 1)  # macOS reports bytes
     return round(v / 1024, 1)  # Linux reports KiB
 
 
@@ -200,7 +200,7 @@ def run_config(name: str, csv: str, kw: dict, outdir: Path) -> dict:
         "t_blockloop_cpu": round(_TIMERS["block_cpu"], 3),
         "t_write_total": round(t_write, 3),
         "t_total": round(total, 3),
-        "peak_rss_mb": _peak_rss_mb(),
+        "peak_rss_mib": _peak_rss_mib(),
     }
 
 
@@ -234,7 +234,7 @@ def main() -> None:
         print(
             f"  ingest {rec['t_ingest']}s  calib {rec['t_calibrate']}s  grid {rec['t_grid']}s  "
             f"blocks(wall) {rec['t_blockloop_wall']}s  write+reproj {rec['t_write_total']}s  "
-            f"TOTAL {rec['t_total']}s  peakRSS {rec['peak_rss_mb']}MB",
+            f"TOTAL {rec['t_total']}s  peakRSS {rec['peak_rss_mib']}MiB",
             flush=True,
         )
 
