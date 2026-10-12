@@ -36,7 +36,15 @@ _COUNT_EPS = 1e-9
 # Sentinel support (metres) for "no data anywhere in the pyramid ancestry".
 _UNRESOLVED_M = 1e9
 
-_LIBC = ctypes.CDLL(None, use_errno=True)
+try:
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+except (TypeError, OSError, AttributeError):
+    # Windows: CPython's CDLL.__init__ runs the "if '/' in name" fullpath
+    # check before the name-is-None special case, so CDLL(None) raises
+    # TypeError on os.name == 'nt'. madvise is a POSIX-only optimisation;
+    # without the libc handle _MADVISE is None and _nohuge() returns early
+    # (a byte-identical no-op).
+    _LIBC = None
 _MADV_NOHUGEPAGE = 15
 try:
     _PAGE = os.sysconf("SC_PAGE_SIZE")

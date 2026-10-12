@@ -1290,6 +1290,15 @@ def _turbo_write_parallel(
 
     """
     warp_tile = 2048
+    # The parallel ZSTD writer resolves the GDAL CPL zstd function pointer
+    # from /proc/self/maps (Linux only). Where it is unavailable (macOS,
+    # Windows, or a GDAL build without the CPL zstd compressor) this writer
+    # cannot run: return False so the caller falls back to the stock-codec
+    # path instead of a ZstdmtError. The production dispatch already gates
+    # on _turbo_zstd_ok() (== zstdmt.available()), so this only makes the
+    # direct call total; Linux behaviour is unchanged (available() is True).
+    if not zstdmt.available():
+        return False
     # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
     # pass 3, ported to the zstd writer - audit #78 P1-3): reproject's
     # ndarray source form copies the whole band into a fresh MEM dataset
@@ -2730,11 +2739,13 @@ class Pipeline:
         plan = turbop.plan(cap_gb, n_cells, self.nx_padded, radius)
         # The process's actual memory ceiling (audit #78 P1-2): the 8 GB
         # cap floor can plan a budget above it on a small cgroup slice;
-        # precheck names the OOM risk instead of staying green.
-        available_gb = min(
-            turbop._read_physical_gb(),  # ruff: ignore[private-member-access]
-            turbop._read_cgroup_max_gb(),  # ruff: ignore[private-member-access]
-        )
+        # precheck names the OOM risk instead of staying green. Only finite,
+        # known bounds count; with none (non-Linux: no /proc/meminfo, cgroup
+        # unlimited) available_gb is None and precheck skips the ceiling note.
+        physical_gb = turbop._read_physical_gb()  # ruff: ignore[private-member-access]
+        cgroup_gb = turbop._read_cgroup_max_gb()  # ruff: ignore[private-member-access]
+        finite = [g for g in (physical_gb, cgroup_gb) if g is not None and math.isfinite(g)]
+        available_gb = min(finite) if finite else None
         decision = turbop.precheck(
             plan,
             strict=self.turbo_strict,

@@ -69,6 +69,20 @@ def _assert_frames_equal(left: list[bytes], right: list[bytes]) -> None:
             raise AssertionError(msg)
 
 
+def _require_cpl() -> None:
+    """Skip when the CPL zstd function pointer cannot be resolved (non-Linux).
+
+    The direct compress_tile/compress_tiles/oracle_check calls need
+    /proc/self/maps to locate libgdal's CPL ZSTD_compress2; on macOS/Windows
+    (or a GDAL build without the CPL zstd compressor) they raise ZstdmtError.
+    available() is zstdmt's own availability predicate and is True on Linux,
+    so the hard byte tests run unchanged on the canonical platform.
+
+    """
+    if not zstdmt.available():
+        pytest.skip("CPL zstd compressor not resolvable (no Linux /proc/self/maps)")
+
+
 # ---------------------------------------------------------------- compressor
 
 
@@ -81,6 +95,7 @@ def test_available_true() -> None:
 
 def test_compress_tile_produces_zstd_frame_and_roundtrips() -> None:
     """compress_tile emits a ZSTD frame that the CPL decompressor inverts."""
+    _require_cpl()
     raw = predictor2(_tile(1)).tobytes()
     frame = compress_tile(raw)
     assert frame[:4] == _ZSTD_MAGIC
@@ -90,12 +105,14 @@ def test_compress_tile_produces_zstd_frame_and_roundtrips() -> None:
 
 def test_compress_tile_deterministic() -> None:
     """Repeated compress_tile calls on the same bytes give identical frames."""
+    _require_cpl()
     raw = predictor2(_tile(2)).tobytes()
     assert compress_tile(raw) == compress_tile(raw)
 
 
 def test_compress_tiles_matches_serial_and_deterministic_across_thread_counts() -> None:
     """compress_tiles output is byte-identical for n_threads 1..16."""
+    _require_cpl()
     tiles = [predictor2(_tile(s)).tobytes() for s in range(32)]
     serial = [compress_tile(t) for t in tiles]
     for n in (1, 2, 4, 8, 16):  # 16 > tile count: more workers than tiles
@@ -118,6 +135,7 @@ def test_compress_tiles_rejects_bad_tile_type() -> None:
 
 def test_compress_tiles_accepts_ndarray_inputs() -> None:
     """compress_tiles accepts int16 numpy arrays as tile inputs."""
+    _require_cpl()
     pa, pb = predictor2(_tile(3)), predictor2(_tile(4))
     _assert_frames_equal(
         compress_tiles([pa, pb], n_threads=2),
@@ -202,6 +220,7 @@ def test_oracle_real_cpl_pfn_consistent_with_byte_comparison() -> None:
     CPL pfn frames differ from the libtiff streaming frames, so the oracle
     reports mismatch: the designed stock-fallback signal.
     """
+    _require_cpl()
     info = zstdmt._tif_info(FIXTURE)  # ruff: ignore[private-member-access]
     stock = info.tile_bytes[0]
     with rasterio.open(FIXTURE) as ds:
@@ -340,6 +359,7 @@ def test_oracle_runs_on_bigtiff(tmp_path: Path) -> None:
     streaming frames, so the verdict is expected to be mismatch, the same
     frame-level behavior as the classic fixture.
     """
+    _require_cpl()
     p = tmp_path / "big.tif"
     _write_bigtiff(p)
     verdict = oracle_check(p, tile=0)

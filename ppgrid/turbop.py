@@ -626,19 +626,23 @@ def _read_cgroup_max_gb() -> float:
     return limit
 
 
-def _read_physical_gb() -> float:
+def _read_physical_gb() -> float | None:
     """Read physical RAM in GB from /proc/meminfo MemTotal (kB).
 
-    Raises:
-        ValueError: If MemTotal is missing.
+    Returns:
+        Physical RAM in GB, or None when /proc/meminfo is absent or has no
+        MemTotal line (non-Linux: macOS/Windows). Callers treat None as
+        "unknown RAM" and must not gate on a physical-RAM ceiling.
 
     """
-    with Path(MEMINFO_PATH).open(encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("MemTotal:"):
-                return float(line.split()[1]) * 1024.0 / GB
-    msg = "MemTotal not found in /proc/meminfo"
-    raise ValueError(msg)
+    try:
+        with Path(MEMINFO_PATH).open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return float(line.split()[1]) * 1024.0 / GB
+    except OSError:
+        return None
+    return None
 
 
 def detect_cap_gb(physical_gb: float | None = None, cgroup_gb: float | None = None) -> tuple[float, str]:
@@ -663,6 +667,28 @@ def detect_cap_gb(physical_gb: float | None = None, cgroup_gb: float | None = No
         physical_gb = _read_physical_gb()
     if cgroup_gb is None:
         cgroup_gb = _read_cgroup_max_gb()
+    if physical_gb is None:
+        # Non-Linux (no /proc/meminfo): physical RAM unknown. Plan against
+        # whatever finite ceiling is visible; with none, take the smaller-
+        # footprint floor rather than an unbounded cap (conservative).
+        if math.isfinite(cgroup_gb):
+            avail = cgroup_gb
+            raw = avail - AUTO_HEADROOM_GB
+            cap = max(raw, CAP_FLOOR_GB)
+            source = (
+                f"auto physical RAM unknown (no /proc/meminfo); cgroup {cgroup_gb:.1f} GB"
+                f" - {AUTO_HEADROOM_GB:g} GB headroom"
+            )
+            if cap > raw:
+                source += f" (floored to {CAP_FLOOR_GB:g} GB)"
+            return cap, source
+        return (
+            CAP_FLOOR_GB,
+            (
+                f"auto physical RAM unknown (no /proc/meminfo) and cgroup unlimited;"
+                f" conservative floor {CAP_FLOOR_GB:g} GB"
+            ),
+        )
     avail = min(physical_gb, cgroup_gb)
     raw = avail - AUTO_HEADROOM_GB
     cap = max(raw, CAP_FLOOR_GB)
