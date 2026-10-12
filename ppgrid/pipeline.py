@@ -3366,8 +3366,8 @@ class Pipeline:
             # still open memmaps (the inode outlives the unlink), but the
             # tmpfs space is freed while the write phase runs. The two DN
             # files stay out of this mid-removal: on Windows an unlink of a
-            # held mmap is WinError 32; run()'s final cleanup removes them
-            # once the warp phase has dropped the handles.
+            # held mmap is WinError 32; this method's finally releases the
+            # local holders, then the final cleanup removes the files.
             self._remove_run_temps(keep=("_val_dn.npy", "_sup_dn.npy"))
 
             # Both bands share the same work-CRS source grid (identical
@@ -3463,13 +3463,23 @@ class Pipeline:
             self._published.add(vpath.name)
             ftmp_s.replace(spath)
             self._published.add(spath.name)
-        except BaseException:
+        except BaseException as exc:
             # Mid-run failure (worker error, OOM, disk full): the finals were
             # not reached (os.replace is last). Warn so nobody consumes an
             # earlier run's files as this run's output (issues #15, #40).
             partial = True
+            # Drop the traceback before the finally cleanup: it pins the
+            # writer frames, whose args still reference the DN memmaps
+            # (Windows: a held mmap keeps the OS file handle and the unlink
+            # raises WinError 32, CI run 38215575734 C1).
+            exc.__traceback__ = None
             raise
         finally:
+            # Release the local DN memmap holders before the final unlink
+            # (same WinError 32 on Windows): `val_dn` / `sup_dn` would
+            # otherwise live to the function end, and `arr` is the warp-loop
+            # variable still bound to the last band's field.
+            val_dn = sup_dn = arr = None
             self._remove_run_temps()
             for p in out_dir.glob("_stock_scratch_*.tif"):
                 p.unlink(missing_ok=True)
