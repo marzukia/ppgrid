@@ -827,12 +827,14 @@ def _assert_transform_equivalent(t_a: Affine, t_b: Affine, name: str) -> None:
     builds. Measured drift: 1 ULP (5.7e-14) on macOS arm64, 3.9e-8 m on
     Windows x64 (CI run 38215575734 C2). abs_tol=1e-7 (0.1 um) covers the
     Windows drift with ~2.5x headroom while staying far below physical
-    meaning at pixel scale (hundreds of metres per pixel); rel_tol=1e-12
-    is kept.
+    meaning at pixel scale (hundreds of metres per pixel). rel_tol=1e-8
+    bounds the measured windows-3.11 pyproj origin drift (coef f, 1.13e-3 m
+    at ~1.1e6 m, rel ~1e-9, CI run 38218917436) with 10x margin — still
+    ~1e-6 of a 538 m pixel.
 
     """
     for coef, (x, y) in zip("abcdef", zip(t_a[:6], t_b[:6], strict=True), strict=True):
-        assert math.isclose(x, y, rel_tol=1e-12, abs_tol=1e-7), f"{name} transform {coef} differs: {x!r} != {y!r}"
+        assert math.isclose(x, y, rel_tol=1e-8, abs_tol=1e-7), f"{name} transform {coef} differs: {x!r} != {y!r}"
 
 
 def _assert_rasters_equivalent(out_path: Path, ref_path: Path) -> None:
