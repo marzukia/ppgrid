@@ -826,6 +826,8 @@ def test_turbo_write_parallel_matches_serial(tmp_path: Path, monkeypatch: pytest
     Simulates an oracle pass: compress_tiles returns the exact stock codec
     frames, so the assembled file must be byte-identical (A6 unit).
     """
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("zstdmt needs the Linux /proc/self/maps CPL resolution (serial fallback)")
     a, xform = _demo_field(1600, 1400, 100.0, seed=11)
     dst_transform, dst_width, dst_height = _dst_grid(1600, 1400, 100.0)
     work_crs, dst_crs = f"EPSG:{WORK_CRS}", f"EPSG:{OUT_CRS}"
@@ -887,6 +889,8 @@ def test_turbo_write_parallel_bigtiff_matches_serial(tmp_path: Path, monkeypatch
     (the pre-fix bug); per-tag strides keep the file byte-identical.
 
     """
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("zstdmt needs the Linux /proc/self/maps CPL resolution (serial fallback)")
     a, xform = _demo_field(1600, 1400, 100.0, seed=11)
     dst_transform, dst_width, dst_height = _dst_grid(1600, 1400, 100.0)
     work_crs, dst_crs = f"EPSG:{WORK_CRS}", f"EPSG:{OUT_CRS}"
@@ -953,6 +957,8 @@ def test_turbo_write_parallel_edge_tiles_padded(tmp_path: Path, monkeypatch: pyt
     with the exact zero padding.
 
     """
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("zstdmt needs the Linux /proc/self/maps CPL resolution (serial fallback)")
     height, width = 700, 900  # 2x2 tile grid: right + bottom edges partial
     assert width % TILE_PX != 0
     assert height % TILE_PX != 0
@@ -1041,6 +1047,11 @@ def test_turbo_writers_wrap_source_array_once(tmp_path: Path, monkeypatch: pytes
     the band loop: one construction per call, and the outputs stay
     bit-identical across thread counts.
 
+    The serial section is OS-independent; the parallel section needs
+    the zstdmt CPL compressor (Linux /proc/self/maps), so it is skipped
+    where unavailable (the round-1 gate makes _turbo_write_parallel
+    return False instead of running).
+
     """
     orig = pipeline_mod.MemoryDataset
     counts = {"n": 0}
@@ -1105,6 +1116,8 @@ def test_turbo_writers_wrap_source_array_once(tmp_path: Path, monkeypatch: pytes
     assert all(isinstance(s, tuple) for s in src_forms)
     src_forms.clear()
     assert _sha(out1) == _sha(out4)  # bit-identity still holds
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("parallel section needs zstdmt (Linux /proc/self/maps); serial wrap checks passed")
 
     frames = iter(_stock_frames(out1))
 

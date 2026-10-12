@@ -27,6 +27,22 @@ ZstdmtError); with the fix they pass.
   math.isclose(rel_tol=1e-12, abs_tol=1e-9); the 1-ULP sim passes, and a real
   1 m grid shift still fails both gates (tolerance not vacuous).
 
+- Windows (round 3, CI run 38207801346): _remove_run_temps unlinked run temps
+  while the main process's memmaps still held the files (WinError 32 on
+  _points.npy masked every run error and broke the CLI exit codes). The
+  recorded-weakref sims below run a full pipeline and assert that no .npy
+  unlink ever happens while a main-process memmap still holds that file;
+  pre-fix they fail on _points.npy (cfg.pts was never released) and, for
+  turbo, on the mid-run removal of the live DN fields.
+
+- Windows (round 3, W1-B): a spawn pool child re-importing ppgrid hit a
+  transient _try_import failure on the parent-built .pyd, then crashed its
+  _cinterp._load() at path.unlink (the parent holds the DLL mapped for its
+  lifetime, WinError 32) -> BrokenProcessPool. The sim below makes every
+  candidate import fail transiently and every candidate unlink raise
+  PermissionError; _load must fall back to np.interp (bit-identical) instead
+  of killing the child's import.
+
 """
 
 from __future__ import annotations
@@ -36,9 +52,12 @@ import math
 import os
 import subprocess
 import sys
+import weakref
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from rasterio.transform import Affine, from_origin
@@ -319,3 +338,152 @@ def test_macos_transform_1ulp_drift_sim(tmp_path: Path) -> None:
     _assert_rasters_equivalent(ulp_p, ref_p)
     with pytest.raises(AssertionError, match="transform"):
         _assert_rasters_equivalent(shift_p, ref_p)
+
+
+# ---------------------------------------------------------------------------
+# Windows (round 3): unlinking a run temp while a main-process mmap still
+# holds the file raises WinError 32 (CI run 38207801346, W1)
+# ---------------------------------------------------------------------------
+
+
+def _write_sim_csv(tmp_path: Path) -> Path:
+    rng = np.random.default_rng(42)
+    n = 50
+    csv = tmp_path / "sim.csv"
+    pd.DataFrame(
+        {
+            "value": 10 + 90 * rng.random(n),
+            "longitude": 144.6 + rng.uniform(-0.3, 0.3, n),
+            "latitude": -37.7 + rng.uniform(-0.3, 0.3, n),
+        },
+    ).to_csv(csv, index=False)
+    return csv
+
+
+def _recorded_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **pipeline_kwargs: Any) -> None:
+    """Full pipeline run; no .npy unlink may hit a still-held memmap.
+
+    Records every main-process memmap via weakref (weakref: the recorder
+    must not itself keep the handle alive) and, at each .npy unlink, flags
+    any file a live memmap still references. On Windows that state is
+    WinError 32; the weakref invariant is its Linux proxy. Pre-fix the
+    serial run violated on _points.npy (cfg.pts was never released) and the
+    turbo run additionally on the mid-run removal of the live DN fields.
+    """
+    rec: list[weakref.ref] = []
+    violations: list[str] = []
+    orig_load = np.load
+    orig_fresh = pipeline_mod._open_fresh_memmap
+
+    def load(*a: Any, **k: Any) -> Any:
+        m = orig_load(*a, **k)
+        if isinstance(m, np.memmap):
+            rec.append(weakref.ref(m))
+        return m
+
+    def fresh(path: Path, dtype: Any, shape: tuple[int, ...]) -> Any:
+        m = orig_fresh(path, dtype, shape)
+        rec.append(weakref.ref(m))
+        return m
+
+    orig_unlink = Path.unlink
+
+    def _unlink(self: Path, *, missing_ok: bool = False) -> None:
+        if self.suffix == ".npy":
+            for r in rec:
+                m = r()
+                if m is not None and m.filename == str(self):
+                    violations.append(self.name)
+        return orig_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(np, "load", load)
+    monkeypatch.setattr(pipeline_mod, "_open_fresh_memmap", fresh)
+    monkeypatch.setattr(Path, "unlink", _unlink)
+    csv = _write_sim_csv(tmp_path)
+    p = Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "out"), **pipeline_kwargs)
+    p.run()
+    assert violations == [], f".npy unlinked while its memmap was still held: {violations}"
+
+
+def test_windows_mmap_released_before_unlink_serial_sim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serial write: every cfg memmap is released before the unlink (W1).
+
+    PPGRID_FORCE_MEMMAP forces the memmap regime at small scale, so
+    cfg.pts + cfg.val_full/sup_full/near_full are all live mmaps at the
+    run's end - exactly the Windows holder set.
+
+    """
+    monkeypatch.setenv("PPGRID_FORCE_MEMMAP", "1")
+    _recorded_run(monkeypatch, tmp_path, res=500.0, cap_km=10.0, workers=2, seed=0)
+
+
+def test_windows_mmap_released_before_unlink_turbo_sim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turbo write: cfg.pts released; DN fields kept out of the mid-run removal (W1)."""
+    monkeypatch.setenv("PPGRID_FORCE_MEMMAP", "1")
+    _recorded_run(
+        monkeypatch,
+        tmp_path,
+        res=500.0,
+        cap_km=10.0,
+        workers=2,
+        seed=0,
+        turbo=True,
+        skip_calibration=True,
+    )
+
+
+def test_windows_cinterp_locked_pyd_child_survives_sim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pool child survives candidate pyds the parent holds locked (W1-B).
+
+    Windows: the parent's import maps the .pyd for its lifetime, so a child
+    that (transiently) fails _try_import cannot unlink or rebuild over the
+    file. Pre-fix the unlink raised WinError 32 inside _cinterp._load and
+    killed the child's ppgrid import (BrokenProcessPool); with the fix the
+    child falls back to np.interp (bit-identical) instead of dying.
+    """
+    import ppgrid._cinterp as ci
+
+    monkeypatch.setattr(ci, "_mod", None)
+    monkeypatch.setattr(ci, "_reason", None)
+    # Synthetic candidates in tmp: the package-dir pyd is mapped by the real
+    # import of this process and must never be truncated out from under it.
+    cands = [tmp_path / "fake" / f"c{k}.so" for k in range(3)]
+    monkeypatch.setattr(ci, "_candidate_paths", lambda: list(cands))
+
+    fake_files: list[Path] = []
+    for path in cands:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fake build")  # an existing, parent-locked pyd
+        fake_files.append(path)
+
+    def _boom_import(path: Path) -> bool:
+        assert path in cands  # only candidate slots are probed
+        ci._mod = None
+        ci._reason = "import failed (simulated transient child failure)"
+        return False
+
+    def _fake_build(src: Path, dst: Path) -> bool:
+        assert src == ci._SRC  # cinterp.c is the source
+        assert dst in cands  # builds only into candidate slots
+        return True  # gcc succeeds; the file stays locked by the parent
+
+    orig_unlink = Path.unlink
+
+    def _unlink(self: Path, *, missing_ok: bool = False) -> None:
+        if self in cands:
+            raise PermissionError(32, "file held by another process", str(self))
+        return orig_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(ci, "_try_import", _boom_import)
+    monkeypatch.setattr(ci, "_build", _fake_build)
+    monkeypatch.setattr(Path, "unlink", _unlink)
+    try:
+        ci._load()  # must not raise: the child lives
+    finally:
+        for path in fake_files:
+            orig_unlink(path, missing_ok=True)
+    assert ci._mod is None
+    assert ci._reason is not None  # np.interp fallback, bit-identical by construction

@@ -157,7 +157,16 @@ def _load() -> None:
                 continue  # shared tmpdir dir not owned by us: treat as absent
             if _try_import(path):
                 return
-            path.unlink(missing_ok=True)
+            # Broken build: delete and rebuild below. On Windows a pyd
+            # already loaded by another process stays locked for that
+            # process's lifetime (the parent's import keeps the DLL
+            # mapped), so it cannot be unlinked and a rebuild cannot
+            # replace it either; the next candidate (or the np.interp
+            # fallback, which is bit-identical) takes over. A pool child
+            # must not crash its import over a file it does not own (CI
+            # run 38207801346 W1-B: BrokenProcessPool at this unlink).
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
     # 2. JIT build into the first writable location
     for path in cands:
         if not _tmpdir_owned(path):
@@ -170,7 +179,12 @@ def _load() -> None:
             continue
         if _build(_SRC, path) and _try_import(path):
             return
-        path.unlink(missing_ok=True)
+        # Normally a fresh file nobody else holds; suppress anyway: on
+        # Windows a build into a location another process has open fails
+        # at the gcc step and the cleanup unlink would then raise (CI run
+        # 38207801346 W1-B).
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
     _reason = "no working C compiler (falling back to np.interp)" + (f"; {_build_err}" if _build_err else "")
 
 

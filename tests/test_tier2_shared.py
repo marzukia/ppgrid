@@ -202,6 +202,21 @@ def test_shared_field_matches_perbox(tmp_path: Path) -> None:
         skip_calibration=True,
         out_crs=6933,
     )
+    # The per-box refs need cfg.pts + cfg.tf/pct (and the points file), all
+    # assigned during the write phase and released at its end (Windows
+    # WinError 32 fix). Capture the refs right after _prepare_shared, when
+    # they are set but nothing is released yet.
+    refs: dict[tuple[int, int], tuple[np.ndarray, np.ndarray] | None] = {}
+    orig_prep = p._prepare_shared
+
+    def prep_with_refs() -> bool:
+        ok = orig_prep()
+        for bx in range(p.cfg.nbx):
+            for by in range(p.cfg.nby):
+                refs[bx, by] = _perbox_reference(p, bx, by)
+        return ok
+
+    p._prepare_shared = prep_with_refs
     p.run()
     assert p.cfg.nbx == 2
     assert p.cfg.nby == 2
@@ -214,7 +229,7 @@ def test_shared_field_matches_perbox(tmp_path: Path) -> None:
                 w = Window(i0, p.cfg.ny - j1, i1 - i0, j1 - j0)
                 v_got = vd.read(1, window=w)
                 s_got = sd.read(1, window=w)
-                ref = _perbox_reference(p, bx, by)
+                ref = refs[bx, by]
                 if ref is None:
                     assert (v_got == NODATA).all(), f"value block {bx},{by} not all nodata"
                     assert (s_got == NODATA).all(), f"support block {bx},{by} not all nodata"
