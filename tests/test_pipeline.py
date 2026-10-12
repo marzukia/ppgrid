@@ -811,14 +811,31 @@ def test_cli_calibration_missing_file_clean_error(tmp_path: Path, capsys: pytest
 ANCHOR = Path(__file__).parent / "fixtures" / "auto_anchor"
 
 
+def _assert_transform_equivalent(t_a: Affine, t_b: Affine, name: str) -> None:
+    """Per-coefficient transform compare with last-ulp tolerance.
+
+    Cross-OS PROJ/warp builds drift the pixel-size coefficients by ~1 ULP
+    (e.g. 538.1210527474219 vs 538.121052747422 on macOS arm64, CI run
+    38205315707); an exact transform assert is unachievable across PROJ
+    builds. rel_tol=1e-12 / abs_tol=1e-9 match the float tolerance this
+    module already applies to JSON values.
+
+    """
+    for coef, (x, y) in zip("abcdef", zip(t_a[:6], t_b[:6], strict=True), strict=True):
+        assert math.isclose(x, y, rel_tol=1e-12, abs_tol=1e-9), f"{name} transform {coef} differs: {x!r} != {y!r}"
+
+
 def _assert_rasters_equivalent(out_path: Path, ref_path: Path) -> None:
     """Non-canonical raster gate: same grid/metadata, near-identical pixels.
 
     Cross-OS tile bytes differ (vendored GDAL/zstd encoder), so compare the
-    decoded arrays with a tight tolerance instead of raw bytes: the grid, CRS,
-    transform, dtype and nodata must match exactly, and the DN values may differ
-    only in a vanishing fraction of cells by a vanishing amount (last-ulp FP
-    drift from the platform PROJ/warp build).
+    decoded arrays with a tight tolerance instead of raw bytes: width, height,
+    count, dtype, CRS and nodata must match exactly, the transform must match
+    within last-ulp tolerance (cross-OS PROJ/warp builds compute the grid
+    transform ~1 ULP apart — exact transform match is unachievable across
+    PROJ builds), and the DN values may differ only in a vanishing fraction
+    of cells by a vanishing amount (last-ulp FP drift from the platform
+    PROJ/warp build).
 
     """
     with rasterio.open(out_path) as a, rasterio.open(ref_path) as b:
@@ -827,7 +844,7 @@ def _assert_rasters_equivalent(out_path: Path, ref_path: Path) -> None:
         assert a.count == b.count
         assert a.dtypes == b.dtypes, f"{out_path.name} dtype differs"
         assert a.crs == b.crs, f"{out_path.name} CRS differs"
-        assert a.transform == b.transform, f"{out_path.name} transform differs"
+        _assert_transform_equivalent(a.transform, b.transform, out_path.name)
         assert a.nodata == b.nodata, f"{out_path.name} nodata differs"
         da = a.read(1)
         db = b.read(1)

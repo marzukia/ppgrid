@@ -371,13 +371,22 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
     )
 
 
+# O_NOFOLLOW and ELOOP are POSIX-only (Windows has no symlinks): getattr
+# defaults keep the same code path total on every platform (PR #97, OS matrix).
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_STAGING_RETRY_ERRNOS: tuple[int, ...] = (errno.EEXIST, getattr(errno, "ELOOP", errno.EEXIST))
+
+
 def _staging_fd(path: Path) -> int:
     """Create `path` as a fresh 0600 regular file and return an open write fd.
 
     Symlinks are replaced, never followed (issues #15, #77): the path is
     unlinked, then recreated with O_CREAT | O_EXCL | O_NOFOLLOW — a symlink
     (or any file) planted in that window makes os.open fail (ELOOP / EEXIST)
-    instead of being followed, and one retry resolves it.
+    instead of being followed, and one retry resolves it. O_NOFOLLOW and
+    ELOOP are POSIX-only; on Windows (no symlinks) the _O_NOFOLLOW /
+    _STAGING_RETRY_ERRNOS getattr defaults degrade them to no-ops without
+    changing the Linux open/retry semantics (PR #97).
 
     Args:
         path: Staging path in the output dir.
@@ -390,15 +399,16 @@ def _staging_fd(path: Path) -> int:
             after one retry.
 
     """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
     path.unlink(missing_ok=True)
     try:
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        return os.open(path, flags, 0o600)
     except OSError as e:
-        if e.errno not in (errno.EEXIST, errno.ELOOP):
+        if e.errno not in _STAGING_RETRY_ERRNOS:
             raise
         # Planted in the unlink->open window: replace it once, try again.
         path.unlink(missing_ok=True)
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        return os.open(path, flags, 0o600)
 
 
 def _open_tiff_staging(path: Path, **profile: Any) -> rasterio.DatasetBase:

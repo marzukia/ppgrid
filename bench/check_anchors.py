@@ -13,7 +13,8 @@ deltas, compiler FP differences in the C interp) that array-compare would miss
 On non-canonical platforms (macOS arm64, Windows, aarch64 Linux) the vendored
 PROJ/GDAL/zstd wheels emit different (functionally equivalent) tile bytes, so a
 byte gate would always fail. There the gate falls back to functional
-equivalence: identical grid/metadata (crs, transform, size, dtype, nodata) and
+equivalence: identical grid/metadata (crs, size, dtype, nodata; transform
+within last-ulp tolerance — cross-OS PROJ builds drift ~1 ULP) and
 near-identical decoded pixels (<=0.5% of cells, each by <=4 DN). A sha match
 still passes on any platform (the fast path).
 
@@ -38,6 +39,7 @@ No new deps: stdlib + the bench harness + the package itself.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import sys
 import tempfile
@@ -73,22 +75,41 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _transforms_equivalent(t_a: rasterio.transform.Affine, t_b: rasterio.transform.Affine) -> bool:
+    """Per-coefficient transform compare with last-ulp tolerance.
+
+    Cross-OS PROJ/warp builds drift the pixel-size coefficients by ~1 ULP
+    (e.g. 538.1210527474219 vs 538.121052747422 on macOS arm64, CI run
+    38205315707); an exact transform match is unachievable across PROJ
+    builds. rel_tol=1e-12 / abs_tol=1e-9 mirror the DN tolerance below.
+
+    """
+    return all(math.isclose(x, y, rel_tol=1e-12, abs_tol=1e-9) for x, y in zip(t_a[:6], t_b[:6], strict=True))
+
+
 def _functional_equivalent(got: Path, want: Path) -> bool:
     """Non-canonical anchor check: same grid/metadata, near-identical pixels.
 
     Cross-OS tile bytes differ (vendored GDAL/zstd encoder), so compare the
     decoded arrays with a tight tolerance instead of raw bytes: grid, CRS,
-    transform, dtype and nodata must match exactly, and the DN values may
-    differ only in a vanishing fraction of cells by a vanishing amount
-    (last-ulp FP drift from the platform PROJ/warp build). A real regression
-    moves many cells or moves them far; encoder/FP drift moves almost none by
-    almost nothing.
+    dtype and nodata must match exactly, and the transform must match within
+    last-ulp tolerance (cross-OS PROJ/warp builds compute the grid transform
+    ~1 ULP apart — exact transform match is unachievable across PROJ builds).
+    The DN values may differ only in a vanishing fraction of cells by a
+    vanishing amount (last-ulp FP drift from the platform PROJ/warp build).
+    A real regression moves many cells or moves them far; encoder/FP drift
+    moves almost none by almost nothing.
 
     """
     with rasterio.open(got) as a, rasterio.open(want) as b:
         if not (a.width == b.width and a.height == b.height and a.count == b.count):
             return False
-        if a.dtypes != b.dtypes or a.crs != b.crs or a.transform != b.transform or a.nodata != b.nodata:
+        if (
+            a.dtypes != b.dtypes
+            or a.crs != b.crs
+            or not _transforms_equivalent(a.transform, b.transform)
+            or a.nodata != b.nodata
+        ):
             return False
         da = a.read(1)
         db = b.read(1)
