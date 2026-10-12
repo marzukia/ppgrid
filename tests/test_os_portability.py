@@ -392,7 +392,7 @@ def _recorded_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **pipeline_kw
         if self.suffix == ".npy":
             for r in rec:
                 m = r()
-                if m is not None and m.filename == str(self):
+                if m is not None and os.fspath(m.filename) == str(self):
                     violations.append(self.name)
         return orig_unlink(self, missing_ok=missing_ok)
 

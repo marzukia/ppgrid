@@ -81,10 +81,13 @@ def _transforms_equivalent(t_a: rasterio.transform.Affine, t_b: rasterio.transfo
     Cross-OS PROJ/warp builds drift the pixel-size coefficients by ~1 ULP
     (e.g. 538.1210527474219 vs 538.121052747422 on macOS arm64, CI run
     38205315707); an exact transform match is unachievable across PROJ
-    builds. rel_tol=1e-12 / abs_tol=1e-9 mirror the DN tolerance below.
+    builds. Measured drift: 1 ULP (5.7e-14) on macOS arm64, 3.9e-8 m on
+    Windows x64 (CI run 38215575734 C2). abs_tol=1e-7 (0.1 um) covers the
+    Windows drift with ~2.5x headroom while staying far below physical
+    meaning at pixel scale; rel_tol=1e-12 is kept.
 
     """
-    return all(math.isclose(x, y, rel_tol=1e-12, abs_tol=1e-9) for x, y in zip(t_a[:6], t_b[:6], strict=True))
+    return all(math.isclose(x, y, rel_tol=1e-12, abs_tol=1e-7) for x, y in zip(t_a[:6], t_b[:6], strict=True))
 
 
 def _functional_equivalent(got: Path, want: Path) -> bool:
