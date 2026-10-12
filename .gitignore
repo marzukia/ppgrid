@@ -13,3 +13,4 @@ data/au_gcc_sparse.csv
 
 # JIT-built C interop (ppgrid._cinterp); rebuilt on demand from cinterp.c
 ppgrid/_cinterp_c-*.so
+ppgrid/_cinterp_c-*.pyd
