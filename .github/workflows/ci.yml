@@ -10,14 +10,15 @@ jobs:
   # PRs: full interpreter x OS sweep on GitHub-hosted runners, pinned versions
   # (requires-python >=3.11, classifiers 3.11-3.14; review m6).
   #
-  # OS matrix (2026-10-12): explicit Linux/macOS/Windows pathways.
+  # OS matrix (2026-10-12): explicit Linux/macOS pathways. Windows was
+  # EXCLUDED from the matrix 2026-10-12 (operator decision: Unix-only support
+  # scope for now) after the portability fixes landed — the CDLL/O_NOFOLLOW/
+  # memmap-release fixes stay in the tree as the re-enable base (a windows-
+  # latest leg passed everything but one anchor test: melb10 DN data drift
+  # on the 3.11 pyproj wheel, 772 max DN delta on cap-boundary cells).
   # - ubuntu-latest  (x86_64, 4 vCPU, 16 GB) — primary; C interp JIT via cc/gcc.
   # - macos-latest   (arm64, ~16 GB) — C interp JIT via clang; proves the
   #   cross-OS C-build bytes in the anchor gate below.
-  # - windows-latest (x86_64, 4 vCPU, 16 GB) — ships MinGW-w64 gcc (15.x)
-  #   on the machine PATH, so the leg JIT-builds cinterp.c and verifies the
-  #   C path; the bit-identical np.interp fallback is unit-verified on
-  #   every leg and engages automatically where no compiler exists.
   # All 34 unique packages (36 lock entries) have wheels for cp311-cp314
   # x every platform above (verified against uv.lock 2026-10-12), so
   # `uv sync --all-extras --locked` never needs a source build.
@@ -37,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
