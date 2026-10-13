@@ -120,6 +120,7 @@ def test_windows_cdll_typeerror_sim(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_macos_no_proc_meminfo_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_read_physical_gb returns None (not FileNotFoundError) when /proc is absent."""
     monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
+    _stub_darwin_probe(monkeypatch)
     assert turbop._read_physical_gb() is None
 
 
@@ -128,6 +129,16 @@ def _sysctl_stdout(stdout: str, returncode: int = 0) -> Any:
         return types.SimpleNamespace(stdout=stdout, returncode=returncode)
 
     return _run
+
+
+def _stub_darwin_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kill the darwin sysctl probe (a real macOS runner's sysctl would succeed)."""
+
+    def _raise(*_a: object, **_k: object) -> NoReturn:
+        msg = "sysctl stubbed"
+        raise OSError(msg)
+
+    monkeypatch.setattr(turbop.subprocess, "run", _raise)
 
 
 def test_macos_sysctl_hw_memsize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,6 +196,7 @@ def test_macos_no_proc_cap_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     """
     monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
+    _stub_darwin_probe(monkeypatch)
     # unlimited cgroup: the conservative floor, never an unbounded cap.
     cap, source = turbop.detect_cap_gb(physical_gb=None, cgroup_gb=math.inf)
     assert cap == 8.0
