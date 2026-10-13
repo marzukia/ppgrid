@@ -130,7 +130,8 @@ def test_main_no_input_error_exit2(capsys: pytest.CaptureFixture[str]) -> None:
         main([])
     assert exc.value.code == 2
     err = capsys.readouterr().err
-    assert "error" in err
+    # D-7: unified plain error line (level letter + logger, no raw 'error:' prefix)
+    assert "E ppgrid.pipeline: missing input file (CSV or Parquet)" in err
     assert "ppgrid help" in err
 
 

@@ -47,6 +47,25 @@ _EXPECTED_SUMMARY = """run summary
 /out/support_km.tif
 """
 
+# X3 (fix-round concept, owner-approved): live mode renders the same rows in a
+# rounded panel titled ``summary`` (the ``run summary`` header line becomes the
+# panel title; the rows keep their plain form, padding (0, 1)). expand=False,
+# so the block is byte-identical at every terminal width.
+_EXPECTED_LIVE_PANEL = """╭────────────── summary ───────────────╮
+│   rows read:     13,580              │
+│   rows accepted: 13,580              │
+│   rows dropped:  0                   │
+│   grid:          11x8 (88 cells)     │
+│   strategy:      standard, workers 4 │
+│   elapsed:       12.34s              │
+│   peak RAM:      14.8 GB (measured)  │
+│   value.tif:     5.2 MB              │
+│   support_km.tif:3.1 MB              │
+│ /out/value.tif                       │
+│ /out/support_km.tif                  │
+╰──────────────────────────────────────╯
+"""
+
 _BAR = "\u2501"  # full bar block
 _PART = "\u2578"  # partial bar block
 
@@ -112,20 +131,22 @@ def test_human_size() -> None:
 
 @pytest.mark.parametrize("width", [80, 120])
 def test_summary_snapshot_live_width_invariant(width: int) -> None:
-    """The live-mode summary block is byte-identical at 80 and 120 cols."""
+    """The live-mode summary panel is byte-identical at 80 and 120 cols.
+
+    X3: the block is a rounded panel titled ``summary`` (hug width via
+    expand=False), so width invariance is now the exact bytes.
+    """
     fake = io.StringIO()
     ui = _ui.UI(live=True, color=False, unicode=True, stream=fake, width=width, spinner_min_s=2.0)
     ui.summary("run summary", _SUMMARY_ROWS)
     text = fake.getvalue()
     assert "\x1b" not in text
-    i = text.find("run summary")
-    assert i >= 0
-    block = text[i : i + len(_EXPECTED_SUMMARY)]
-    assert block == _EXPECTED_SUMMARY
+    assert text == _EXPECTED_LIVE_PANEL
     # every line comfortably inside the terminal (well under 80).
-    assert max(len(line) for line in _EXPECTED_SUMMARY.splitlines()) <= 78
-    # paths are copyable: one per line, bare, no decoration.
-    assert "/out/value.tif\n/out/support_km.tif" in text
+    assert max(len(line) for line in _EXPECTED_LIVE_PANEL.splitlines()) <= 78
+    # paths are one per line inside the panel.
+    assert "│ /out/value.tif" in text
+    assert "│ /out/support_km.tif" in text
 
 
 def test_summary_plain_mode_no_escapes() -> None:
@@ -253,13 +274,17 @@ def _run_argv(csv: str, out: Path, *extra: str) -> list[str]:
 
 
 def test_run_summary_in_stderr_default_verbosity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Non-TTY default run prints the summary block with drop reasons."""
+    """Default run prints the summary (live: the X3 panel) with drop reasons."""
+    # Wide terminal so the long pytest tmp paths fit the hug-width panel
+    # unclipped (80-col clipping of oversized panels is standard rich
+    # behavior, covered at unit level by the width-invariant snapshot).
+    monkeypatch.setenv("COLUMNS", "200")
     fake = FakeTTY()
     monkeypatch.setattr(sys, "stderr", fake)
     argv = _run_argv(_drops_csv(tmp_path), tmp_path / "out")
     _pl.main(argv)
     text = fake.getvalue()
-    assert "run summary" in text
+    assert " summary " in text  # panel title (X3)
     assert "  rows read:     5" in text
     assert "  rows accepted: 2" in text
     assert "  rows dropped:  3 (1 non-finite value; 2 out-of-domain)" in text
@@ -268,11 +293,11 @@ def test_run_summary_in_stderr_default_verbosity(tmp_path: Path, monkeypatch: py
     assert re.search(r"elapsed:\s+\d+\.\d\ds", text)
     assert re.search(r"peak RAM:\s+(?:\d+\.\d GB \(measured\)|~\d+\.\d GB \(estimated\))", text)
     assert re.search(r"value\.tif:\s+\d+(\.\d+)? (B|KB|MB|GB)", text)
-    # copyable bare paths, one per line
-    assert f"\n{tmp_path / 'out' / 'value.tif'}\n" in text
-    assert f"\n{tmp_path / 'out' / 'support_km.tif'}\n" in text
-    # only the colour title carries escapes (no cursor/movement codes)
-    block = text[text.find("run summary") :]
+    # paths are one per line inside the panel
+    assert f"│ {tmp_path / 'out' / 'value.tif'}" in text
+    assert f"│ {tmp_path / 'out' / 'support_km.tif'}" in text
+    # only the panel title carries escapes after the table (no cursor/movement codes)
+    block = text[text.find(" summary ") :]
     assert "\x1b" not in block.replace("\x1b[32m", "").replace("\x1b[0m", "")
 
 
@@ -282,7 +307,7 @@ def test_quiet_suppresses_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(sys, "stderr", fake)
     argv = _run_argv(_drops_csv(tmp_path), tmp_path / "out", "--quiet")
     _pl.main(argv)
-    assert "run summary" not in fake.getvalue()
+    assert " summary " not in fake.getvalue()
 
 
 def test_json_gains_status_ok(tmp_path: Path) -> None:
@@ -315,9 +340,9 @@ def test_fallback_recorded_in_summary(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_summary_printed_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Plain mode: exactly one summary block (not once plain + once live)."""
+    """Exactly one summary block per run (X3: the panel title appears once)."""
     fake = FakeTTY()
     monkeypatch.setattr(sys, "stderr", fake)
     argv = _run_argv(_drops_csv(tmp_path), tmp_path / "out")
     _pl.main(argv)
-    assert fake.getvalue().count("run summary") == 1
+    assert fake.getvalue().count(" summary ") == 1
