@@ -251,9 +251,17 @@ def test_fnf_internal_resource_names_itself(capsys: pytest.CaptureFixture) -> No
 def test_missing_meminfo_run_names_ram_detection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """End-to-end: absent meminfo + bare --turbo reports unknown RAM, exits 0."""
+    """End-to-end: absent meminfo + bare --turbo reports unknown RAM, exits 0.
+
+    Platform-deterministic (#106): stub every physical-RAM source. The
+    meminfo path covers Linux; the shared-detector stub (_read_physical_gb
+    -> None) covers darwin, where the sysctl hw.memsize probe inside it
+    would otherwise succeed on a real macOS runner (RAM known) and the
+    unknown-RAM branch never runs.
+    """
     csv = _tiny_csv(tmp_path)
     monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
+    monkeypatch.setattr(turbop, "_read_physical_gb", lambda: None)
     monkeypatch.setattr(turbop, "_read_cgroup_max_gb", lambda: math.inf)
     main(_run_argv(tmp_path / "out", "--turbo", csv=csv))
     err = capsys.readouterr().err
