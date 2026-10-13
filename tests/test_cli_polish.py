@@ -13,11 +13,13 @@ failures, --json write-failure mapping, EPSG exit-2 alignment).
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
 import pytest
 
+from ppgrid import turbop
 from ppgrid.pipeline import _build_parser, _resolve_log_level, main
 
 
@@ -429,9 +431,16 @@ def test_new_flags_byte_identical(tmp_path: Path, extra: list[str]) -> None:
 
 
 def test_turbo_run_keeps_stdout_clean(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Turbo run: the precheck summary is a log line (stderr), stdout stays empty (#77)."""
+    # Pin RAM detection: the cap message must hold on any runner (a real macOS
+    # runner's ~7.5 GB box would clamp --turbo 16 to the 8 GB floor).
+    monkeypatch.setattr(turbop, "_read_physical_gb", lambda: 128.0)
+    monkeypatch.setattr(turbop, "_read_cgroup_max_gb", lambda: math.inf)
     with caplog.at_level(logging.DEBUG, logger="ppgrid"):
         main(_run_argv(tmp_path, tmp_path / "out", "--turbo", "16"))
     captured = capsys.readouterr()

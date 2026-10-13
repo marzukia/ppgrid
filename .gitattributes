@@ -1,0 +1,6 @@
+# Force LF on checkout regardless of platform (Windows would otherwise
+# apply CRLF to text files). The CI anchor gate (bench/check_anchors.py)
+# requires byte-identical inputs on ubuntu/macos/windows, and cinterp.c's
+# md5 is embedded in the JIT module name, so source bytes must not depend
+# on the OS that checked the repo out.
+* text=auto eol=lf

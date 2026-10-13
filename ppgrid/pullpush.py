@@ -36,9 +36,28 @@ _COUNT_EPS = 1e-9
 # Sentinel support (metres) for "no data anywhere in the pyramid ancestry".
 _UNRESOLVED_M = 1e9
 
-_LIBC = ctypes.CDLL(None, use_errno=True)
+try:
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+except (TypeError, OSError, AttributeError):
+    # Windows: CPython's CDLL.__init__ runs the "if '/' in name" fullpath
+    # check before the name-is-None special case, so CDLL(None) raises
+    # TypeError on os.name == 'nt'. madvise is a POSIX-only optimisation;
+    # without the libc handle _MADVISE is None and _nohuge() returns early
+    # (a byte-identical no-op).
+    _LIBC = None
 _MADV_NOHUGEPAGE = 15
-_PAGE = os.sysconf("SC_PAGE_SIZE")
+try:
+    _PAGE = os.sysconf("SC_PAGE_SIZE")
+except (AttributeError, OSError, ValueError):
+    # SC_PAGE_SIZE is documented Unix-only (ValueError possible on Windows);
+    # the try/except above covers every failure mode, and _PAGE is unused
+    # there anyway (_MADVISE is None, so _nohuge returns before touching it).
+    _PAGE = 4096
+# Windows: CDLL(None) is kernel32, which has no madvise — the advice is a
+# no-op there, so probe once and skip (byte-identical on POSIX: same
+# function pointer, same call; on macOS madvise(15) returns EINVAL and is
+# already ignored, behaviour unchanged).
+_MADVISE = getattr(_LIBC, "madvise", None)
 # Below this, glibc serves chunks from arena heap VMAs where a mid-VMA
 # MADV_NOHUGEPAGE split has tripped glibc heap asserts (non-deterministic
 # abort in the test suite). >= 16 MiB arrays are direct mmaps, where the
@@ -56,7 +75,10 @@ def _nohuge(*arrays: np.ndarray | None) -> None:
     4KB pages). Calling this right after allocation (before any first touch)
     keeps the later fills fast. Values are unaffected - only the page size.
     No-op on None/empty; safe on memmaps (shmem honours the advice too).
+    Also a no-op where the C library has no madvise (Windows).
     """
+    if _MADVISE is None:
+        return
     for a in arrays:
         if a is None or a.size == 0 or a.nbytes < _NOHUGE_MIN_BYTES:
             continue
@@ -65,7 +87,7 @@ def _nohuge(*arrays: np.ndarray | None) -> None:
         # page-aligned: snap the start down, round the length up.
         start = a.ctypes.data & ~(_PAGE - 1)
         length = (a.nbytes + (a.ctypes.data - start) + _PAGE - 1) & ~(_PAGE - 1)
-        _LIBC.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_NOHUGEPAGE)
+        _MADVISE(ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_NOHUGEPAGE)
 
 
 def downsample_sum(a: np.ndarray) -> np.ndarray:

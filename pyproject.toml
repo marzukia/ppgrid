@@ -90,6 +90,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# ppgrid/turbop.py probes platform RAM via /usr/sbin/sysctl on darwin (fixed
+# argv, no shell); the strict subprocess rules fit build glue, not a probe.
+"ppgrid/turbop.py" = [
+    "suspicious-subprocess-import",   # S404: sysctl fixed argv, no shell
+]
 # ppgrid/_cinterp.py is JIT-build glue: a subprocess cc call and module-level
 # backend state are the whole point; the strict rules fit its callers, not it.
 "ppgrid/_cinterp.py" = [
@@ -104,6 +109,28 @@ ignore = [
 # tests/test_cinterp.py pokes at private state (_mod, _p) on purpose.
 "tests/test_cinterp.py" = [
     "private-member-access",    # fallback simulation + transform internals
+]
+# tests/test_os_portability.py simulates other OSes: it pokes private state
+# (_MADVISE, _STATE, _read_physical_gb) and runs the venv interpreter directly.
+"tests/test_os_portability.py" = [
+    "private-member-access",    # degraded-state pokes
+    "suspicious-subprocess-import",   # S404: own interpreter, fixed argv
+    "subprocess-without-shell-equals-true",   # no shell, fixed argv
+    "subprocess-run-without-check",   # returncode checked explicitly
+]
+# tests/test_tier2_shared.py wraps _prepare_shared to capture the per-box refs
+# before the write phase releases cfg.pts (Windows WinError 32 fix).
+"tests/test_tier2_shared.py" = [
+    "private-member-access",    # harness wraps _prepare_shared
+]
+# Lazy native stack (PEP 562): the TYPE_CHECKING blocks declare the names
+# for static analysis; _load_native() binds them at first use (runtime).
+"ppgrid/pipeline.py" = ["TC004"]
+"ppgrid/zstdmt.py" = ["TC004"]
+# Fresh-interpreter probes: the code strings are our own constants.
+"tests/test_lazy_imports.py" = [
+    "S404",   # suspicious subprocess import
+    "S603",   # subprocess.run([sys.executable, -c, <own constant>])
 ]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
@@ -130,7 +157,7 @@ ignore = [
 testpaths = ["tests"]
 # rasterio's MemoryDataset (reproject's ndarray destination) warns NotGeoreferencedWarning
 # on the initial transform read of the MEM::: dataset, then sets the real transform.
-# pipeline.py ignores the category at import, but pytest's per-test
+# pipeline.py ignores the category at first warp (_ensure_warp_ready), but pytest's per-test
 # warnings.catch_warnings + simplefilter wipes module filters, so restate it here.
 filterwarnings = ["ignore:Dataset has no geotransform:UserWarning"]
 
