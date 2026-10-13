@@ -434,6 +434,37 @@ def _ui_note(kind: str, text: str) -> None:
         ui.note(text)
 
 
+def _ru_maxrss_gb() -> float | None:
+    """Process peak RSS in GB via resource.getrusage, or None (issue #102).
+
+    ru_maxrss is KB on Linux and bytes on macOS; Windows has no stdlib
+    resource module, so callers label the value ``estimated`` instead.
+
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    try:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (AttributeError, OSError, ValueError):
+        return None
+    if rss <= 0:
+        return None
+    return rss / 1e9 if sys.platform == "darwin" else rss / 1024.0 / 1024.0
+
+
+def _human_size(n: int) -> str:
+    """Bytes as a compact decimal size: 856 KB, 1.2 MB (issue #102)."""
+    if n >= 1e9:
+        return f"{n / 1e9:.1f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f} MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f} KB"
+    return f"{n} B"
+
+
 class _NoPhase:
     """Progress handle for library mode (no UI): every method a no-op."""
 
@@ -2159,6 +2190,13 @@ class Pipeline:
         # then don't report the just-written rasters as stale "left
         # untouched" (issues #40, #77).
         self._published: set[str] = set()
+        # Write-path fallbacks actually taken this run (issue #102); the
+        # final run summary surfaces them at default verbosity, not only in
+        # DEBUG. Reset per run() so re-runs on one instance stay honest.
+        self._fallbacks: list[str] = []
+        # Set by _turbo_zstd_ok() when the A.7 gate fails: the short reason
+        # the summary's fallbacks line names.
+        self._zstd_gate_reason: str | None = None
         # Presentation (issue #101): the active phase handle for the current
         # _phase() scope (None in library mode or outside a phase) and the
         # shared-descent cell count measured in _prepare_shared (so the
@@ -2682,6 +2720,8 @@ class Pipeline:
 
         """
         self._phase_wall = {}
+        self._fallbacks = []
+        self._zstd_gate_reason = None
         t_total = time.perf_counter()
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
         scope = self.ui.run_scope() if self.ui is not None else nullcontext()
@@ -2719,6 +2759,10 @@ class Pipeline:
         # logging output (F3/F4, #115 review).
         if self.ui is not None and self.ui.live:
             self.ui.ok(f"{t_total:.2f}s -> {Path(vpath).name}, {Path(spath).name}")
+        # Final run summary (issue #102): default verbosity in both plain
+        # and live modes; --quiet keeps the pre-#101 surface (zero stderr).
+        if self.ui is not None and not self.ui.quiet:
+            self.ui.summary("run summary", self._run_summary_rows(t_total, vpath, spath))
         return vpath, spath
 
     def plan(self) -> None:
@@ -2847,6 +2891,9 @@ class Pipeline:
             return round(seconds * 1e3, 3)
 
         return {
+            # Only JSON delta of issue #102: written only after a successful
+            # run(), so it is always 'ok' (error surface = the exit code).
+            "status": "ok",
             "ppgrid_version": __version__,
             "seed": self.seed,
             "transform": self.tname,
@@ -2903,6 +2950,77 @@ class Pipeline:
             "turbo": turbo,
             "outputs": {"value": vpath, "support": spath},
         }
+
+    def _strategy_text(self) -> str:
+        """Plain-language strategy line for the run summary (issue #102).
+
+        E.g. ``full in-RAM turbo, cap 16 GB, budget 13.6 GB, workers 2``;
+        the per-box regime names itself as the low-RAM fallback.
+        """
+        d = self._turbo_decision
+        if d is not None and self._turbo_plan is not None:
+            t = self._turbo_plan
+            return (
+                f"{turbop.regime_name(d.regime)} turbo, cap {t.cap_gb:g} GB, "
+                f"budget {d.budget_gb:g} GB, workers {t.workers}"
+            )
+        if self.turbo:
+            return f"turbo, workers {self.workers}"
+        return f"standard, workers {self.workers}"
+
+    def _peak_ram_text(self) -> str:
+        """Peak-RAM line: measured ru_maxrss, else visibly labelled estimated (#102)."""
+        gb = _ru_maxrss_gb()
+        if gb is not None:
+            return f"{gb:.1f} GB (measured)"
+        d = self._turbo_decision
+        if d is not None:
+            return f"~{d.est_peak_gb:.1f} GB (estimated)"
+        est = turbop.est_peak(self.nx_padded * self.ny_padded, self.n)
+        return f"~{est / turbop.GB:.1f} GB (estimated)"
+
+    def _run_summary_rows(self, t_total: float, vpath: str, spath: str) -> list[tuple[str, str] | str]:
+        """Rows for the final run summary block (issue #102).
+
+        Rows read/accepted/dropped (with reasons), grid WxH + cell count,
+        strategy (the per-box regime names itself as a fallback),
+        write-path fallbacks when any were taken, elapsed, peak RAM, output
+        sizes, and the output paths one per line (bare, copyable).
+        """
+        rows: list[tuple[str, str] | str] = [
+            ("rows read", f"{self.n_total:,}"),
+            ("rows accepted", f"{self.n:,}"),
+        ]
+        if self.n_dropped:
+            detail = []
+            if self.n_dropped_nan_inf:
+                detail.append(f"{self.n_dropped_nan_inf} non-finite value")
+            if self.n_dropped_out_of_domain:
+                detail.append(f"{self.n_dropped_out_of_domain} out-of-domain")
+            if self.n_dropped_nonfinite_proj:
+                detail.append(f"{self.n_dropped_nonfinite_proj} non-finite projection")
+            rows.append(("rows dropped", f"{self.n_dropped} ({'; '.join(detail)})" if detail else str(self.n_dropped)))
+        else:
+            rows.append(("rows dropped", "0"))
+        rows.extend(
+            [
+                ("grid", f"{self.nx}x{self.ny} ({self.nx * self.ny:,} cells)"),
+                ("strategy", self._strategy_text()),
+            ]
+        )
+        if self._fallbacks:
+            rows.append(("fallbacks", "; ".join(dict.fromkeys(self._fallbacks))))
+        rows.extend(
+            [
+                ("elapsed", f"{t_total:.2f}s"),
+                ("peak RAM", self._peak_ram_text()),
+                ("value.tif", _human_size(Path(vpath).stat().st_size)),
+                ("support_km.tif", _human_size(Path(spath).stat().st_size)),
+                str(vpath),
+                str(spath),
+            ]
+        )
+        return rows
 
     def _log_run_summary(
         self,
@@ -3184,6 +3302,7 @@ class Pipeline:
             # zstdmt.available() inside the try (audit #81 F-3): a gate
             # failure must mean "stock parallel write", never a crash.
             if not zstdmt.available():
+                self._zstd_gate_reason = "CPL zstd unavailable"
                 _ui_note("warn", "[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write")
                 return False
             with rasterio.open(
@@ -3208,8 +3327,10 @@ class Pipeline:
             verdict = zstdmt.oracle_check(probe, tile=0)
             if verdict.ok:
                 return True
+            self._zstd_gate_reason = "oracle mismatch"
             _ui_note("warn", f"[warn] {verdict.detail}")
         except Exception as e:  # ruff: ignore[blind-except] - any probe failure means the stock parallel writer runs
+            self._zstd_gate_reason = "oracle probe error"
             _ui_note("warn", f"[warn] turbo zstd oracle: {e}; stock parallel write")
         finally:
             probe.unlink(missing_ok=True)
@@ -3689,6 +3810,7 @@ class Pipeline:
         _load_native()  # mid-run failure path references _CLI_MAPPED_EXCEPTIONS
         budget = self._turbo_budget_bytes
         if budget is not None and self.nx * self.ny * 4 > budget // 2:
+            self._fallbacks.append("DN field over half budget -> serial write")
             self._write_rasters_serial(vprof, sprof, vpath, spath, vtags, stags)
             return
 
@@ -3787,6 +3909,10 @@ class Pipeline:
             warp_threads = self._turbo_plan.workers if self._turbo_plan is not None else self.n_threads
             with _prof.phase("write.oracle"):
                 cpl = self._turbo_zstd_ok()
+            if not cpl:
+                self._fallbacks.append(
+                    f"zstd parallel write -> stock parallel ({self._zstd_gate_reason or 'oracle mismatch'})"
+                )
             # The writers below create ftmp_v / ftmp_s fresh (O_EXCL |
             # O_NOFOLLOW) and never follow a pre-planted symlink (issues #15, #77).
             for band, arr, prof, path, tags, scales in (
@@ -3827,6 +3953,8 @@ class Pipeline:
                                 )
                             except Exception as e:  # ruff: ignore[blind-except] - layout surprise: fall back
                                 _ui_note("warn", f"[warn] turbo zstd parallel: {e}; stock parallel write")
+                            if not wrote:
+                                self._fallbacks.append("zstd parallel write guard -> stock parallel")
                         if not wrote:
                             try:
                                 wrote = _turbo_write_stock_parallel(
@@ -3849,6 +3977,8 @@ class Pipeline:
                                 )
                             except Exception as e:  # ruff: ignore[blind-except] - any surprise: serial
                                 _ui_note("warn", f"[warn] turbo stock parallel: {e}; serial write")
+                            if not wrote:
+                                self._fallbacks.append("stock parallel write guard -> serial write")
                         if not wrote:
                             # Layout guard tripped (see the parallel writers): the
                             # serial array reproject is byte-identical by
