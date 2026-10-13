@@ -39,10 +39,62 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # static bindings only; __getattr__ provides the runtime values
+    import rasterio
+    from rasterio.windows import Window
 
 import numpy as np
-import rasterio
-from rasterio.windows import Window
+
+# rasterio (and the GDAL C extension behind it) is only used by oracle_check;
+# keep it out of the import path so `import ppgrid` stays cheap (see
+# pipeline.py). The two names below resolve on first attribute access
+# (PEP 562) and cache in the module namespace, so `from ppgrid.zstdmt import
+# rasterio` keeps working.
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "Window": ("rasterio.windows", "Window"),
+    "rasterio": ("rasterio", ""),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a lazily imported rasterio name (see _LAZY_IMPORTS).
+
+    Raises:
+        AttributeError: If name is not a lazy import.
+
+    """
+    try:
+        module_name, attr = _LAZY_IMPORTS[name]
+    except KeyError:
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg) from None
+    import importlib
+
+    module = importlib.import_module(module_name)
+    value = module if not attr else getattr(module, attr)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_IMPORTS))
+
+
+def _load_native() -> None:
+    """Populate the lazy names in the module dict (idempotent).
+
+    CPython's LOAD_GLOBAL does not consult a module __getattr__, so the
+    functions in this module can only see rasterio/Window once they are in
+    the module dict. Call it before running such code (oracle_check is the
+    only caller needed today).
+
+    """
+    for name in _LAZY_IMPORTS:
+        if name not in globals():
+            globals()[name] = __getattr__(name)
+
 
 __all__ = [
     "OracleVerdict",
@@ -673,6 +725,7 @@ def oracle_check(
             is out of range.
 
     """
+    _load_native()
     tif = _tif_info(Path(path))
     if tif.predictor not in (1, 2):
         msg = f"predictor {tif.predictor} not supported by the oracle (need 1 or 2)"

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import errno
+import importlib
 import io
 import json
 import logging
@@ -28,20 +29,10 @@ from dataclasses import asdict, dataclass
 from functools import partial
 from itertools import starmap
 from pathlib import Path
-from typing import Any, NoReturn, Self
+from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 import numpy as np
 import pandas as pd
-import rasterio
-from pyproj import Transformer
-from pyproj.exceptions import CRSError
-from rasterio._io import MemoryDataset
-from rasterio.crs import CRS
-from rasterio.errors import CRSError as RasterioCRSError
-from rasterio.errors import NotGeoreferencedWarning, RasterioIOError
-from rasterio.transform import Affine, from_bounds, from_origin
-from rasterio.warp import Resampling, reproject
-from rasterio.windows import Window
 
 from . import __version__, _prof, turbop, zstdmt
 from ._tempfiles import _open_fresh_memmap
@@ -68,14 +59,111 @@ from .pullpush import (
     pull_push,
 )
 
+# --- lazy native imports (PEP 562) ------------------------------------------
+# rasterio (GDAL C extension) and pyproj (PROJ) cost tens of ms of import
+# time together and are only needed once the pipeline does geospatial work
+# (point projection, warping, raster I/O). `import ppgrid` and `ppgrid
+# --help` must not pay for them, so the names below resolve on first
+# attribute access and are then cached in the module namespace. The public
+# surface is unchanged: `from ppgrid.pipeline import reproject` and
+# `monkeypatch.setattr(ppgrid.pipeline, "reproject", ...)` keep working, a
+# patched attribute lives in the module dict, which shadows __getattr__ (it
+# only fires on a lookup miss).
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "Affine": ("rasterio.transform", "Affine"),
+    "CRS": ("rasterio.crs", "CRS"),
+    "CRSError": ("pyproj.exceptions", "CRSError"),
+    "MemoryDataset": ("rasterio._io", "MemoryDataset"),
+    "NotGeoreferencedWarning": ("rasterio.errors", "NotGeoreferencedWarning"),
+    "RasterioCRSError": ("rasterio.errors", "CRSError"),
+    "RasterioIOError": ("rasterio.errors", "RasterioIOError"),
+    "Resampling": ("rasterio.warp", "Resampling"),
+    "Transformer": ("pyproj", "Transformer"),
+    "Window": ("rasterio.windows", "Window"),
+    "from_bounds": ("rasterio.transform", "from_bounds"),
+    "from_origin": ("rasterio.transform", "from_origin"),
+    "reproject": ("rasterio.warp", "reproject"),
+    "rasterio": ("rasterio", ""),
+}
+
+if TYPE_CHECKING:  # static bindings only; _load_native() provides the runtime values
+    import rasterio
+    from pyproj import Transformer
+    from pyproj.exceptions import CRSError
+    from rasterio._io import MemoryDataset
+    from rasterio.crs import CRS
+    from rasterio.errors import CRSError as RasterioCRSError
+    from rasterio.errors import NotGeoreferencedWarning, RasterioIOError
+    from rasterio.transform import Affine, from_bounds, from_origin
+    from rasterio.warp import Resampling, reproject
+    from rasterio.windows import Window
+
+
+def _load_native() -> None:
+    """Import rasterio + pyproj and publish all lazy names in the module dict.
+
+    CPython's LOAD_GLOBAL does not consult a module __getattr__, so function
+    bodies can only see these names once they are in the module dict. This
+    runs the one-time import (sys.modules-cached afterwards) and populates
+    the dict. Idempotent; names already present (e.g. monkeypatched) are
+    left alone. Call it at every entry point that can run the functions
+    below directly (CLI, Pipeline methods, reproject helpers).
+
+    """
+    if "rasterio" in globals():
+        return
+    for name, (module_name, attr) in _LAZY_IMPORTS.items():
+        if name in globals():
+            continue
+        module = importlib.import_module(module_name)
+        globals()[name] = module if not attr else getattr(module, attr)
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a lazily imported rasterio/pyproj name (see _LAZY_IMPORTS).
+
+    Raises:
+        AttributeError: If name is not a lazy import.
+
+    """
+    if name in _LAZY_IMPORTS:
+        _load_native()
+        return globals()[name]
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg) from None
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_IMPORTS))
+
+
 # rasterio's MemoryDataset.__init__ (used by reproject for ndarray buffers)
 # always warns NotGeoreferencedWarning on the initial transform read of the
 # MEM::: dataset, then sets the real transform immediately after. It normally
 # hides the warning in a nested warnings.catch_warnings, but CPython warning
 # filters are process-global, not thread-safe: with concurrent warps (S3.3)
 # another thread can restore a stale filter snapshot and leak the benign
-# warning. It carries no information here, so ignore the category.
-warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+# warning. It carries no information here, so ignore the category. The filter
+# is installed lazily in _ensure_warp_ready (first warp, before the pool
+# starts) because the category lives in the heavy rasterio package.
+_WARP_READY: dict[str, bool] = {}
+
+
+def _ensure_warp_ready() -> None:
+    """Load the native stack and install the NotGeoreferencedWarning filter.
+
+    Call at the top of every function that warps, before its thread pool
+    starts: _load_native makes the module globals visible to the warp
+    functions, and the process-global filter (installed once per process)
+    then covers every warp thread.
+
+    """
+    _load_native()
+    if _WARP_READY.get("filter"):
+        return
+    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+    _WARP_READY["filter"] = True
+
 
 # Module logger (pattern shared with turbop.py). The CLI configures the
 # `ppgrid` logger (level + compact stderr format) in main(); library users
@@ -792,6 +880,7 @@ def _warp_dst_tile(
         Tuple of (tile column origin i0, warped int16 tile buffer).
 
     """
+    _ensure_warp_ready()
     band_w = min(warp_tile, dst_width - i0)
     with rasterio.open(src_path) as src:
         w = Window(i0, j0, band_w, band_h)
@@ -855,6 +944,7 @@ def _warp_dst_tile_arr(
         (i0, buf) - buf shape (band_h, band_w).
 
     """
+    _ensure_warp_ready()
     band_w = min(warp_tile, dst_width - i0)
     w = Window(i0, j0, band_w, band_h)
     w_bounds = rasterio.windows.bounds(w, dst_transform)
@@ -913,6 +1003,7 @@ def _reproject_core(
         n_threads: Warp threads. 1 = fully serial (A8 path).
 
     """
+    _ensure_warp_ready()
     dst_profile = dict(
         profile,
         width=dst_width,
@@ -1040,6 +1131,7 @@ def _reproject_band(
     no tile is skippable (or task_info is None) the output is identical to
     the unskipped path.
     """
+    _load_native()
     with rasterio.open(src_path) as src:
         skip = task_info is not None
         if skip:
@@ -1147,6 +1239,8 @@ def _reproject_band_array(
         n_threads: Warp threads. 1 = fully serial (A8 path).
 
     """
+    _load_native()
+
     # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
     # pass 3, ported to the serial array reproject - audit #78 P1-3):
     # reproject's ndarray source form copies the whole band into a fresh
@@ -1300,6 +1394,7 @@ def _turbo_write_parallel(
         >= 4 GiB assembled file).
 
     """
+    _ensure_warp_ready()
     warp_tile = 2048
     # The parallel ZSTD writer resolves the GDAL CPL zstd function pointer
     # from /proc/self/maps (Linux only). Where it is unavailable (macOS,
@@ -1530,6 +1625,7 @@ def _turbo_write_stock_parallel(
         the serial array reproject (layout guards).
 
     """
+    _ensure_warp_ready()
     warp_tile = 2048
     # 1. Reference raster: stock GDAL head + exact tag layout. The head
     # (IFD + tag arrays) is sized from the raster dimensions at creation,
@@ -1832,6 +1928,7 @@ class Pipeline:
             ValueError: If seed is not >= 0.
 
         """
+        _load_native()
         self.input_path = input_path
         self.value_col = value_col
         self.lng_col = lng_col
@@ -3679,22 +3776,7 @@ def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
 # no full stack is pre-printed before the traceback is released). SystemExit
 # is included too: pass-through control flow (e.g. --turbo-strict exit 3),
 # not a failure warranting a stack.
-_CLI_MAPPED_EXCEPTIONS: tuple[type[BaseException], ...] = (
-    CRSError,
-    RasterioCRSError,
-    ImportError,
-    FileNotFoundError,
-    pd.errors.ParserError,
-    RasterioIOError,
-    IndexError,
-    OverflowError,
-    ZeroDivisionError,
-    RuntimeError,
-    KeyError,
-    ValueError,
-    OSError,
-    SystemExit,
-)
+# _CLI_MAPPED_EXCEPTIONS: built by _load_native() (references lazy names).
 
 
 def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
@@ -3715,6 +3797,7 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         SystemExit: 1 (pipeline/IO) or 2 (validation, unknown EPSG).
 
     """
+    _load_native()  # the except clauses below reference CRSError (pyproj)
     try:
         return fn()
     except (CRSError, RasterioCRSError) as e:
