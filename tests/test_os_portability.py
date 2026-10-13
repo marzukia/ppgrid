@@ -52,9 +52,10 @@ import math
 import os
 import subprocess
 import sys
+import types
 import weakref
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import numpy as np
 import pandas as pd
@@ -120,6 +121,61 @@ def test_macos_no_proc_meminfo_returns_none(tmp_path: Path, monkeypatch: pytest.
     """_read_physical_gb returns None (not FileNotFoundError) when /proc is absent."""
     monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
     assert turbop._read_physical_gb() is None
+
+
+def _sysctl_stdout(stdout: str, returncode: int = 0) -> Any:
+    def _run(*_a: object, **_k: object) -> types.SimpleNamespace:
+        return types.SimpleNamespace(stdout=stdout, returncode=returncode)
+
+    return _run
+
+
+def test_macos_sysctl_hw_memsize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sysctl hw.memsize on macOS yields physical RAM (no /proc/meminfo)."""
+    monkeypatch.setattr(turbop.sys, "platform", "darwin")
+    monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
+    monkeypatch.setattr(turbop.subprocess, "run", _sysctl_stdout("171798691840\n"))  # 160 GiB, bytes
+    assert turbop._read_physical_gb() == pytest.approx(171.79869184)
+
+
+def test_macos_sysctl_absent_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sysctl missing or empty output on macOS falls back to unknown RAM."""
+    monkeypatch.setattr(turbop.sys, "platform", "darwin")
+    monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
+
+    def _raise(*_a: object, **_k: object) -> NoReturn:
+        msg = "sysctl"
+        raise FileNotFoundError(msg)
+
+    monkeypatch.setattr(turbop.subprocess, "run", _raise)
+    assert turbop._read_physical_gb() is None
+    monkeypatch.setattr(turbop.subprocess, "run", _sysctl_stdout("   \n"))
+    assert turbop._read_physical_gb() is None
+
+
+def test_macos_preset_clamps_to_box_minus_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--turbo 128 on a 128 GB box must clamp to box - 8 GB headroom.
+
+    Regression (Mac Studio, 2026-10-13): pre-fix, physical None (no
+    /proc/meminfo, no sysctl probe) skipped the clamp and trusted the 128 GB
+    preset as-is, planning the whole box and OOMing; --turbo 64 only
+    "worked" as a manual bypass because 64 < box.
+
+    """
+    monkeypatch.setattr(turbop.sys, "platform", "darwin")
+    monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
+    monkeypatch.setattr(turbop.subprocess, "run", _sysctl_stdout("128000000000\n"))  # 128 GB decimal, bytes
+    physical = turbop._read_physical_gb()
+    assert physical == pytest.approx(128.0)
+    cap, source = turbop.resolve_cap(128.0, physical_gb=physical, cgroup_gb=math.inf)
+    assert cap == 120.0
+    assert "clamped to available 128 GB - 8 GB" in source
+    # below the box the preset stands (the --turbo 64 case).
+    cap, source = turbop.resolve_cap(64.0, physical_gb=physical, cgroup_gb=math.inf)
+    assert cap == 64.0
+    assert source == "preset 64 GB"
 
 
 def test_macos_no_proc_cap_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
