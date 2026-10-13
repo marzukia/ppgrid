@@ -4114,9 +4114,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="GB",
         help="Explicit RAM cap in GB (decimal, 1e9 bytes; overrides the --turbo preset). Implies --turbo.",
     )
-    g_mem.add_argument(
-        "--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram."
-    )
+    g_mem.add_argument("--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram.")
     g_mem.add_argument(
         "--turbo-strict",
         action="store_true",
