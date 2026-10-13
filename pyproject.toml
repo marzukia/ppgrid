@@ -140,6 +140,11 @@ ignore = [
     "S603",   # subprocess.run([sys.executable, -c, <own constant>])
 ]
 
+# tests/test_run_summary.py drives the adaptive table layout through the
+# Progress instance (private _progress) and the pure helpers on purpose.
+"tests/test_run_summary.py" = [
+    "private-member-access",    # layout snapshots reach into UI internals
+]
 # tests/test_cli_help.py reads parser internals and runs the epilog examples.
 "tests/test_cli_help.py" = [
     "private-member-access",    # parser._actions / _action_groups
