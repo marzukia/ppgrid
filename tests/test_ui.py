@@ -269,12 +269,16 @@ def test_no_color_env_suppresses_live_on_tty(tmp_path: Path, monkeypatch: pytest
 
 
 def test_error_line_red_only_when_colored(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """A CLI error is red SGR with --color always, plain without it."""
+    """A CLI error is red SGR with --color always, plain without it.
+
+    D-7: the plain line is the unified ``E ppgrid.pipeline: <msg>`` log
+    line (the state word is the level letter, not the text).
+    """
     with pytest.raises(SystemExit) as exc:
         main(["/nonexistent-input.csv", "-o", str(tmp_path / "o1")])
     assert exc.value.code == 1
     err = capsys.readouterr().err
-    assert "error" in err
+    assert "E ppgrid.pipeline: input file not found: /nonexistent-input.csv" in err
     assert "\x1b[" not in err
     with pytest.raises(SystemExit) as exc:
         main(["/nonexistent-input.csv", "-o", str(tmp_path / "o2"), "--color", "always"])
@@ -419,12 +423,13 @@ def test_verbose_env_report_single_line(
     The version values must be real (digits, not 'unknown'/'not loaded'
     placeholders): the report probes with local imports, so it must work in a
     fresh process where the module-lazy native globals are not yet published
-    (F1, #115 review).
+    (F1, #115 review). D-7: the line is the unified
+    ``I ppgrid.pipeline: env: ...`` log line.
     """
     monkeypatch.delenv("NO_COLOR", raising=False)
     main(_run_argv(tmp_path, tmp_path / "out", "--verbose"))
     err = capsys.readouterr().err
-    lines = [ln for ln in err.splitlines() if ln.startswith("env:")]
+    lines = [ln for ln in err.splitlines() if ln.startswith("I ppgrid.pipeline: env:")]
     assert len(lines) == 1
     line = lines[0]
     for field in (
@@ -465,13 +470,19 @@ def test_plain_run_stderr_no_ok_line(
 
 
 def test_live_run_emits_final_ok_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Live table mode (TTY) emits the final ok line with the output names."""
+    """Live table mode (TTY) emits the final ok line with the output names.
+
+    D-8: the line carries the promised ``ok: `` prefix (the docstring
+    contract) — not just the bare success text.
+    """
     fake = FakeTTY()
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr(sys, "stderr", fake)
     main(_run_argv(tmp_path, tmp_path / "out"))
     text = fake.getvalue()
-    assert re.search(r"\d+\.\d+s -> value\.tif, support_km\.tif", text), "ok line missing from live stderr"
+    assert re.search(r"ok: \d+\.\d+s -> value\.tif, support_km\.tif", text), (
+        "ok line with 'ok: ' prefix (D-8) missing from live stderr"
+    )
 
 
 def test_quiet_tty_zero_stderr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

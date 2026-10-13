@@ -450,7 +450,8 @@ def test_cli_explicit_invalid_transform_hard_error(tmp_path: Path, capsys: pytes
         sys.argv = old_argv
     assert exc.value.code == 2
     err = capsys.readouterr().err
-    assert "error:" in err
+    # D-7: unified plain error line (level letter, no raw 'error:' prefix)
+    assert "E ppgrid.pipeline:" in err
     assert "log10" in err
     assert "not valid" in err
 
@@ -772,7 +773,8 @@ def _run_cli(capsys: pytest.CaptureFixture[str], *args: str) -> tuple[int, str]:
 
 def _assert_clean_error(code: int, err: str, needle: str) -> None:
     assert code in (1, 2), f"exit code {code}, expected non-zero"
-    assert err.startswith("error: "), f"stderr must start with 'error: ', got: {err!r}"
+    # D-7: clean errors are unified plain log lines, not raw 'error:' prints.
+    assert err.startswith("E ppgrid.pipeline: "), f"stderr must start with 'E ppgrid.pipeline: ', got: {err!r}"
     assert needle in err
     assert "Traceback" not in err
 
