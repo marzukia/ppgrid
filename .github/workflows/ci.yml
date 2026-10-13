@@ -76,3 +76,59 @@ jobs:
       - run: uv run pytest
       - name: Anchor gate (outputs must be byte-identical to committed examples)
         run: uv run python bench/check_anchors.py
+
+  # Built-artifact gate (issue #98): uv build -> fresh stdlib venv (plain
+  # pip, no dev extras) -> installed console-script e2e -> anchor gate.
+  # The wheel must install and run on every OS in the matrix (s2: per-OS
+  # install). Byte-exact anchor matching applies only on canonical x86_64
+  # Linux; every other leg gets functional-equivalence (same rules as
+  # bench/check_anchors.py). The e2e venv pins its runtime deps to uv.lock
+  # before the anchor gate: the anchors were cut on that toolchain, and a
+  # fresh pip resolution drifts the grid transform by ~1e-15, changing
+  # output bytes on every OS (decoded pixels stay identical) — see
+  # scripts/check_artifact.sh. The fresh install itself still runs first,
+  # so per-OS wheel availability + pip metadata stay exercised.
+  artifact:
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+      - name: Build wheel + sdist
+        run: uv build
+      - name: "Wheel: clean-venv install + e2e + anchor gate + Parquet e2e (items 1-4, 7)"
+        run: scripts/check_artifact.sh dist/ppgrid-*-py3-none-any.whl parquet
+      - name: Dependency vuln scan (item 8)
+        # Fail threshold: pip-audit exits 1 on ANY known vulnerability in
+        # the installed dep tree (default PyPI advisory service). No
+        # --ignore-vuln suppressions; triage = bump the dep in pyproject
+        # and relock. The scan runs on the pinned (uv.lock) tree, i.e. the
+        # dependency set this repo actually ships. The installed set is
+        # rendered as name==version (pip freeze emits file:// direct refs
+        # for the locally installed wheel, which pip-audit cannot parse),
+        # deduped (importlib.metadata can double-count on multiarch
+        # lib/lib64 venvs), and the project itself is excluded (pip-audit -r
+        # resolves every line against PyPI; the in-flight version is not
+        # published until the release). The venv's own pip/setuptools are
+        # excluded too: tooling of the disposable CI venv, not artifact
+        # runtime deps (a fresh ensurepip pip can carry advisories before
+        # it is ever used).
+        run: |
+          PROJ=$(/tmp/ppgrid-artifact-venv/bin/python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["name"])')
+          /tmp/ppgrid-artifact-venv/bin/python - <<'PY' | sort -u | grep -vE "^(${PROJ}|pip|setuptools)==" > /tmp/ppgrid-audit-deps.txt
+          import importlib.metadata as m
+          for d in m.distributions():
+              name = d.metadata.get("Name")
+              if name:
+                  print(f"{name}=={d.version}")
+          PY
+          uvx --from pip-audit pip-audit -r /tmp/ppgrid-audit-deps.txt
+      - name: "sdist: clean-venv install + console-script works (item 5, ubuntu leg only)"
+        if: runner.os == 'Linux'
+        run: scripts/check_artifact.sh dist/ppgrid-*.tar.gz
