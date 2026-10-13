@@ -116,6 +116,26 @@ def _load_native() -> None:
                 continue
             module = importlib.import_module(module_name)
             globals()[name] = module if not attr else getattr(module, attr)
+    # _CLI_MAPPED_EXCEPTIONS references lazy names, so it is built here, not
+    # at import time (module-level, but unevaluable before the native stack
+    # is published).
+    if not globals().get("_CLI_MAPPED_EXCEPTIONS"):
+        globals()["_CLI_MAPPED_EXCEPTIONS"] = (
+            CRSError,
+            RasterioCRSError,
+            ImportError,
+            FileNotFoundError,
+            pd.errors.ParserError,
+            RasterioIOError,
+            IndexError,
+            OverflowError,
+            ZeroDivisionError,
+            RuntimeError,
+            KeyError,
+            ValueError,
+            OSError,
+            SystemExit,
+        )
 
 
 def __getattr__(name: str) -> Any:
@@ -3411,6 +3431,7 @@ class Pipeline:
         identical profile - frames byte-equal to the serial flush by
         construction on any stack (_turbo_write_stock_parallel).
         """
+        _load_native()  # mid-run failure path references _CLI_MAPPED_EXCEPTIONS
         budget = self._turbo_budget_bytes
         if budget is not None and self.nx * self.ny * 4 > budget // 2:
             self._write_rasters_serial(vprof, sprof, vpath, spath, vtags, stags)
@@ -3777,7 +3798,9 @@ def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
 # no full stack is pre-printed before the traceback is released). SystemExit
 # is included too: pass-through control flow (e.g. --turbo-strict exit 3),
 # not a failure warranting a stack.
-# _CLI_MAPPED_EXCEPTIONS: built by _load_native() (references lazy names).
+# _CLI_MAPPED_EXCEPTIONS: populated by _load_native() (it references lazy
+# names, so it cannot be built at import time); empty until first native use.
+_CLI_MAPPED_EXCEPTIONS: tuple[type[BaseException], ...] = ()
 
 
 def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
