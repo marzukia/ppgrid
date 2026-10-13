@@ -240,6 +240,48 @@ def test_macos_no_proc_turbo_precheck(tmp_path: Path, monkeypatch: pytest.Monkey
     assert p._turbo_decision.path == "per_box"
 
 
+def test_macos_no_proc_precheck_names_gap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bare --turbo precheck line names the RAM detection gap (no hard exit).
+
+    Real cap path (no resolve_cap stub, no preset): /proc/meminfo absent and
+    the darwin sysctl probe stubbed, so physical RAM is unknown. Acceptance
+    (#99, s8 P0 box 5): the user-visible precheck summary carries the
+    conservative-fallback source string (cgroup bound, or the 8 GB floor),
+    and the run continues (exit 0) - v1's exit-2 "cannot detect physical RAM
+    ... pass --max-ram GB" wording is cut.
+
+    """
+    monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "missing-meminfo"))
+    _stub_darwin_probe(monkeypatch)
+    p = Pipeline(
+        str(REPO / "data" / "melb_houses.csv"),
+        "price",
+        "longitude",
+        "latitude",
+        str(tmp_path / "o"),
+        res=100.0,
+        cap_km=25.0,
+        turbo=True,
+    )
+    p.n, p.nx_padded, p.ny_padded, p.res, p.cap_km_val = (400_000, 41472, 38400, 100.0, 25)
+    # unlimited cgroup: the 8 GB floor, named in the precheck line.
+    monkeypatch.setattr(turbop, "_read_cgroup_max_gb", lambda: math.inf)
+    p._turbo_precheck()
+    assert p._turbo_decision.exit_code == 0
+    assert (
+        "cap 8 GB (auto physical RAM unknown (no /proc/meminfo) and cgroup unlimited; "
+        "conservative floor 8 GB)" in p._turbo_decision.summary
+    )
+    # finite cgroup: the slice bound binds, named in the precheck line.
+    monkeypatch.setattr(turbop, "_read_cgroup_max_gb", lambda: 24.0)
+    p._turbo_precheck()
+    assert p._turbo_decision.exit_code == 0
+    assert (
+        "cap 16 GB (auto physical RAM unknown (no /proc/meminfo); "
+        "cgroup 24.0 GB - 8 GB headroom)" in p._turbo_decision.summary
+    )
+
+
 def test_macos_no_proc_write_parallel_returns_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_turbo_write_parallel is total: False when zstdmt is unavailable.
 
