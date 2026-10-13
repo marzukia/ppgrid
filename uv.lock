@@ -124,6 +124,27 @@ wheels = [
 ]
 
 [[package]]
+name = "markdown-it-py"
+version = "4.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mdurl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/ff/7841249c247aa650a76b9ee4bbaeae59370dc8bfd2f6c01f3630c35eb134/markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49", size = 82454, upload-time = "2026-05-07T12:08:28.36Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/81/4da04ced5a082363ecfa159c010d200ecbd959ae410c10c0264a38cac0f5/markdown_it_py-4.2.0-py3-none-any.whl", hash = "sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a", size = 91687, upload-time = "2026-05-07T12:08:27.182Z" },
+]
+
+[[package]]
+name = "mdurl"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
 name = "nodeenv"
 version = "1.10.0"
 source = { registry = "https://pypi.org/simple" }
@@ -361,6 +382,7 @@ dependencies = [
     { name = "pyproj" },
     { name = "rasterio", version = "1.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "rasterio", version = "1.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "rich" },
 ]
 
 [package.optional-dependencies]
@@ -382,6 +404,7 @@ requires-dist = [
     { name = "pyproj", specifier = ">=3.6,<4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "rasterio", specifier = ">=1.3,<2" },
+    { name = "rich", specifier = ">=13.7,<14" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1" },
 ]
 provides-extras = ["dev", "parquet"]
@@ -740,6 +763,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/59/d2/13f9d16f2cfd4e163973bff03dc730d21d1b6ebdcfc6bf8c4eca1e9ec746/rasterio-1.5.1-cp315-cp315t-manylinux_2_28_aarch64.whl", hash = "sha256:e4ea970d39f0b134fc91141d767b3c49bc2dea38a32f0b036fbdd5ec2e8ca457", size = 37369002, upload-time = "2026-08-08T02:37:08.127Z" },
     { url = "https://files.pythonhosted.org/packages/ed/20/8a44acb103a9f6a5a0f605d4c8825a2de26ea5420b561b4a23b9da864f6a/rasterio-1.5.1-cp315-cp315t-manylinux_2_28_x86_64.whl", hash = "sha256:fbb933659035f0aca32e4dc0dc022c7162b4f6598b15366c5b19b4a7e65c1991", size = 38538441, upload-time = "2026-08-08T02:33:26.991Z" },
     { url = "https://files.pythonhosted.org/packages/12/3f/aa7fd1beda974c7e2ded73abdbc3978c7d60165ee70c0ee29c0ebef22a8b/rasterio-1.5.1-cp315-cp315t-win_amd64.whl", hash = "sha256:ac450a2c1e6de990eaaee347ebceca160b1531c9f13c5db489d0e3113ea13984", size = 31728213, upload-time = "2026-08-08T02:38:21.338Z" },
+]
+
+[[package]]
+name = "rich"
+version = "13.9.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markdown-it-py" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/3a/0316b28d0761c6734d6bc14e770d85506c986c85ffb239e688eeaab2c2bc/rich-13.9.4.tar.gz", hash = "sha256:439594978a49a09530cff7ebc4b5c7103ef57baf48d5ea3184f21d9a2befa098", size = 223149, upload-time = "2024-11-01T16:43:57.873Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/71/39c7c0d87f8d4e6c020a393182060eaefeeae6c01dab6a84ec346f2567df/rich-13.9.4-py3-none-any.whl", hash = "sha256:6049d5e6ec054bf2779ab3358186963bac2ea89175919d699e378b99738c2a90", size = 242424, upload-time = "2024-11-01T16:43:55.817Z" },
 ]
 
 [[package]]

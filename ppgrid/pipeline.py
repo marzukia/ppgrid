@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import platform
 import shutil
 import struct
 import subprocess  # ruff: ignore[suspicious-subprocess-import] — git rev-parse for the --json summary
@@ -23,18 +24,19 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from functools import partial
-from itertools import starmap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 import numpy as np
 import pandas as pd
 
-from . import __version__, _prof, turbop, zstdmt
+from . import __version__, _cinterp, _prof, turbop, zstdmt
+from . import ui as _ui
 from ._tempfiles import _open_fresh_memmap
 from .calibrate import (
     M_PER_KM,
@@ -399,6 +401,106 @@ class _WorkerConfig:
 _CTX: dict[str, Any] = {}
 
 
+# ---------------------------------------------------------------------------
+# Presentation layer (issue #101). `_CURRENT_UI` is set by main() for the
+# duration of the CLI run; module-level helpers route their stderr lines
+# through it. Library mode (no main) and pre-UI paths fall back to a plain
+# stderr print, byte-identical to the old behavior.
+# ---------------------------------------------------------------------------
+
+# A dict holder (not a bare global) so main() can bind/clear it without a
+# module-level `global` statement (ruff PLW0603).
+_CURRENT_UI: dict[str, _ui.UI | None] = {"ui": None}
+
+
+def _ui_note(kind: str, text: str) -> None:
+    """Emit a CLI stderr line via the presentation layer (issue #101).
+
+    kind: ``note`` | ``ok`` | ``warn`` | ``error``. Without an active UI
+    (library mode, or a print that fires before ``main`` builds one) the
+    text goes to stderr as-is.
+    """
+    ui = _CURRENT_UI["ui"]
+    if ui is None:
+        print(text, file=sys.stderr)  # ruff: ignore[print]
+        return
+    if kind == "ok":
+        ui.ok(text)
+    elif kind == "warn":
+        ui.warn(text)
+    elif kind == "error":
+        ui.error(text)
+    else:
+        ui.note(text)
+
+
+class _NoPhase:
+    """Progress handle for library mode (no UI): every method a no-op."""
+
+    __slots__ = ("name", "summary")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.summary: str | None = None
+
+    def set_total(self, total: float) -> None:
+        pass
+
+    def advance(self, n: float) -> None:
+        pass
+
+    def set_count(self, n: float) -> None:
+        pass
+
+
+def _env_report_line(preset: float | None) -> str:
+    """Build the ``--verbose`` one-line environment report (issue #101).
+
+    Version, Python, OS, arch, RAM detection source + resolved cap,
+    rasterio/GDAL/pyproj/numpy versions, and the C-interp status. Must
+    never raise: every probe is best-effort with an ``unknown`` fallback.
+    """
+    parts: list[str] = [f"ppgrid={__version__}", f"python={platform.python_version()}"]
+    try:
+        parts.append(f"os={platform.system().lower()}-{platform.release()}")
+    except Exception:  # ruff: ignore[blind-except] - report line must not break the run
+        parts.append("os=unknown")
+    parts.append(f"arch={platform.machine() or 'unknown'}")
+    try:
+        physical = turbop._read_physical_gb()  # ruff: ignore[private-member-access]
+    except (ValueError, OSError):
+        physical = None
+    try:
+        cgroup = turbop._read_cgroup_max_gb()  # ruff: ignore[private-member-access]
+    except (ValueError, OSError):
+        cgroup = float("inf")
+    try:
+        cap, source = turbop.resolve_cap(preset, physical_gb=physical, cgroup_gb=cgroup)
+        parts.append(f"ram={cap:g}GB ({source})")
+    except Exception as e:  # ruff: ignore[blind-except] - report line must not break the run
+        parts.append(f"ram=unknown ({e})")
+    try:
+        parts.extend([f"rasterio={rasterio.__version__}", f"gdal={rasterio.gdal_version()}"])
+    except Exception:  # ruff: ignore[blind-except]
+        parts.append("rasterio=unknown")
+    try:
+        parts.append(f"pyproj={pyproj.__version__}")
+    except Exception:  # ruff: ignore[blind-except]
+        parts.append("pyproj=unknown")
+    try:
+        parts.append(f"numpy={np.__version__}")
+    except Exception:  # ruff: ignore[blind-except]
+        parts.append("numpy=unknown")
+    try:
+        if _cinterp.available():
+            parts.append("cinterp=c")
+        else:
+            parts.append(f"cinterp=numpy ({_cinterp.reason() or 'unknown'})")
+    except Exception:  # ruff: ignore[blind-except]
+        parts.append("cinterp=unknown")
+    return "env: " + ", ".join(parts)
+
+
 def _die(msg: str) -> NoReturn:
     """Print a clean CLI error (no traceback) and exit 1.
 
@@ -409,7 +511,7 @@ def _die(msg: str) -> NoReturn:
         SystemExit: Always, with status code 1.
 
     """
-    print(f"error: {msg}", file=sys.stderr)  # ruff: ignore[print]
+    _ui_note("error", f"error: {msg}")
     raise SystemExit(1)
 
 
@@ -472,10 +574,10 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
     existing = [name for name in ("value.tif", "support_km.tif") if (out / name).is_file() and name not in published]
     if not existing:
         return
-    print(  # ruff: ignore[print]
+    _ui_note(
+        "warn",
         f"warning: this run failed before writing outputs; {', '.join(existing)} in {out} "
         "are from an earlier run and were left untouched",
-        file=sys.stderr,
     )
 
 
@@ -996,6 +1098,7 @@ def _reproject_core(
     scales: tuple[float, ...] | None,
     offsets: tuple[float, ...] | None,
     n_threads: int = 1,
+    progress: Callable[[int], None] | None = None,
 ) -> None:
     """Warp one dst row band and flush it to the output GeoTIFF.
 
@@ -1020,6 +1123,8 @@ def _reproject_core(
         scales: Band scales to set, or None to leave unset.
         offsets: Band offsets to set, or None to leave unset.
         n_threads: Warp threads. 1 = fully serial (A8 path).
+        progress: Optional callback with the cells flushed in this band
+            (issue #101 progress); the caller owns throttling.
 
     """
     _ensure_warp_ready()
@@ -1057,6 +1162,8 @@ def _reproject_core(
                     i0 = (i // warp_tile) * warp_tile
                     sub = coarse[i0][j - j0 : j - j0 + w_h, i - i0 : i - i0 + w_w]
                     dst.write(sub, 1, window=Window(i, j, w_w, w_h))
+                    if progress is not None:
+                        progress(w_w * w_h)
 
 
 def _footprint_has_task(
@@ -1121,6 +1228,7 @@ def _reproject_band(
     dst_height: int,
     task_info: dict[str, Any] | None = None,
     n_threads: int = 1,
+    progress: Callable[[int], None] | None = None,
 ) -> None:
     """Nearest-neighbour reproject one band into a fresh output-CRS GeoTIFF.
 
@@ -1214,6 +1322,7 @@ def _reproject_band(
             scales=tuple(src.scales) if getattr(src, "scales", None) else None,
             offsets=tuple(src.offsets) if getattr(src, "offsets", None) else None,
             n_threads=n_threads,
+            progress=progress,
         )
         if skip and counters["skipped"] > 0:
             log.debug("[reproj] skipped %d/%d all-NoData tiles", counters["skipped"], counters["tiles"])
@@ -1233,6 +1342,7 @@ def _reproject_band_array(
     scales: tuple[float, ...] | None = None,
     offsets: tuple[float, ...] | None = None,
     n_threads: int = 1,
+    progress: Callable[[int], None] | None = None,
 ) -> None:
     """Reproject an in-RAM work-CRS int16 array.
 
@@ -1256,6 +1366,8 @@ def _reproject_band_array(
         scales: Band scales to set, or None.
         offsets: Band offsets to set, or None.
         n_threads: Warp threads. 1 = fully serial (A8 path).
+        progress: Optional callback with the cells flushed so far in this
+            band (issue #101 progress); the caller owns throttling.
 
     """
     _load_native()
@@ -1294,6 +1406,7 @@ def _reproject_band_array(
         scales=scales,
         offsets=offsets,
         n_threads=n_threads,
+        progress=progress,
     )
 
 
@@ -1385,9 +1498,11 @@ def _turbo_write_parallel(
     dst_width: int,
     dst_height: int,
     tags: dict[str, str],
-    scales: tuple[float, ...],
+    scales: tuple[float, ...] | None,
     offsets: tuple[float, ...] | None,
     n_threads: int,
+    progress: Callable[[int], None] | None = None,
+    progress_refresh: Callable[[], None] | None = None,
 ) -> bool:
     """Assemble the output-CRS GeoTIFF from an in-RAM array.
 
@@ -1452,11 +1567,20 @@ def _turbo_write_parallel(
         coarse = {}
         if n_threads > 1:
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
-                coarse.update(ex.map(warp_i0, range(0, dst_width, warp_tile)))
+                for i0, buf in ex.map(warp_i0, range(0, dst_width, warp_tile)):
+                    coarse[i0] = buf
+                    if progress is not None:
+                        progress(min(warp_tile, dst_width - i0) * band_h)
+                    if progress_refresh is not None:
+                        progress_refresh()
         else:
             for i0 in range(0, dst_width, warp_tile):
                 _, buf = warp_i0(i0)
                 coarse[i0] = buf
+                if progress is not None:
+                    progress(min(warp_tile, dst_width - i0) * band_h)
+                if progress_refresh is not None:
+                    progress_refresh()
         band_tiles = []
         for j in range(j0, j0 + band_h, TILE_PX):
             h = min(TILE_PX, j0 + band_h - j)
@@ -1518,11 +1642,11 @@ def _turbo_write_parallel(
     try:
         info = _tif_parse_ifd(data)
     except ValueError as e:
-        print(f"[warn] turbo zstd head parse: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        _ui_note("warn", f"[warn] turbo zstd head parse: {e}; serial write")
         return False
     t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
     if n_tiles != len(tiles):
-        print(f"[warn] turbo zstd head: tile count {n_tiles} != {len(tiles)}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        _ui_note("warn", f"[warn] turbo zstd head: tile count {n_tiles} != {len(tiles)}; serial write")
         return False
     # All external value arrays must end before the first stored tile, so
     # the head cut keeps every array and drops every reference tile.
@@ -1530,10 +1654,10 @@ def _turbo_write_parallel(
     for typ, count, voff in info["tags"].values():
         total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
-            print("[warn] turbo zstd head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
+            _ui_note("warn", "[warn] turbo zstd head: value array overlaps tiles; serial write")
             return False
     if not info["big"] and head_end + sum(len(t) for t in tiles) > _TIFF_CLASSIC_MAX_BYTES:
-        print("[warn] turbo zstd head: assembled file beyond classic 4 GiB; serial write", file=sys.stderr)  # ruff: ignore[print]
+        _ui_note("warn", "[warn] turbo zstd head: assembled file beyond classic 4 GiB; serial write")
         return False
 
     head = bytearray(data[:head_end])
@@ -1620,6 +1744,8 @@ def _turbo_write_stock_parallel(
     offsets: tuple[float, ...] | None,
     n_threads: int,
     scratch_dir: str,
+    progress: Callable[[int], None] | None = None,
+    progress_refresh: Callable[[], None] | None = None,
 ) -> bool:
     """Assemble the output-CRS GeoTIFF with parallel stock-codec compression.
 
@@ -1685,19 +1811,19 @@ def _turbo_write_stock_parallel(
     try:
         info = _tif_parse_ifd(data)
     except ValueError as e:
-        print(f"[warn] turbo stock head parse: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        _ui_note("warn", f"[warn] turbo stock head parse: {e}; serial write")
         return False
     t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
     head_end = info["first"]
     for typ, count, voff in info["tags"].values():
         total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
-            print("[warn] turbo stock head: value array overlaps tiles; serial write", file=sys.stderr)  # ruff: ignore[print]
+            _ui_note("warn", "[warn] turbo stock head: value array overlaps tiles; serial write")
             return False
     # Compressed frames are never longer than the raw band, so raw size is
     # a sound classic-4GiB upper bound.
     if not info["big"] and head_end + arr.nbytes > _TIFF_CLASSIC_MAX_BYTES:
-        print("[warn] turbo stock head: assembled file may exceed classic 4 GiB; serial write", file=sys.stderr)  # ruff: ignore[print]
+        _ui_note("warn", "[warn] turbo stock head: assembled file may exceed classic 4 GiB; serial write")
         return False
 
     # 2. Warp blocks in parallel; each block compresses through its thread's
@@ -1748,13 +1874,22 @@ def _turbo_write_stock_parallel(
                     file=sys.stderr,
                     flush=True,
                 )
+        if progress is not None:
+            progress(bw * bh)
         return frames
 
+    block_frames: list[list[bytes]] = []
     if n_threads > 1:
         with ThreadPoolExecutor(max_workers=n_threads) as ex:
-            block_frames = list(ex.map(lambda jb: _block(*jb), band_jobs))
+            for frames in ex.map(lambda jb: _block(*jb), band_jobs):
+                block_frames.append(frames)
+                if progress_refresh is not None:
+                    progress_refresh()
     else:
-        block_frames = list(starmap(_block, band_jobs))
+        for jb in band_jobs:
+            block_frames.append(_block(*jb))
+            if progress_refresh is not None:
+                progress_refresh()
 
     # Reassemble into global 512 raster-scan (the serial/CPL order). A block's
     # frames are block-local raster-scan, so block-major concatenation would
@@ -1771,7 +1906,7 @@ def _turbo_write_stock_parallel(
         for bc, cl in col_map:
             tiles.append(block_frames[br * n_bcols + bc][tl * tcols_by_bc[bc] + cl])
     if len(tiles) != n_tiles:
-        print(f"[warn] turbo stock: tile count {len(tiles)} != {n_tiles}; serial write", file=sys.stderr)  # ruff: ignore[print]
+        _ui_note("warn", f"[warn] turbo stock: tile count {len(tiles)} != {n_tiles}; serial write")
         return False
 
     # 3. Patch the head and assemble: head + frames in raster-scan order.
@@ -1934,6 +2069,7 @@ class Pipeline:
         turbo_strict: bool = False,
         seed: int = 0,
         dry_run: bool = False,
+        ui: _ui.UI | None = None,
     ) -> None:
         """Initialise the interpolation pipeline.
 
@@ -2007,6 +2143,13 @@ class Pipeline:
         # then don't report the just-written rasters as stale "left
         # untouched" (issues #40, #77).
         self._published: set[str] = set()
+        # Presentation (issue #101): the active phase handle for the current
+        # _phase() scope (None in library mode or outside a phase) and the
+        # shared-descent cell count measured in _prepare_shared (so the
+        # interpolate phase can budget its bar before the block loop).
+        self.ui = ui
+        self._active_phase: _ui.Phase | None = None
+        self._shared_descent_cells = 0
         # Set by run() on success: machine-readable summary for --json (#55).
         self._summary: dict[str, Any] | None = None
 
@@ -2063,6 +2206,33 @@ class Pipeline:
     def published(self) -> set[str]:
         """Final-output names published (via os.replace) this run (issues #40, #77)."""
         return self._published
+
+    @contextmanager
+    def _phase(self, name: str, **kwargs: Any) -> Iterator[_ui.Phase | _NoPhase]:
+        """Open a UI phase scope (issue #101).
+
+        No-op in library mode (ui is None): yields a no-op handle. In CLI
+        mode the handle is also stored on self._active_phase so inner
+        helpers (the parallel CSV read) can advance it without a parameter.
+
+        Args:
+            name: Phase name shown in the progress display
+                (read/calibrate/grid/interpolate/reproject/write).
+            **kwargs: Passed to the UI (e.g. total, unit).
+
+        Yields:
+            The phase handle (set_total / advance / set_count / summary).
+
+        """
+        if self.ui is None:
+            yield _NoPhase(name)
+            return
+        with self.ui.phase(name, **kwargs) as ph:
+            self._active_phase = ph
+            try:
+                yield ph
+            finally:
+                self._active_phase = None
 
     def ingest(self) -> None:
         """Read input, filter, project to working CRS.
@@ -2233,11 +2403,22 @@ class Pipeline:
             )
 
         tasks = _csv_chunk_tasks(self.input_path, wanted, self.n_threads) if self.n_threads > 1 else None
+        ph = self._active_phase
         if tasks is None:
+            if ph is not None:
+                ph.set_total(0)  # serial parse: no reliable total -> indeterminate
             return serial()
         task_list, expected = tasks
+        if ph is not None:
+            ph.set_total(expected)
+        chunks: list[dict[str, np.ndarray]] = []
         with ProcessPoolExecutor(max_workers=len(task_list)) as ex:
-            chunks = list(ex.map(_read_csv_chunk, task_list))
+            for chunk in ex.map(_read_csv_chunk, task_list):
+                chunks.append(chunk)
+                if ph is not None:
+                    ph.advance(int(chunk[self.value_col].size))
+                    if self.ui is not None:
+                        self.ui.maybe_refresh()
         # Index by column name, not position (audit #83): the chunk dicts
         # carry the same names the serial path uses.
         v = np.concatenate([c[self.value_col] for c in chunks])
@@ -2487,31 +2668,38 @@ class Pipeline:
         self._phase_wall = {}
         t_total = time.perf_counter()
         Path(self.out_dir).mkdir(parents=True, exist_ok=True)
-        t0 = time.perf_counter()
-        with _prof.phase("ingest"):
-            self.ingest()
-        t_ingest = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        with _prof.phase("calibrate"):
-            self.calibrate()
-        t_calibrate = time.perf_counter() - t0
-        try:
+        scope = self.ui.run_scope() if self.ui is not None else nullcontext()
+        with scope:
             t0 = time.perf_counter()
-            with _prof.phase("grid"):
-                self.grid()
-            t_grid = time.perf_counter() - t0
-            self._turbo_precheck()
+            with _prof.phase("ingest"), self._phase("read", unit="rows") as ph:
+                self.ingest()
+                ph.summary = f"{self.n_total:,} rows -> {self.n:,} points"
+            t_ingest = time.perf_counter() - t0
             t0 = time.perf_counter()
-            vpath, spath = self._write_rasters()
-            t_write = time.perf_counter() - t0
-        finally:
-            # Temp cleanup on every path: grid failure, mid-run worker error,
-            # OOM, disk full — _points.npy + partial TIFF temps are removed
-            # (issue #15).
-            self._remove_run_temps()
-        t_total = time.perf_counter() - t_total
-        self._log_run_summary(t_ingest, t_calibrate, t_grid, t_write, t_total, vpath, spath)
-        self._summary = self._collect_summary(vpath, spath, t_ingest, t_calibrate, t_grid, t_write, t_total)
+            with _prof.phase("calibrate"), self._phase("calibrate") as ph:
+                self.calibrate()
+                ph.summary = f"transform={self.tname} cap_km={self.cap_km_val:.4g}"
+            t_calibrate = time.perf_counter() - t0
+            try:
+                t0 = time.perf_counter()
+                with _prof.phase("grid"), self._phase("grid") as ph:
+                    self.grid()
+                    ph.summary = f"{self.nx}x{self.ny} cells @ {self.res:g} m"
+                t_grid = time.perf_counter() - t0
+                self._turbo_precheck()
+                t0 = time.perf_counter()
+                vpath, spath = self._write_rasters()
+                t_write = time.perf_counter() - t0
+            finally:
+                # Temp cleanup on every path: grid failure, mid-run worker error,
+                # OOM, disk full — _points.npy + partial TIFF temps are removed
+                # (issue #15).
+                self._remove_run_temps()
+            t_total = time.perf_counter() - t_total
+            self._log_run_summary(t_ingest, t_calibrate, t_grid, t_write, t_total, vpath, spath)
+            self._summary = self._collect_summary(vpath, spath, t_ingest, t_calibrate, t_grid, t_write, t_total)
+        if self.ui is not None:
+            self.ui.ok(f"{t_total:.2f}s -> {Path(vpath).name}, {Path(spath).name}")
         return vpath, spath
 
     def plan(self) -> None:
@@ -2522,10 +2710,18 @@ class Pipeline:
         infeasibility in the precheck exits 3 (SystemExit propagates).
 
         """
-        self.ingest()
-        self.calibrate()
-        self.grid()
-        self._turbo_precheck()
+        scope = self.ui.run_scope() if self.ui is not None else nullcontext()
+        with scope:
+            with self._phase("read", unit="rows") as ph:
+                self.ingest()
+                ph.summary = f"{self.n_total:,} rows -> {self.n:,} points"
+            with self._phase("calibrate") as ph:
+                self.calibrate()
+                ph.summary = f"transform={self.tname} cap_km={self.cap_km_val:.4g}"
+            with self._phase("grid") as ph:
+                self.grid()
+                ph.summary = f"{self.nx}x{self.ny} cells @ {self.res:g} m"
+            self._turbo_precheck()
 
     def plan_text(self, args: argparse.Namespace) -> str:
         """Human-readable run plan for --plan (issue #53); printed on stdout.
@@ -2936,14 +3132,14 @@ class Pipeline:
             # --plan: the plan printout carries the decision; only a hard
             # failure (--turbo-strict infeasible) says its piece on stderr.
             if decision.exit_code == 3 and decision.message:
-                print(decision.message, file=sys.stderr)  # ruff: ignore[print]
+                _ui_note("warn", decision.message)
         else:
             # stdout stays clean (the --json/--help contract): the summary
             # goes through the run logger (stderr, INFO; -q suppresses it,
             # like every other progress line) (#77).
             log.info("%s", decision.summary)
             if decision.message:
-                print(decision.message, file=sys.stderr)  # ruff: ignore[print]
+                _ui_note("warn", decision.message)
         if decision.exit_code == 3:
             raise SystemExit(3)
 
@@ -2969,7 +3165,7 @@ class Pipeline:
             # zstdmt.available() inside the try (audit #81 F-3): a gate
             # failure must mean "stock parallel write", never a crash.
             if not zstdmt.available():
-                print("[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
+                _ui_note("warn", "[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write")
                 return False
             with rasterio.open(
                 probe,
@@ -2993,9 +3189,9 @@ class Pipeline:
             verdict = zstdmt.oracle_check(probe, tile=0)
             if verdict.ok:
                 return True
-            print(f"[warn] {verdict.detail}", file=sys.stderr)  # ruff: ignore[print]
+            _ui_note("warn", f"[warn] {verdict.detail}")
         except Exception as e:  # ruff: ignore[blind-except] - any probe failure means the stock parallel writer runs
-            print(f"[warn] turbo zstd oracle: {e}; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
+            _ui_note("warn", f"[warn] turbo zstd oracle: {e}; stock parallel write")
         finally:
             probe.unlink(missing_ok=True)
         return False
@@ -3005,7 +3201,7 @@ class Pipeline:
         d = self._turbo_decision
         return d is not None and d.regime == "A"
 
-    def _prepare_shared(self) -> bool:
+    def _prepare_shared(self, progress: Callable[[int], None] | None = None) -> bool:
         """Prebuild the full-grid pull-push field shared by all blocks (bit-exact).
 
         Bins every point once into the padded grid, builds the pyramid once,
@@ -3042,6 +3238,11 @@ class Pipeline:
         step = self.step
         bsize = self.bsize
         halo = self.halo
+        # Descent work estimate for the progress bar (issue #101): pyramid
+        # build (~1x) + descent levels (geometric, ~1.33x) of the padded
+        # grid. A round 2.5x bound keeps the bar honest (it can finish
+        # under 100%, never invented over it).
+        self._shared_descent_cells = int(self.nx_padded * self.ny_padded * 2.5)
         for bx in range(self.nbx):
             for by in range(self.nby):
                 i0, j0, i1, j1 = _block_bounds(bx, by, bsize, self.nx, self.ny)
@@ -3118,6 +3319,8 @@ class Pipeline:
             counts: list[np.ndarray] = [c0]
             for _ in range(self.levels):
                 counts.append(downsample_sum(counts[-1]))
+        if progress is not None:
+            progress(int(self.nx_padded * self.ny_padded))
 
         if not use_memmap:
             out_val = out_sup = None
@@ -3145,6 +3348,7 @@ class Pipeline:
                     n_threads=n_threads,
                     out_val=out_val,
                     out_sup=out_sup,
+                    progress=progress,
                 )
             # Level 0 is dead after the descent: free the finest grids
             # (two f32 full arrays, ~12 GB at full-AU scale) before the
@@ -3169,6 +3373,7 @@ class Pipeline:
                 stop_level=lvl2,
                 free_levels=True,
                 n_threads=n_threads,
+                progress=progress,
             )
             val_full = _open_fresh_memmap(Path(self.out_dir) / "_val_full.npy", np.float32, s0.shape)
             sup_full = _open_fresh_memmap(Path(self.out_dir) / "_sup_full.npy", np.float32, s0.shape)
@@ -3185,6 +3390,7 @@ class Pipeline:
                     out_sup=sup_full,
                     level_dir=Path(self.out_dir),
                     n_threads=n_threads,
+                    progress=progress,
                 )
             for k in range(min(3, self.levels + 1)):
                 sums[k] = None  # type: ignore[assignment]
@@ -3305,26 +3511,41 @@ class Pipeline:
                     cfg.tf = make_transform(cfg.transform_state)
                     cfg.pct = PercentileTransform(cfg.pct_quantiles)
                     _CTX["cfg"] = cfg
-                    with _WallPhase("descent", self._phase_wall):
-                        if self._prepare_shared():
-                            cfg.shared = True
-                    with (
-                        ThreadPoolExecutor(max_workers=self.workers) as ex,
-                        _prof.phase("write.serial"),
-                        _WallPhase("interpolate", self._phase_wall),
-                    ):
-                        for bx, by, out in ex.map(_process_block, self.tasks):
-                            w = _block_window(bx, by, self.cfg)
+                    # Progress (issue #101): the interpolate bar budgets the
+                    # shared descent (measured in _prepare_shared) plus every
+                    # task block, and advances as each block is written.
+                    task_cells: list[int] = []
+                    for bx, by in self.tasks:
+                        w = _block_window(bx, by, self.cfg)
+                        task_cells.append(w.width * w.height)
+                    with self._phase("interpolate", unit="cells") as iph:
+                        with _WallPhase("descent", self._phase_wall):
+                            if self._prepare_shared(progress=iph.advance):
+                                cfg.shared = True
+                        iph.set_total(sum(task_cells) + self._shared_descent_cells)
+                        with (
+                            ThreadPoolExecutor(max_workers=self.workers) as ex,
+                            _prof.phase("write.serial"),
+                            _WallPhase("interpolate", self._phase_wall),
+                        ):
+                            results = zip(self.tasks, ex.map(_process_block, self.tasks), task_cells, strict=True)
+                            for task, res, tc in results:
+                                bx, by = task
+                                _, _, out = res
+                                w = _block_window(bx, by, self.cfg)
 
-                            if out is None:
-                                blank = np.full((w.height, w.width), NODATA, np.int16)
-                                vd.write(blank, 1, window=w)
-                                sd.write(blank, 1, window=w)
-                                continue
-
-                            vq, rq = out
-                            vd.write(vq.T[::-1, :], 1, window=w)
-                            sd.write(rq.T[::-1, :], 1, window=w)
+                                if out is None:
+                                    blank = np.full((w.height, w.width), NODATA, np.int16)
+                                    vd.write(blank, 1, window=w)
+                                    sd.write(blank, 1, window=w)
+                                else:
+                                    vq, rq = out
+                                    vd.write(vq.T[::-1, :], 1, window=w)
+                                    sd.write(rq.T[::-1, :], 1, window=w)
+                                iph.advance(tc)
+                                if self.ui is not None:
+                                    self.ui.maybe_refresh()
+                        iph.summary = f"{self.nx}x{self.ny} grid"
             if self.out_crs != self.work_crs:
                 # Both bands share the same work-CRS source grid (identical
                 # bounds/size), so the output grid is identical too: compute
@@ -3352,35 +3573,49 @@ class Pipeline:
                         "nby": self.nby,
                         "task_bids": {bx * self.nby + by for bx, by in self.tasks},
                     }
-                with _prof.phase("write.reproj_value"), _WallPhase("reproject_value", self._phase_wall):
-                    _reproject_band(
-                        str(wtmp_v),
-                        str(ftmp_v),
-                        vprof,
-                        out_crs,
-                        dst_transform,
-                        dst_width,
-                        dst_height,
-                        task_info=task_info,
-                        n_threads=self.n_threads,
-                    )
-                with _prof.phase("write.reproj_support"), _WallPhase("reproject_support", self._phase_wall):
-                    _reproject_band(
-                        str(wtmp_s),
-                        str(ftmp_s),
-                        sprof,
-                        out_crs,
-                        dst_transform,
-                        dst_width,
-                        dst_height,
-                        task_info=task_info,
-                        n_threads=self.n_threads,
-                    )
-            # Publish: the finals only ever change via atomic rename.
-            ftmp_v.replace(vpath)
-            self._published.add(vpath.name)
-            ftmp_s.replace(spath)
-            self._published.add(spath.name)
+                with self._phase("reproject", total=2 * dst_width * dst_height, unit="cells") as rph:
+
+                    def _reproj_progress(done: int) -> None:
+                        rph.advance(done)
+                        if self.ui is not None:
+                            self.ui.maybe_refresh()
+
+                    with _prof.phase("write.reproj_value"), _WallPhase("reproject_value", self._phase_wall):
+                        _reproject_band(
+                            str(wtmp_v),
+                            str(ftmp_v),
+                            vprof,
+                            out_crs,
+                            dst_transform,
+                            dst_width,
+                            dst_height,
+                            task_info=task_info,
+                            n_threads=self.n_threads,
+                            progress=_reproj_progress,
+                        )
+                    with _prof.phase("write.reproj_support"), _WallPhase("reproject_support", self._phase_wall):
+                        _reproject_band(
+                            str(wtmp_s),
+                            str(ftmp_s),
+                            sprof,
+                            out_crs,
+                            dst_transform,
+                            dst_width,
+                            dst_height,
+                            task_info=task_info,
+                            n_threads=self.n_threads,
+                            progress=_reproj_progress,
+                        )
+                    rph.summary = f"-> {dst_width}x{dst_height} EPSG:{self.out_crs}"
+            with self._phase("write") as wph:
+                # Publish: the finals only ever change via atomic rename.
+                ftmp_v.replace(vpath)
+                self._published.add(vpath.name)
+                ftmp_s.replace(spath)
+                self._published.add(spath.name)
+                mb_v = Path(vpath).stat().st_size / 1e6
+                mb_s = Path(spath).stat().st_size / 1e6
+                wph.summary = f"value.tif {mb_v:.1f} MB, support_km.tif {mb_s:.1f} MB"
             if wtmp_v is not ftmp_v:
                 wtmp_v.unlink(missing_ok=True)
                 wtmp_s.unlink(missing_ok=True)
@@ -3393,10 +3628,10 @@ class Pipeline:
         finally:
             self._remove_run_temps()
             if partial:
-                print(  # ruff: ignore[print]
+                _ui_note(
+                    "warn",
                     f"warning: run failed during write; {vpath}, {spath} were not fully written "
                     "(any existing files are from an earlier run, left untouched)",
-                    file=sys.stderr,
                 )
 
     def _write_rasters_turbo(
@@ -3470,24 +3705,35 @@ class Pipeline:
                     cfg.tf = make_transform(cfg.transform_state)
                     cfg.pct = PercentileTransform(cfg.pct_quantiles)
                     _CTX["cfg"] = cfg
-                    with _WallPhase("descent", self._phase_wall):
-                        if self._prepare_shared():
-                            cfg.shared = True
-                    # The workers write the DN grids straight into the tmpfs
-                    # fields (issue #84): the main thread used to do those
-                    # copies as results arrived and sat on the critical path
-                    # ahead of the pool. Block windows are disjoint, so the
-                    # writes are thread-safe and the fields are byte-identical.
-                    _CTX["dn"] = (val_dn, sup_dn)
-                    try:
-                        with (
-                            _WallPhase("interpolate", self._phase_wall),
-                            ThreadPoolExecutor(max_workers=self.workers) as ex,
-                        ):
-                            for _ in ex.map(_process_block, self.tasks):
-                                pass
-                    finally:
-                        del _CTX["dn"]
+                    # Progress (issue #101): as the serial writer, but the
+                    # blocks write DN grids straight into the tmpfs fields.
+                    task_cells: list[int] = []
+                    for bx, by in self.tasks:
+                        w = _block_window(bx, by, self.cfg)
+                        task_cells.append(w.width * w.height)
+                    with self._phase("interpolate", unit="cells") as iph:
+                        with _WallPhase("descent", self._phase_wall):
+                            if self._prepare_shared(progress=iph.advance):
+                                cfg.shared = True
+                        iph.set_total(sum(task_cells) + self._shared_descent_cells)
+                        # The workers write the DN grids straight into the tmpfs
+                        # fields (issue #84): the main thread used to do those
+                        # copies as results arrived and sat on the critical path
+                        # ahead of the pool. Block windows are disjoint, so the
+                        # writes are thread-safe and the fields are byte-identical.
+                        _CTX["dn"] = (val_dn, sup_dn)
+                        try:
+                            with (
+                                _WallPhase("interpolate", self._phase_wall),
+                                ThreadPoolExecutor(max_workers=self.workers) as ex,
+                            ):
+                                for tc, _ in zip(task_cells, ex.map(_process_block, self.tasks), strict=True):
+                                    iph.advance(tc)
+                                    if self.ui is not None:
+                                        self.ui.maybe_refresh()
+                        finally:
+                            del _CTX["dn"]
+                        iph.summary = f"{self.nx}x{self.ny} grid"
                     # The shared field is dead after the block loop: free it
                     # before the reproject/write (val/sup f32 + near bool,
                     # ~13.7 GB at full-AU scale) (issue #39).
@@ -3528,11 +3774,70 @@ class Pipeline:
                 ("value", val_dn, vprof, ftmp_v, vtags, (1.0 / self.scale,)),
                 ("support", sup_dn, sprof, ftmp_s, stags, (1.0,)),
             ):
-                with _prof.phase(f"write.reproj_{band}"), _WallPhase(f"reproject_{band}", self._phase_wall):
-                    wrote = False
-                    if cpl:
-                        try:
-                            wrote = _turbo_write_parallel(
+                with self._phase("write", total=2 * dst_width * dst_height, unit="cells") as wph:
+
+                    def _wprogress(done: int) -> None:
+                        wph.advance(done)
+
+                    def _wrefresh() -> None:
+                        if self.ui is not None:
+                            self.ui.maybe_refresh()
+
+                    with _prof.phase(f"write.reproj_{band}"), _WallPhase(f"reproject_{band}", self._phase_wall):
+                        wrote = False
+                        if cpl:
+                            try:
+                                wrote = _turbo_write_parallel(
+                                    arr,
+                                    xform,
+                                    work_crs,
+                                    str(path),
+                                    prof,
+                                    out_crs,
+                                    dst_transform,
+                                    dst_width,
+                                    dst_height,
+                                    tags=tags,
+                                    scales=scales,
+                                    offsets=(0.0,),
+                                    n_threads=warp_threads,
+                                    progress=_wprogress,
+                                    progress_refresh=_wrefresh,
+                                )
+                            except Exception as e:  # ruff: ignore[blind-except] - layout surprise: fall back
+                                _ui_note("warn", f"[warn] turbo zstd parallel: {e}; stock parallel write")
+                        if not wrote:
+                            try:
+                                wrote = _turbo_write_stock_parallel(
+                                    arr,
+                                    xform,
+                                    work_crs,
+                                    str(path),
+                                    prof,
+                                    out_crs,
+                                    dst_transform,
+                                    dst_width,
+                                    dst_height,
+                                    tags=tags,
+                                    scales=scales,
+                                    offsets=(0.0,),
+                                    n_threads=warp_threads,
+                                    scratch_dir=str(out_dir),
+                                    progress=_wprogress,
+                                    progress_refresh=_wrefresh,
+                                )
+                            except Exception as e:  # ruff: ignore[blind-except] - any surprise: serial
+                                _ui_note("warn", f"[warn] turbo stock parallel: {e}; serial write")
+                        if not wrote:
+                            # Layout guard tripped (see the parallel writers): the
+                            # serial array reproject is byte-identical by
+                            # construction.
+
+                            def _serial_progress(done: int) -> None:
+                                _wprogress(done)
+                                _wrefresh()
+
+                            _reproject_band_array(
                                 arr,
                                 xform,
                                 work_crs,
@@ -3546,48 +3851,9 @@ class Pipeline:
                                 scales=scales,
                                 offsets=(0.0,),
                                 n_threads=warp_threads,
+                                progress=_serial_progress,
                             )
-                        except Exception as e:  # ruff: ignore[blind-except] - layout surprise: fall back
-                            print(f"[warn] turbo zstd parallel: {e}; stock parallel write", file=sys.stderr)  # ruff: ignore[print]
-                    if not wrote:
-                        try:
-                            wrote = _turbo_write_stock_parallel(
-                                arr,
-                                xform,
-                                work_crs,
-                                str(path),
-                                prof,
-                                out_crs,
-                                dst_transform,
-                                dst_width,
-                                dst_height,
-                                tags=tags,
-                                scales=scales,
-                                offsets=(0.0,),
-                                n_threads=warp_threads,
-                                scratch_dir=str(out_dir),
-                            )
-                        except Exception as e:  # ruff: ignore[blind-except] - any surprise: serial
-                            print(f"[warn] turbo stock parallel: {e}; serial write", file=sys.stderr)  # ruff: ignore[print]
-                    if not wrote:
-                        # Layout guard tripped (see the parallel writers): the
-                        # serial array reproject is byte-identical by
-                        # construction.
-                        _reproject_band_array(
-                            arr,
-                            xform,
-                            work_crs,
-                            str(path),
-                            prof,
-                            out_crs,
-                            dst_transform,
-                            dst_width,
-                            dst_height,
-                            tags=tags,
-                            scales=scales,
-                            offsets=(0.0,),
-                            n_threads=warp_threads,
-                        )
+                        wph.summary = f"{Path(path).name} {Path(path).stat().st_size / 1e6:.1f} MB"
             # Publish: the finals only ever change via atomic rename.
             ftmp_v.replace(vpath)
             self._published.add(vpath.name)
@@ -3622,10 +3888,10 @@ class Pipeline:
             for p in out_dir.glob("_stock_scratch_*.tif"):
                 p.unlink(missing_ok=True)
             if partial:
-                print(  # ruff: ignore[print]
+                _ui_note(
+                    "warn",
                     f"warning: run failed during write; {vpath}, {spath} were not fully written "
                     "(any existing files are from an earlier run, left untouched)",
-                    file=sys.stderr,
                 )
 
 
@@ -3740,7 +4006,7 @@ def _git_commit() -> str | None:
     return r.stdout.strip() or None
 
 
-def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
+def _make_pipeline(args: argparse.Namespace, *, dry_run: bool, ui: _ui.UI | None = None) -> Pipeline:
     """Build the Pipeline from parsed CLI args (shared by --plan and run).
 
     Resolves the turbo flag/cap pair in one place so the two paths cannot
@@ -3749,6 +4015,8 @@ def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
     Args:
         args: Parsed CLI namespace.
         dry_run: True for --plan (no files created).
+        ui: Presentation handle for progress display (issue #101); None for
+            library-style calls.
 
     Returns:
         Configured Pipeline, not yet run.
@@ -3789,6 +4057,7 @@ def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
         turbo_strict=args.turbo_strict,
         seed=args.seed,
         dry_run=dry_run,
+        ui=ui,
     )
 
 
@@ -3944,7 +4213,7 @@ def _resolve_log_level(*, verbose: bool, log_level: str | None, quiet: bool = Fa
         val = "debug"
     if val in _LOG_LEVELS:
         return val
-    print(f"warning: unrecognized LOGGING={raw!r}; using 'info'", file=sys.stderr)  # ruff: ignore[print]
+    _ui_note("warn", f"warning: unrecognized LOGGING={raw!r}; using 'info'")
     return "info"
 
 
@@ -4150,6 +4419,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Suppress stderr below WARNING (beats --verbose and LOGGING; an explicit --log-level wins)",
     )
     g_log.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default=None,
+        help="Color output: auto (TTY, no NO_COLOR/TERM=dumb), always, never. "
+        "Live progress needs a TTY stderr plus --color auto/always and no --quiet.",
+    )
+    g_log.add_argument(
         "--verbose",
         action="store_true",
         help="Debug logging: per-phase wall times + volumetric detail (shorthand for --log-level debug)",
@@ -4182,8 +4458,11 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
 
     """
     if args.input is None:
-        print("error: missing input file (CSV or Parquet)", file=sys.stderr)  # ruff: ignore[print]
-        print("hint: run 'ppgrid help' for usage and examples", file=sys.stderr)  # ruff: ignore[print]
+        _ui_note("error", "error: missing input file (CSV or Parquet)")
+        _ui_note(
+            "note",
+            "hint: run 'ppgrid help' for usage and examples",
+        )
         raise SystemExit(2)
     if args.input == "help" and not Path("help").exists():
         # A literal file named "help" wins over the pseudo-command (use --help).
@@ -4218,6 +4497,16 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         parser.error("--max-ram and --ram-gb are aliases and must match")
     if args.turbo_strict and args.turbo is None and args.max_ram is None:
         parser.error("--turbo-strict requires --turbo or --max-ram")
+    if args.verbose:
+        # One-line environment report (issue #101): versions, RAM detection
+        # source + resolved cap, C-interp status. Must never break the run.
+        if args.max_ram is not None:
+            preset = args.max_ram
+        elif args.turbo not in (None, "auto"):
+            preset = float(args.turbo)
+        else:
+            preset = None
+        _ui_note("note", _env_report_line(preset))
 
     if out.exists() and not out.is_dir():
         _die(f"output path is a file, not a directory: {args.out}")
@@ -4228,7 +4517,7 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         # and grid from writing files, so nothing is created.
         # #57: column preflight first (same error as the run path).
         _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
-        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=True), args.input)
+        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=True, ui=_CURRENT_UI["ui"]), args.input)
         _map_pipeline_errors(p.plan, args.input)
         print(p.plan_text(args))  # ruff: ignore[print]
         raise SystemExit(0)
@@ -4237,22 +4526,52 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
 def main(argv: list[str] | None = None) -> None:
     """Parse CLI arguments and run the pipeline.
 
+    Exit codes: as documented on _run_cli (propagated unchanged).
+
     Args:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
-
-    Raises:
-        SystemExit: exit 0 for `ppgrid help` (and `--plan`), exit 1 for
-        pipeline/IO errors (`_die`), exit 2 for missing input, validation
-        errors, missing input columns (#57), or a non-empty out dir without
-        --force (#54), exit 3 for `--turbo-strict` shared-path infeasibility.
-        Any non-zero exit over an earlier run's rasters also prints the
-        stale-outputs warning (issues #40, #77).
 
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
     out = Path(args.out)
 
+    # Presentation layer (issue #101): resolve live/color modes once for
+    # this invocation. main() is the only builder; library callers pass
+    # their own (or no) UI straight to Pipeline.
+    ui = _ui.UI.from_cli(quiet=args.quiet, color=args.color)
+    _CURRENT_UI["ui"] = ui
+    try:
+        _run_cli(parser, args, out, ui)
+    finally:
+        _CURRENT_UI["ui"] = None
+
+
+def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Path, ui: _ui.UI) -> None:
+    """Run the parsed-args CLI sequence: preflight -> guard -> run -> summary.
+
+    Split from main() (issue #101) so the presentation handle is built
+    once per invocation and routes every stderr line (errors, warnings,
+    hints, the env report) through the same live console that hosts the
+    progress table. main() clears the _CURRENT_UI slot when this returns.
+    Exit codes propagate as documented on main().
+
+    Args:
+        parser: The argument parser (for print_help / error).
+        args: Parsed namespace (mutated: max_ram alias resolution).
+        out: Output directory path.
+        ui: Presentation handle for this invocation.
+
+    Raises:
+        SystemExit: exit 0 for `ppgrid help` (and `--plan`), exit 1 for
+            pipeline/IO errors (`_die`), exit 2 for missing input,
+            validation errors, missing input columns (#57), or a non-empty
+            out dir without --force (#54), exit 3 for `--turbo-strict`
+            shared-path infeasibility. Any non-zero exit over an earlier
+            run's rasters also prints the stale-outputs warning
+            (issues #40, #77).
+
+    """
     try:
         # Preflight (input check, logging, flag validation, --plan branch):
         # any non-zero exit over an earlier run's rasters warns instead of
@@ -4272,8 +4591,11 @@ def main(argv: list[str] | None = None) -> None:
         guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
         existing = [name for name in guarded if (out / name).is_file()]
         if existing:
-            print(f"error: output directory {args.out} already contains: {', '.join(existing)}", file=sys.stderr)  # ruff: ignore[print]
-            print("hint: pass --force to overwrite them", file=sys.stderr)  # ruff: ignore[print]
+            _ui_note("error", f"error: output directory {args.out} already contains: {', '.join(existing)}")
+            _ui_note(
+                "note",
+                "hint: pass --force to overwrite them",
+            )
             raise SystemExit(2)
 
     try:
@@ -4291,7 +4613,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         # Construction (init validation, e.g. --scale range) gets the same
         # exit-code mapping as the run phase (review M-1, #56 contract).
-        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False), args.input)
+        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False, ui=ui), args.input)
         _map_pipeline_errors(p.run, args.input)
         if args.json:
             _write_json_summary(p, args, out)
