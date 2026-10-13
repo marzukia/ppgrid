@@ -180,7 +180,7 @@ def test_macos_preset_clamps_to_box_minus_headroom(tmp_path: Path, monkeypatch: 
     assert physical == pytest.approx(128.0)
     cap, source = turbop.resolve_cap(128.0, physical_gb=physical, cgroup_gb=math.inf)
     assert cap == 120.0
-    assert "clamped to available 128 GB - 8 GB" in source
+    assert source == "preset 128 GB >= detected 128.0 GB; using 120.0 GB (128.0 - 8.0 GB headroom)"
     # below the box the preset stands (the --turbo 64 case).
     cap, source = turbop.resolve_cap(64.0, physical_gb=physical, cgroup_gb=math.inf)
     assert cap == 64.0

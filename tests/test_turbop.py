@@ -468,18 +468,64 @@ def test_resolve_cap_preset_clamp_cgroup_aware() -> None:
     """
     cap, source = resolve_cap(32.0, physical_gb=134.9, cgroup_gb=24.0)
     assert cap == 16.0  # 24 - 8: the slice limit binds before physical
-    assert "cgroup 24 GB" in source
+    assert source == "preset 32 GB >= detected 24.0 GB; using 16.0 GB (24.0 - 8.0 GB headroom)"
     cap, source = resolve_cap(32.0, physical_gb=16.0, cgroup_gb=math.inf)
     assert cap == 8.0  # physical binds; unlimited cgroup
-    assert "unlimited" in source
-    # Legacy call style (cgroup None): physical-only string stands.
+    assert source == "preset 32 GB >= detected 16.0 GB; using 8.0 GB (16.0 - 8.0 GB headroom)"
+    # Legacy call style (cgroup None): detected = physical (issue #104 format).
     cap, source = resolve_cap(128.0, physical_gb=64.0)
     assert cap == 56.0
-    assert source == "preset 128 GB >= physical 64 GB; clamped to physical - 8 GB"
+    assert source == "preset 128 GB >= detected 64.0 GB; using 56.0 GB (64.0 - 8.0 GB headroom)"
     # Below available: the preset stands as given.
     cap, source = resolve_cap(16.0, physical_gb=134.9, cgroup_gb=24.0)
     assert cap == 16.0
     assert source == "preset 16 GB"
+
+
+def test_resolve_cap_clamp_cause_pinned_format() -> None:
+    """#104: the clamp event prints its cause in a pinned format.
+
+    The numbers vary with input; the format is asserted:
+    preset 128 GB >= detected 96.0 GB; using 88.0 GB (96.0 - 8.0 GB headroom)
+
+    """
+    expected = "preset 128 GB >= detected 96.0 GB; using 88.0 GB (96.0 - 8.0 GB headroom)"
+    # physical-only detection (cgroup unlimited).
+    cap, source = resolve_cap(128.0, physical_gb=96.0, cgroup_gb=math.inf)
+    assert cap == 88.0
+    assert source == expected
+    # cgroup-limited slice: detected = min(physical, cgroup), same format.
+    cap, source = resolve_cap(128.0, physical_gb=134.9, cgroup_gb=96.0)
+    assert cap == 88.0
+    assert source == expected
+    # Legacy call style (cgroup None): detected = physical.
+    cap, source = resolve_cap(128.0, physical_gb=96.0)
+    assert cap == 88.0
+    assert source == expected
+
+
+def test_resolve_cap_maxram_boundaries() -> None:
+    """#104: --max-ram boundaries — below floor, == detected, > detected, cgroup slice.
+
+    Extends the #78 resolve_cap coverage; #78 owns the floor logic (it must
+    stay green), this pins the wording at the boundaries.
+
+    """
+    # Below the 8 GB floor: the floor wins, and the source names it.
+    cap, source = resolve_cap(6.0, physical_gb=64.0)
+    assert cap == 8.0
+    assert source == "preset 6 GB (floored to 8 GB)"
+    # == detected: the >= rule clamps (whole box), the preset does not stand.
+    cap, source = resolve_cap(96.0, physical_gb=96.0, cgroup_gb=math.inf)
+    assert cap == 88.0
+    assert source == "preset 96 GB >= detected 96.0 GB; using 88.0 GB (96.0 - 8.0 GB headroom)"
+    # > detected: the same clamp, the same cap as == detected.
+    cap2, source2 = resolve_cap(128.0, physical_gb=96.0, cgroup_gb=math.inf)
+    assert (cap2, source2) == (88.0, "preset 128 GB >= detected 96.0 GB; using 88.0 GB (96.0 - 8.0 GB headroom)")
+    # Cgroup-limited slice: the slice ceiling binds, not physical.
+    cap, source = resolve_cap(32.0, physical_gb=134.9, cgroup_gb=24.0)
+    assert cap == 16.0
+    assert source == "preset 32 GB >= detected 24.0 GB; using 16.0 GB (24.0 - 8.0 GB headroom)"
 
 
 def test_cap_floor_source_and_budget_ceiling_warning() -> None:
@@ -500,7 +546,7 @@ def test_cap_floor_source_and_budget_ceiling_warning() -> None:
     # Clamped preset on a small slice: clamped then floored, both named.
     cap, source = resolve_cap(32.0, physical_gb=134.9, cgroup_gb=6.0)
     assert cap == 8.0
-    assert "cgroup 6 GB" in source
+    assert "detected 6.0 GB" in source
     assert "floored to 8 GB" in source
     # Auto on a 6 GB slice: the floor note is present (cap 8 > raw -2).
     cap, source = detect_cap_gb(physical_gb=134.9, cgroup_gb=6.0)

@@ -683,7 +683,7 @@ def test_resolve_turbo_cap_cgroup_wired(tmp_path: Path, monkeypatch: pytest.Monk
     p = Pipeline(str(DATA_CSV), "price", "longitude", "latitude", str(tmp_path / "o"), turbo=True, turbo_cap_gb=32.0)
     cap, source = p._resolve_turbo_cap()  # ruff: ignore[private-member-access]
     assert cap == 16.0  # min(134.9, 24) - 8: the slice limit binds
-    assert "cgroup 24 GB" in source
+    assert source == "preset 32 GB >= detected 24.0 GB; using 16.0 GB (24.0 - 8.0 GB headroom)"
     p.turbo_cap_gb = None  # auto path, same wired values
     cap, source = p._resolve_turbo_cap()  # ruff: ignore[private-member-access]
     assert cap == 16.0
