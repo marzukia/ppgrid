@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
       - run: uv sync --locked -q
       # Fail fast when a release tag does not match the pyproject version
       # (before: an opaque uv publish "File already exists", or a
@@ -32,6 +34,14 @@ jobs:
           fi
           echo "release tag $TAG_NAME matches pyproject version $ver"
       - run: uv build
+      # s30 "RC tested from the exact wheel intended for publication":
+      # install the just-built wheel in a fresh stdlib venv (plain pip, no
+      # dev extras) and run the installed console script end-to-end
+      # (version check + e2e + anchor gate) BEFORE uv publish. The runner
+      # is x86_64 Linux, so the gate is byte-exact against the committed
+      # anchors.
+      - name: "Artifact gate: clean-venv install + console-script e2e (pre-publish)"
+        run: scripts/check_artifact.sh dist/ppgrid-*-py3-none-any.whl
       - name: Publish
         env:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
