@@ -38,6 +38,7 @@ dependencies = [
     "pandas>=2.0,<3",
     "pyproj>=3.6,<4",
     "rasterio>=1.3,<2",
+    "rich>=13.7,<14",
 ]
 
 [project.optional-dependencies]
@@ -105,6 +106,12 @@ ignore = [
     "raise-within-try",     # import-failure diagnostics
     "try-consider-else",    # diagnostic bookkeeping
     "type-check-without-type-error",    # capability probe (callable check)
+]
+# ppgrid/ui.py: Phase and UI are one design unit - Phase delegates to the
+# UI's private _phase_* methods and the pipeline touches _task_id via
+# _finish_phase. The coupling is intentional; the public API is UI/Phase.
+"ppgrid/ui.py" = [
+    "private-member-access",
 ]
 # tests/test_cinterp.py pokes at private state (_mod, _p) on purpose.
 "tests/test_cinterp.py" = [

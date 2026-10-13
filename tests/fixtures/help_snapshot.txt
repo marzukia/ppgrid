@@ -9,7 +9,8 @@ usage: ppgrid [-h] [--version] [--value-col VALUE_COL] [--lng-col LNG_COL]
               [--max-band-parallel MAX_BAND_PARALLEL] [--turbo [GB]]
               [--max-ram GB] [--ram-gb GB] [--turbo-strict] [-o OUT]
               [--compress COMPRESS] [--force] [--json] [--plan] [--quiet]
-              [--verbose] [--log-level {error,warning,info,debug}]
+              [--color {auto,always,never}] [--verbose]
+              [--log-level {error,warning,info,debug}]
               [input]
 
 Pull-push scattered-data interpolation
@@ -89,6 +90,10 @@ output:
 logging:
   --quiet, -q           Suppress stderr below WARNING (beats --verbose and
                         LOGGING; an explicit --log-level wins)
+  --color {auto,always,never}
+                        Color output: auto (TTY, no NO_COLOR/TERM=dumb),
+                        always, never. Live progress needs a TTY stderr plus
+                        --color auto/always and no --quiet.
   --verbose             Debug logging: per-phase wall times + volumetric
                         detail (shorthand for --log-level debug)
   --log-level {error,warning,info,debug}
