@@ -483,10 +483,11 @@ def _env_report_line(preset: float | None) -> str:
         parts.extend([f"rasterio={rasterio.__version__}", f"gdal={rasterio.gdal_version()}"])
     except Exception:  # ruff: ignore[blind-except]
         parts.append("rasterio=unknown")
-    try:
-        parts.append(f"pyproj={pyproj.__version__}")
-    except Exception:  # ruff: ignore[blind-except]
-        parts.append("pyproj=unknown")
+    pyproj_mod = globals().get("pyproj")  # lazy name (PEP 562, #110)
+    if pyproj_mod is None:
+        parts.append("pyproj=not loaded")
+    else:
+        parts.append(f"pyproj={pyproj_mod.__version__}")
     try:
         parts.append(f"numpy={np.__version__}")
     except Exception:  # ruff: ignore[blind-except]
