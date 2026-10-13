@@ -1,10 +1,14 @@
 """Clean Ctrl-C (exit 130), error attribution, and the exit-code table (#106).
 
 - SIGINT mid-run -> one `interrupted` line, no traceback, exit 130, and no
-  run-temp residue (retained partials named instead) — subprocess test with
-  the parent sending SIGINT at a fixed wall-clock delay that lands in the
-  interpolate/reproject phase (the per-phase log lines are only written in
-  the end-of-run summary block, so the parent cannot gate on them).
+  run-temp residue (retained partials named instead) — subprocess test in
+  which the parent polls a positive mid-run marker (the `_points.npy`
+  grid-phase temp exists, no finals published yet) and sends exactly one
+  SIGINT when it is observable. The per-phase log lines are only written in
+  the end-of-run summary block, so they cannot be a gate; a wall-clock
+  delay cannot be one either (a second fixed-delay send that lands while
+  the first KeyboardInterrupt is still being handled triggers CPython's
+  force-kill path and exits -2, not 130).
 - Attribution audit: only the user-supplied input renders as `input file
   not found`; internal resources (meminfo, cgroup, run temps) name
   themselves.
@@ -65,19 +69,79 @@ def _big_csv(tmp_path: Path, n: int = 20_000) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_sigint_mid_run_exit130_no_traceback_no_residue(tmp_path: Path) -> None:
-    """Parent sends SIGINT mid-run (fixed wall-clock delay, interpolate window).
+def _wait_mid_run_marker(out: Path, proc: subprocess.Popen, t0: float, timeout: float = 60.0) -> None:
+    """Poll until the child is observably mid-run, else fail loudly.
 
-    The per-phase log lines (`ingest:`/`grid:`/`done:` ...) are emitted only
-    in the end-of-run summary block, so a child-side log gate arms far too
-    late. Measured phase layout for this input (200k rows, --res 200, 2
-    workers): import <= 1.5 s, ingest+calibrate+grid <= 0.3 s,
-    interpolate ~3.6 s, reproject+write ~9-13 s (total ~13.5 s). SIGINT at
-    parent t=3.0 s therefore lands in the interpolate/reproject window on
-    any machine within 2x of that speed, well after the run started and
-    long before it can finish. A second send at t=6.0 s covers a main
-    thread parked in a long C call at the first one (the signal trampoline
-    is lossless; only the Python handler needs an eval break).
+    Marker: `_points.npy` (written in grid(), on disk for the entire
+    interpolate/reproject/write phase) exists in `out`, and neither final
+    (value.tif / support_km.tif, published only via os.replace() at the
+    very end) exists yet. That is a positive mid-run observation: the run
+    has passed all fast phases and is inside the long write phase, before
+    publish.
+
+    Two loud failures instead of a vacuous pass: (1) the child exits
+    before the marker is observable — sizing regression, the run finished
+    before it could be interrupted mid-run; (2) the marker never becomes
+    observable within `timeout` — early crash or hang. Both carry the
+    child's stderr.
+
+    Raises:
+        AssertionError: child exited before the marker (sizing regression)
+            or the marker was never observed within `timeout`.
+
+    """
+    pts = out / "_points.npy"
+    deadline = t0 + timeout
+    while True:
+        if pts.exists() and not (out / "value.tif").exists() and not (out / "support_km.tif").exists():
+            return
+        rc = proc.poll()
+        if rc is not None:
+            _out, err = proc.communicate()
+            raise AssertionError(
+                f"child exited (rc={rc}) before the mid-run marker was observable "
+                "(sizing regression: the run finished before the interrupt window); stderr:\n" + err
+            )
+        if time.time() > deadline:
+            proc.kill()
+            _out, err = proc.communicate()
+            raise AssertionError(
+                f"mid-run marker (_points.npy present, no finals) never observed within "
+                f"{timeout:.0f} s; stderr:\n" + err
+            )
+        time.sleep(0.05)
+
+
+def test_sigint_mid_run_exit130_no_traceback_no_residue(tmp_path: Path) -> None:
+    """Parent sends ONE SIGINT, gated on a positive mid-run marker.
+
+    The per-phase log lines (`ingest:`/`grid:`/`done:` ...) are emitted
+    only in the end-of-run summary block, so a child-side log gate arms far
+    too late; a fixed wall-clock delay cannot be trusted either — the
+    double-send design (SIGINT at t=3.0 s plus a second at t=6.0 s to
+    cover a main thread parked in a long C call) conflicts with itself:
+    CPython's documented "press Ctrl-C again to force kill" kills the
+    process with the raw signal (returncode -2) when a second SIGINT
+    arrives while the first KeyboardInterrupt is still being handled, and
+    on slow/loaded macOS runners the first signal's cleanup (propagation
+    + temp sweep + sys.exit(130)) takes longer than that 3 s gap, so the
+    second send lands mid-handling. One send removes the failure mode by
+    construction: the signal trampoline is lossless, so even a main thread
+    inside a long C call gets the pending KeyboardInterrupt at the next
+    eval break (at most one GDAL warp tile away in the write phase), the
+    handler runs to completion, and the process exits 130 however slow the
+    handler is — there is no second signal to trigger the force-kill path.
+
+    The gate is `_wait_mid_run_marker`: the child is observably mid-run
+    when `_points.npy` (written in grid(), before the slow phases) exists
+    and no final is published yet. Measured phase layout for this input
+    (20k rows, --res 200, 2 workers, measured 2026-10-13): marker observable
+    ~0.6 s after spawn, run completes ~13.5 s (interpolate ~3.4 s,
+    reproject+write ~9-13 s). The marker window is ~12 s on a fast
+    machine and ~20 s on the ~1.6x-slower macos-latest runners, so a
+    0.05 s poll lands inside it on both OS families; the only remaining
+    wall-clock quantity is the 60 s poll timeout, which fails loudly if
+    the window is missed entirely.
     """
     csv = _big_csv(tmp_path)
     out = tmp_path / "out"
@@ -109,11 +173,8 @@ def test_sigint_mid_run_exit130_no_traceback_no_residue(tmp_path: Path) -> None:
         text=True,
         cwd=REPO_ROOT,
     )
-    for send_at in (3.0, 6.0):
-        while time.time() - t0 < send_at:
-            time.sleep(0.05)
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGINT)
+    _wait_mid_run_marker(out, proc, t0)
+    proc.send_signal(signal.SIGINT)
     _out_s, err = proc.communicate(timeout=240)
     # Interrupted mid-run, not before or after: the summary block (incl.
     # `done:`) is only logged on completion, so its absence + missing finals
