@@ -309,7 +309,9 @@ def test_fallback_recorded_in_summary(tmp_path: Path, monkeypatch: pytest.Monkey
     _pl.main(argv)
     text = fake.getvalue()
     assert "  fallbacks:     zstd parallel write -> stock parallel (oracle mismatch)" in text
-    assert re.search(r"strategy:\s+\S.* turbo, cap 16 GB, budget [\d.]+ GB, workers \d+", text)
+    # Cap is clamped to detected RAM (macos runner: 7.5 GB -> floored to 8 GB);
+    # assert the structure, not the values (CI 38400658211, 2026-10-13).
+    assert re.search(r"strategy:\s+\S.* turbo, cap [\d.]+ GB, budget [\d.]+ GB, workers \d+", text)
 
 
 def test_summary_printed_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
