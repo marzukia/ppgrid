@@ -304,8 +304,8 @@ def test_a9_regime_c_at_20gb() -> None:
     assert dec.budget_gb == pytest.approx(17.0, abs=1e-9)
     assert dec.message is not None
     assert dec.message.startswith("[warn]")
-    assert "38.7" in dec.message  # regime-A field estimate, A9
-    assert "regime C" in dec.message
+    assert "38.7" in dec.message  # full-in-RAM field estimate, A9
+    assert "file-backed (page-cache)" in dec.message  # #103: plain name, no regime code
 
     strict = precheck(pl, strict=True, cap_source="preset 20 GB")
     assert strict.exit_code == 0  # strict at 20 GB passes: regime C fits
@@ -384,9 +384,9 @@ def test_precheck_clean_at_64gb() -> None:
     assert dec.message is None
     assert "cap 64 GB" in dec.summary
     assert "preset 64 GB" in dec.summary
-    assert "budget 0.85*C = 54.4 GB" in dec.summary
-    assert "Bt = 50.4 GB" in dec.summary
-    assert "regime A" in dec.summary
+    assert "budget 0.85 x cap = 54.4 GB" in dec.summary
+    assert "sizing 50.4 GB" in dec.summary
+    assert "full in-RAM" in dec.summary  # #103: plain name, no regime code
 
 
 def test_budget_is_printable() -> None:

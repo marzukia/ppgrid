@@ -202,12 +202,10 @@ examples:
   # Custom transform, CRS and DN scale: log10 values, WGS84 output, DN = 10*percentile
   ppgrid data/all_equakes.csv -o out/eq --transform log10 --out-crs 4326 --scale 10 --cap-km 20 --value-col mag
 
-  # Turbo / low-RAM: 32 GB budget, strict (exit 3 if infeasible).
-  # au_gcc_sparse.csv is the production dataset (not in the repo); any sparse
-  # CSV with lng/lat/value columns works.
-  ppgrid data/au_gcc_sparse.csv -o out/au --turbo 32 --turbo-strict --workers 8
+  # Turbo: 32 GB RAM budget, strict (exit 3 if infeasible), 8 workers.
+  ppgrid data/melb_houses.csv -o out/melb_turbo --turbo 32 --turbo-strict --workers 8 --value-col price
 
-logging:
+progress logging:
   Progress goes to stderr (stdout stays clean). Default level is info (one line
   per phase + a final summary). --verbose (or --log-level debug, or
   LOGGING=verbose) adds a per-phase wall-time
@@ -2571,8 +2569,11 @@ class Pipeline:
         ]
         if self.turbo and self._turbo_decision is not None and self._turbo_plan is not None:
             d, t = self._turbo_decision, self._turbo_plan
+            mode = turbop.regime_name(d.regime)
+            if d.path == "shared":
+                mode += " (shared path)"
             lines.append(
-                f"  turbo:         on — regime {d.regime}, path {d.path}, cap {t.cap_gb:g} GB, "
+                f"  turbo:         on — {mode}, cap {t.cap_gb:g} GB, "
                 f"budget {d.budget_gb:g} GB, est peak {d.est_peak_gb:g} GB, workers {t.workers}"
             )
         elif self.turbo:
@@ -2782,8 +2783,8 @@ class Pipeline:
                 )
                 if self._turbo_decision is not None:
                     turbo_desc = (
-                        f"on (regime {self._turbo_decision.regime}, path {self._turbo_decision.path}, "
-                        f"cap {self._turbo_plan.cap_gb:g} GB)"
+                        f"on ({turbop.regime_name(self._turbo_decision.regime)}, "
+                        f"{self._turbo_decision.path.replace('_', '-')} path, cap {self._turbo_plan.cap_gb:g} GB)"
                         if self._turbo_plan is not None
                         else "on"
                     )
@@ -3980,138 +3981,184 @@ def _configure_logging(level_name: str) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the CLI argument parser (tests exercise the flags here)."""
+    """Build the CLI argument parser (tests exercise the flags here).
+
+    Layout (issue #103): options live in six groups — input/columns, CRS/grid,
+    interpolation, memory/turbo, output, logging — and `--help` is snapshot-
+    tested. Metavars carry units (METRES, KM, GB, CELLS). Every option with a
+    non-None default shows it in its help text as "(default: X)"; the
+    mechanical check is tests/test_cli_help.py.
+    """
     parser = argparse.ArgumentParser(
+        prog="ppgrid",  # fixed prog: help/snapshot are identical under -m, -c, and the console script
         description="Pull-push scattered-data interpolation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOG,
     )
     parser.add_argument("--version", action="version", version=f"ppgrid {__version__}")
     parser.add_argument("input", nargs="?", help="CSV or Parquet input path")
-    parser.add_argument("-o", "--out", default="out/", help="Output directory (default: ./out)")
-    parser.add_argument("--value-col", default="value", help="Value column name")
-    parser.add_argument("--lng-col", default="longitude", help="Longitude column name")
-    parser.add_argument("--lat-col", default="latitude", help="Latitude column name")
-    parser.add_argument("--res", type=_pos_float, default=DEFAULT_RES, help="Cell size in metres")
-    parser.add_argument("--cap-km", type=_cap_km_arg, default="auto", help="Fill cap km, or 'auto'")
-    parser.add_argument(
+
+    g_input = parser.add_argument_group("input/columns")
+    g_input.add_argument("--value-col", default="value", help="Value column name (default: value)")
+    g_input.add_argument("--lng-col", default="longitude", help="Longitude column name (default: longitude)")
+    g_input.add_argument("--lat-col", default="latitude", help="Latitude column name (default: latitude)")
+
+    g_crs = parser.add_argument_group("CRS/grid")
+    g_crs.add_argument(
+        "--src-crs",
+        type=_crs_arg,
+        default=SRC_CRS,
+        help=f"Input CRS as a bare int or 'EPSG:<code>' string (default: {SRC_CRS})",
+    )
+    g_crs.add_argument(
+        "--work-crs",
+        type=_crs_arg,
+        default=WORK_CRS,
+        help=f"Working CRS for interpolation, bare int or 'EPSG:<code>' (default: {WORK_CRS})",
+    )
+    g_crs.add_argument(
+        "--out-crs",
+        type=_crs_arg,
+        default=OUT_CRS,
+        help=f"Output CRS, bare int or 'EPSG:<code>' (default: {OUT_CRS})",
+    )
+    g_crs.add_argument(
+        "--res",
+        type=_pos_float,
+        default=DEFAULT_RES,
+        metavar="METRES",
+        help=f"Cell size in metres (default: {DEFAULT_RES:g})",
+    )
+    g_crs.add_argument(
+        "--cap-km",
+        type=_cap_km_arg,
+        default="auto",
+        metavar="KM",
+        help="Fill cap in km, or 'auto' (default: auto)",
+    )
+    g_crs.add_argument(
+        "--block",
+        type=int,
+        default=DEFAULT_BLOCK,
+        metavar="CELLS",
+        help=f"Block size in cells (default: {DEFAULT_BLOCK})",
+    )
+
+    g_interp = parser.add_argument_group("interpolation")
+    g_interp.add_argument(
         "--transform",
         default="auto",
         # Pinned to the calibrate.transforms() factory names (audit #83):
         # adding a transform there adds its name here, nothing else to update.
         choices=["auto", *(t.name for t in transforms())],
+        help="Value transform for the interpolation (default: auto)",
     )
-    parser.add_argument(
+    g_interp.add_argument(
         "--saturation",
         type=_pos_float,
         default=DEFAULT_SATURATION,
-        help="Counts for a cell to fully self-trust",
+        help=f"Point counts for a cell to fully self-trust (default: {DEFAULT_SATURATION:g})",
     )
-    parser.add_argument("--block", type=int, default=DEFAULT_BLOCK, help="Block size in cells")
-    parser.add_argument(
-        "--workers",
-        type=_workers_arg,
-        default=DEFAULT_WORKERS,
-        help="Number of workers (positive integer, or 'auto' = os.cpu_count()); default 4",
+    g_interp.add_argument(
+        "--scale", type=_pos_float, default=DEFAULT_SCALE, help=f"DN = percentile * scale (default: {DEFAULT_SCALE:g})"
     )
-    parser.add_argument("--scale", type=_pos_float, default=DEFAULT_SCALE, help="DN = percentile * scale")
-    parser.add_argument(
+    g_interp.add_argument(
         "--percentile-step",
         type=_pos_float,
         default=None,
-        help="Round output percentiles to the nearest step (e.g. 5 -> 90/95/100). Default: no rounding",
+        help="Round output percentiles to the nearest step (e.g. 5 -> 90/95/100) (default: off)",
     )
-    parser.add_argument("--compress", default="ZSTD")
-    parser.add_argument("--calib-max-points", type=int, default=CALIB_MAX_POINTS_DEFAULT)
-    parser.add_argument("--calibration", default=None, help="Calibration JSON path")
-    parser.add_argument(
-        "--src-crs",
-        type=_crs_arg,
-        default=SRC_CRS,
-        help=f"Input CRS as a bare int or 'EPSG:<code>' string (default {SRC_CRS})",
-    )
-    parser.add_argument(
-        "--work-crs",
-        type=_crs_arg,
-        default=WORK_CRS,
-        help=f"Working CRS for interpolation, bare int or 'EPSG:<code>' (default {WORK_CRS})",
-    )
-    parser.add_argument(
-        "--out-crs",
-        type=_crs_arg,
-        default=OUT_CRS,
-        help=f"Output CRS, bare int or 'EPSG:<code>' (default {OUT_CRS})",
-    )
-    parser.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
-    parser.add_argument(
+    g_interp.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
+    g_interp.add_argument(
         "--seed",
         type=int,
         default=0,
-        help="RNG seed for the calibration subsampling and blocked-CV bootstrap (default 0; "
+        help="RNG seed for the calibration subsampling and blocked-CV bootstrap (default: 0; "
         "same seed + same input -> reproducible outputs)",
     )
-    parser.add_argument(
-        "--plan",
-        action="store_true",
-        help="Resolve the full run plan, print it, and exit 0 before running; creates no files or directories",
+    g_interp.add_argument(
+        "--calib-max-points",
+        type=int,
+        default=CALIB_MAX_POINTS_DEFAULT,
+        help=f"Max points used for the calibration subsampling (default: {CALIB_MAX_POINTS_DEFAULT})",
     )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite existing outputs in the out dir (default: exit 2 when value.tif / "
-        "support_km.tif / calibration.json / run_summary.json are already present)",
+    g_interp.add_argument("--calibration", default=None, help="Calibration JSON path (default: none)")
+
+    g_mem = parser.add_argument_group("memory/turbo")
+    g_mem.add_argument(
+        "--workers",
+        type=_workers_arg,
+        default=DEFAULT_WORKERS,
+        help=f"Number of workers (positive integer, or 'auto' = os.cpu_count()) (default: {DEFAULT_WORKERS})",
     )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Write a machine-readable run summary to <out>/run_summary.json "
-        "(phase timings, volumetrics, grid, calibration, CLI params; stdout stays clean)",
-    )
-    parser.add_argument(
-        "--quiet",
-        "-q",
-        action="store_true",
-        help="Suppress stderr below WARNING (beats --verbose and LOGGING; an explicit --log-level wins)",
-    )
-    parser.add_argument(
+    g_mem.add_argument(
         "--max-band-parallel",
         type=int,
         default=None,
         help="Cap parallel row-band workers for the low-RAM shared descent (default: --workers).",
     )
-    parser.add_argument(
+    g_mem.add_argument(
         "--turbo",
         nargs="?",
         const="auto",
         default=None,
         metavar="GB",
-        help="Turbo mode: parallel phases + RAM-budgeted shared cap (S3.3). "
+        help="Turbo mode: parallel phases sized to a RAM budget. "
         "Optional RAM cap preset 16|32|64|128 (GB, decimal 1e9 bytes); bare --turbo = auto-detect. "
         "Presets are common sizes; use --max-ram GB for any value.",
     )
-    parser.add_argument(
+    g_mem.add_argument(
         "--max-ram",
         type=_pos_float,
         default=None,
         metavar="GB",
         help="Explicit RAM cap in GB (decimal, 1e9 bytes; overrides the --turbo preset). Implies --turbo.",
     )
-    parser.add_argument("--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram.")
-    parser.add_argument(
+    g_mem.add_argument("--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram.")
+    g_mem.add_argument(
         "--turbo-strict",
         action="store_true",
         help="Shared path infeasible under the budget: error + exit 3 instead of [warn] + per-box fallback (exit 0).",
     )
-    parser.add_argument(
+
+    g_out = parser.add_argument_group("output")
+    g_out.add_argument("-o", "--out", default="out/", help="Output directory (default: out/)")
+    g_out.add_argument("--compress", default="ZSTD", help="GeoTIFF tile compression codec (default: ZSTD)")
+    g_out.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing outputs in the out dir (default: exit 2 when value.tif / "
+        "support_km.tif / calibration.json / run_summary.json are already present)",
+    )
+    g_out.add_argument(
+        "--json",
+        action="store_true",
+        help="Write a machine-readable run summary to <out>/run_summary.json "
+        "(phase timings, volumetrics, grid, calibration, CLI params; stdout stays clean)",
+    )
+    g_out.add_argument(
+        "--plan",
+        action="store_true",
+        help="Resolve the full run plan, print it, and exit 0 before running; creates no files or directories",
+    )
+
+    g_log = parser.add_argument_group("logging")
+    g_log.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress stderr below WARNING (beats --verbose and LOGGING; an explicit --log-level wins)",
+    )
+    g_log.add_argument(
         "--verbose",
         action="store_true",
         help="Debug logging: per-phase wall times + volumetric detail (shorthand for --log-level debug)",
     )
-    parser.add_argument(
+    g_log.add_argument(
         "--log-level",
         choices=list(_LOG_LEVELS),
         default=None,
-        help="Progress log level on stderr (default info; env LOGGING; 'verbose' = debug)",
+        help="Progress log level on stderr (default: info; env LOGGING; 'verbose' = debug)",
     )
     return parser
 
