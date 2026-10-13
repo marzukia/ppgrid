@@ -21,6 +21,8 @@ not downstream calculation).
 - `data/` — example inputs: `melb_houses.csv` (13,580 pts), `all_equakes.csv` (44,376 pts).
 - `examples/` — committed outputs + repro scripts + README images (see "Images" below).
 - `tests/` — pytest. `examples/run_melb.py` regenerates the Melbourne example rasters.
+- `bench/` — perf harnesses + anchor gates: `check_anchors.py` (re-runs pipeline vs committed anchors), `check_artifact.py` (anchor gate for installed-artifact e2e outputs, issue #98).
+- `scripts/` — CI helpers: `check_artifact.sh` (clean-venv install + console-script e2e, shared by ci.yml + publish.yml, issue #98).
 
 ## Versioning / release
 
@@ -80,6 +82,14 @@ not downstream calculation).
   git push "https://x-access-token:${PAT}@github.com/marzukia/ppgrid" <branch>
   ```
 - Branches go to a PR, not main, per the fleet merge gate.
+
+## What changed recently (2026-10-13, CI artifact gate, issue #98)
+
+- New `artifact` CI job (PR-only, ubuntu-latest + macos-latest): `uv build` -> install the wheel in a fresh stdlib venv (plain `python -m venv` + pip, no dev extras; `[parquet]` extra always included) -> `ppgrid --version` == pyproject -> e2e run outside the repo tree (melb 500m, `--skip-calibration`, the committed melb500 anchor config) -> anchor gate -> Parquet-input e2e -> `pip check`. sdist install tested once (ubuntu leg): PEP 517 build via pip, version + e2e + pip check, no byte gate.
+- publish.yml: the just-built wheel gets the same clean-venv e2e + anchor gate BEFORE `uv publish` (s30 "RC tested from the exact wheel intended for publication").
+- Vuln scan: `uvx --from pip-audit pip-audit -r` on the installed tree rendered as name==version, excluding the project itself (unpublished in-flight version) and the venv's own pip/setuptools (ensurepip tooling, not artifact deps). Fails on ANY known vulnerability (PyPI advisory DB); no `--ignore-vuln` suppressions — triage = bump dep + relock.
+- Key finding: a fresh pip resolution pulls newer rasterio/pyproj/affine than uv.lock, drifting the grid transform by ~1e-15 and changing output bytes on EVERY OS (decoded pixels stay identical). `scripts/check_artifact.sh` therefore pins runtime deps to `uv export --frozen` before the anchor gate — byte-exact anchors are only reproducible on the anchor-cut toolchain. The fresh install itself still runs first, so per-OS wheel availability + pip metadata stay exercised.
+- Shared helpers: `scripts/check_artifact.sh` (clean-venv install + e2e, used by both workflows) + `bench/check_artifact.py` (anchor gate for e2e outputs; reuses check_anchors' compare functions, byte-exact on canonical x86_64 Linux, functional-equivalence elsewhere).
 
 ## What changed recently (2026-10-08, sparse-output branch reconciled onto main post-#50)
 
