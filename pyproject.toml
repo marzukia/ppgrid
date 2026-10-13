@@ -138,7 +138,7 @@ ignore = [
     "private-member-access",    # parser._actions / _action_groups
     "suspicious-subprocess-import",    # [sys.executable, -m ppgrid, ...] fixed argv
     "subprocess-run-without-check",    # returncode asserted explicitly
-    "subprocess-without-shell-equals-true",    # fixed argv, no shell>>>>>>> 4d1dd6c (cli: grouped help, unit metavars, jargon-free strings, runnable epilog examples (#103))
+    "subprocess-without-shell-equals-true",    # fixed argv, no shell
 ]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]

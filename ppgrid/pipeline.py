@@ -205,7 +205,7 @@ examples:
   # Turbo: 32 GB RAM budget, strict (exit 3 if infeasible), 8 workers.
   ppgrid data/melb_houses.csv -o out/melb_turbo --turbo 32 --turbo-strict --workers 8 --value-col price
 
-logging:
+progress logging:
   Progress goes to stderr (stdout stays clean). Default level is info (one line
   per phase + a final summary). --verbose (or --log-level debug, or
   LOGGING=verbose) adds a per-phase wall-time
@@ -4115,7 +4115,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Explicit RAM cap in GB (decimal, 1e9 bytes; overrides the --turbo preset). Implies --turbo.",
     )
     g_mem.add_argument(
-        "--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram (default: off)."
+        "--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram."
     )
     g_mem.add_argument(
         "--turbo-strict",

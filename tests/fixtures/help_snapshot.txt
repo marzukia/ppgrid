@@ -64,11 +64,12 @@ memory/turbo:
                         Cap parallel row-band workers for the low-RAM shared
                         descent (default: --workers).
   --turbo [GB]          Turbo mode: parallel phases sized to a RAM budget.
-                        Optional RAM cap preset 16|32|64|128; bare --turbo =
-                        auto-detect (default: off).
-  --max-ram GB          Explicit RAM cap in GB (overrides the --turbo preset).
-                        Implies --turbo (default: off).
-  --ram-gb GB           Alias of --max-ram (default: off).
+                        Optional RAM cap preset 16|32|64|128 (GB, decimal 1e9
+                        bytes); bare --turbo = auto-detect. Presets are common
+                        sizes; use --max-ram GB for any value.
+  --max-ram GB          Explicit RAM cap in GB (decimal, 1e9 bytes; overrides
+                        the --turbo preset). Implies --turbo.
+  --ram-gb GB           Alias of --max-ram.
   --turbo-strict        Shared path infeasible under the budget: error + exit
                         3 instead of [warn] + per-box fallback (exit 0).
 
@@ -104,7 +105,7 @@ examples:
   # Turbo: 32 GB RAM budget, strict (exit 3 if infeasible), 8 workers.
   ppgrid data/melb_houses.csv -o out/melb_turbo --turbo 32 --turbo-strict --workers 8 --value-col price
 
-logging:
+progress logging:
   Progress goes to stderr (stdout stays clean). Default level is info (one line
   per phase + a final summary). --verbose (or --log-level debug, or
   LOGGING=verbose) adds a per-phase wall-time
