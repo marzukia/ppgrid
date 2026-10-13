@@ -153,9 +153,7 @@ def test_macos_sysctl_absent_returns_none(tmp_path: Path, monkeypatch: pytest.Mo
     assert turbop._read_physical_gb() is None
 
 
-def test_macos_preset_clamps_to_box_minus_headroom(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_macos_preset_clamps_to_box_minus_headroom(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """--turbo 128 on a 128 GB box must clamp to box - 8 GB headroom.
 
     Regression (Mac Studio, 2026-10-13): pre-fix, physical None (no
