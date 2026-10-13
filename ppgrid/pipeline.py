@@ -110,13 +110,12 @@ def _load_native() -> None:
     below directly (CLI, Pipeline methods, reproject helpers).
 
     """
-    if "rasterio" in globals():
-        return
-    for name, (module_name, attr) in _LAZY_IMPORTS.items():
-        if name in globals():
-            continue
-        module = importlib.import_module(module_name)
-        globals()[name] = module if not attr else getattr(module, attr)
+    if not all(name in globals() for name in _LAZY_IMPORTS):
+        for name, (module_name, attr) in _LAZY_IMPORTS.items():
+            if name in globals():
+                continue
+            module = importlib.import_module(module_name)
+            globals()[name] = module if not attr else getattr(module, attr)
 
 
 def __getattr__(name: str) -> Any:
@@ -128,7 +127,9 @@ def __getattr__(name: str) -> Any:
     """
     if name in _LAZY_IMPORTS:
         _load_native()
-        return globals()[name]
+        val = globals().get(name)
+        if val is not None:
+            return val
     msg = f"module {__name__!r} has no attribute {name!r}"
     raise AttributeError(msg) from None
 
