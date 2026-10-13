@@ -7,6 +7,7 @@
 - the committed Melbourne 10m example is reproduced bit-for-bit
 """
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Self
 
@@ -210,8 +211,8 @@ def test_shared_field_matches_perbox(tmp_path: Path) -> None:
     refs: dict[tuple[int, int], tuple[np.ndarray, np.ndarray] | None] = {}
     orig_prep = p._prepare_shared
 
-    def prep_with_refs() -> bool:
-        ok = orig_prep()
+    def prep_with_refs(progress: Callable[[int], None] | None = None) -> bool:
+        ok = orig_prep(progress=progress)
         for bx in range(p.cfg.nbx):
             for by in range(p.cfg.nby):
                 refs[bx, by] = _perbox_reference(p, bx, by)
