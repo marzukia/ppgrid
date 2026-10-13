@@ -291,7 +291,12 @@ class Phase:
         self._task_id = task_id
 
     def set_total(self, total: float) -> None:
-        """Set (or grow) the determinate total; enables % and rate."""
+        """Set (or grow) the determinate total; enables % and rate.
+
+        A falsy total (0) marks the task indeterminate: rich renders
+        total=0 as a finished task (full green bar), so the UI layer
+        normalizes 0 to total=None (F6, #115 review).
+        """
         self._ui._phase_set_total(self._task_id, total)
 
     def advance(self, n: float) -> None:
@@ -453,7 +458,9 @@ class UI:
 
         """
         if self._live and self._progress is not None and self._progress.live.is_started:
-            task_id = self._progress.add_task(name, total=total, **({"unit": unit} if unit else {}))
+            # A falsy total means indeterminate (total=None): rich renders
+            # total=0 as a finished task (full green bar) (F6, #115 review).
+            task_id = self._progress.add_task(name, total=total or None, **({"unit": unit} if unit else {}))
         else:
             task_id = None
         ph = Phase(name, self, task_id)
@@ -482,6 +489,16 @@ class UI:
 
     def _phase_set_total(self, task_id: int | None, total: float) -> None:
         if task_id is None or self._progress is None:
+            return
+        if not total:
+            # rich renders total=0 as a finished task (full green bar), not
+            # indeterminate; a falsy total means "no reliable total" (serial
+            # CSV parse), so normalize to total=None (F6, #115 review).
+            task = self._progress.tasks[task_id]
+            if task.total is not None:
+                task.total = None
+                task._reset()  # rich's internal rate/speed state
+                self._refresh(force=True)
             return
         self._progress.update(task_id, total=total)
         self._refresh(force=True)

@@ -1627,3 +1627,53 @@ def test_turbo_midwrite_failure_keeps_finals(
     assert _sha(out / "support_km.tif") == sha_s
     assert _staging_leftovers(out) == []
     assert not list(out.glob("_stock_scratch_*.tif"))
+
+
+def test_turbo_write_phase_total_per_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each turbo write phase's total covers only its own file (F5, #115 review).
+
+    The write phase opens inside the per-file loop, so a two-file total would
+    freeze every bar at 50%; each file's bar must end at 100%.
+    """
+    monkeypatch.setattr(pipeline_mod.turbop, "resolve_cap", _identity_cap)
+
+    class _RecordingUI(pipeline_mod._ui.UI):  # ruff: ignore[private-member-access] - ui is the only import site
+        """Record the total of every 'write' phase the pipeline opens."""
+
+        def __init__(self) -> None:
+            super().__init__(live=False, color=False, unicode=True)
+            self.write_totals: list[float | None] = []
+
+        def phase(self, name: str, *, total: float | None = None, unit: str = "") -> Any:
+            """Record the write-phase total, then delegate to the base UI."""
+            if name == "write":
+                self.write_totals.append(total)
+            return super().phase(name, total=total, unit=unit)
+
+    ui = _RecordingUI()
+    p = Pipeline(
+        str(_small_csv(tmp_path)),
+        "value",
+        "longitude",
+        "latitude",
+        str(tmp_path / "out"),
+        res=100.0,
+        block_size=2048,
+        workers=2,
+        turbo=True,
+        turbo_cap_gb=64.0,
+        ui=ui,
+    )
+    p.run()
+    _, dst_width, dst_height = calculate_default_transform(
+        f"EPSG:{p.work_crs}",
+        f"EPSG:{p.out_crs}",
+        p.nx,
+        p.ny,
+        p.x0,
+        p.y0,
+        p.x0 + p.nx * p.res,
+        p.y0 + p.ny * p.res,
+    )
+    assert len(ui.write_totals) == 2  # one phase per file
+    assert all(t == dst_width * dst_height for t in ui.write_totals)

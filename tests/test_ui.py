@@ -226,9 +226,15 @@ def test_plain_run_phase_lines_unchanged(tmp_path: Path, caplog: pytest.LogCaptu
 def test_color_always_non_tty_semantic_only(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--color always colors even on a non-TTY; only semantic SGR codes appear."""
+    """--color always colors even on a non-TTY; only semantic SGR codes appear.
+
+    A successful plain run has no status line left to color (the final ok
+    line is live-mode only, F3), so drive an error: the 'error:' line must
+    carry SGR, and only allow-listed semantic codes may appear.
+    """
     monkeypatch.delenv("NO_COLOR", raising=False)
-    main(_run_argv(tmp_path, tmp_path / "out", "--color", "always"))
+    with pytest.raises(SystemExit):
+        main(["/nonexistent-input.csv", "-o", str(tmp_path / "o"), "--color", "always"])
     err = capsys.readouterr().err
     assert "\x1b[" in err
     for group in _SGR_RE.findall(err):
@@ -408,12 +414,19 @@ def test_utf8_tty_uses_unicode_symbols() -> None:
 def test_verbose_env_report_single_line(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--verbose emits exactly one env: line with every required field."""
+    """--verbose emits exactly one env: line with REAL native-stack versions.
+
+    The version values must be real (digits, not 'unknown'/'not loaded'
+    placeholders): the report probes with local imports, so it must work in a
+    fresh process where the module-lazy native globals are not yet published
+    (F1, #115 review).
+    """
     monkeypatch.delenv("NO_COLOR", raising=False)
     main(_run_argv(tmp_path, tmp_path / "out", "--verbose"))
     err = capsys.readouterr().err
     lines = [ln for ln in err.splitlines() if ln.startswith("env:")]
     assert len(lines) == 1
+    line = lines[0]
     for field in (
         "ppgrid=",
         "python=",
@@ -426,7 +439,69 @@ def test_verbose_env_report_single_line(
         "numpy=",
         "cinterp=",
     ):
-        assert field in lines[0], f"missing {field}"
+        assert field in line, f"missing {field}"
+    # Real versions, not placeholders: this fails standalone if the probes
+    # ever regress to module-globals lookups before the native load.
+    for pat in (r"rasterio=\d", r"gdal=\d", r"pyproj=\d", r"numpy=\d"):
+        assert re.search(pat, line), f"no real version matching {pat!r}"
+
+
+def test_plain_run_stderr_no_ok_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plain (non-TTY) stderr stays byte-identical to the pre-#101 surface.
+
+    The final ok line (e.g. '0.24s -> value.tif, support_km.tif') is
+    live-table-mode only; plain runs keep exactly the one-line-per-phase log
+    output (F3, #115 review).
+    """
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    main(_run_argv(tmp_path, tmp_path / "out"))
+    err = capsys.readouterr().err
+    assert not re.search(r"^\d+\.\d+s -> ", err, flags=re.MULTILINE), "ok line leaked into plain stderr"
+    for prefix in ("ingest: ", "calibrate: ", "grid: ", "interpolate: ", "write: ", "done: "):
+        # Log format is 'I ppgrid.pipeline: <message>' - match the message part.
+        assert any(prefix in ln for ln in err.splitlines()), f"missing {prefix!r} line"
+
+
+def test_live_run_emits_final_ok_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live table mode (TTY) emits the final ok line with the output names."""
+    fake = FakeTTY()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(sys, "stderr", fake)
+    main(_run_argv(tmp_path, tmp_path / "out"))
+    text = fake.getvalue()
+    assert re.search(r"\d+\.\d+s -> value\.tif, support_km\.tif", text), "ok line missing from live stderr"
+
+
+def test_quiet_tty_zero_stderr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--quiet on a TTY: zero stderr, zero escape sequences (F4, #115 review).
+
+    quiet kills the live table, and the final ok line is live-mode only, so a
+    quiet successful run produces no stderr at all (pre-#101 behavior).
+    """
+    fake = FakeTTY()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(sys, "stderr", fake)
+    main(_run_argv(tmp_path, tmp_path / "out", "--quiet"))
+    assert not fake.getvalue()
+
+
+def test_set_total_zero_is_indeterminate() -> None:
+    """A falsy total stays indeterminate (total=None) in rich's task state.
+
+    rich renders total=0 as a finished task (full green bar), not
+    indeterminate; the UI normalizes 0 to None at both entry points (F6,
+    #115 review).
+    """
+    fake = FakeTTY()
+    ui = _ui.UI(live=True, color=False, unicode=True, stream=fake, spinner_min_s=0.0, refresh_interval=0.01)
+    with ui.run_scope(), ui.phase("read", unit="rows") as ph:
+        ph.set_total(0)
+        assert ui._progress.tasks[0].total is None  # ruff: ignore[private-member-access]
+        ph.advance(10)
+    with ui.run_scope(), ui.phase("grid", total=0):
+        assert ui._progress.tasks[1].total is None  # ruff: ignore[private-member-access]
 
 
 def test_env_report_not_emitted_without_verbose(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
