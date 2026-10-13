@@ -628,7 +628,7 @@ def test_a9_pin_20gb_regime_c() -> None:
     assert d.path == "shared"
     assert d.exit_code == 0
     assert "--turbo: cap" in d.summary  # the budget value used is printed
-    assert "budget 0.85*C = 17.0 GB" in d.summary
+    assert "budget 0.85 x cap = 17.0 GB" in d.summary
 
 
 def test_a9_pin_16gb_per_box() -> None:

@@ -125,7 +125,7 @@ def test_plan_includes_turbo_decision(tmp_path: Path, capsys: pytest.CaptureFixt
     assert not out.exists()
     text = capsys.readouterr().out
     assert "turbo:         on" in text
-    assert "regime" in text
+    assert "full in-RAM" in text  # #103: plain language, no regime codes
     assert "budget" in text
 
 

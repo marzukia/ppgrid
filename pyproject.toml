@@ -132,6 +132,14 @@ ignore = [
     "S404",   # suspicious subprocess import
     "S603",   # subprocess.run([sys.executable, -c, <own constant>])
 ]
+
+# tests/test_cli_help.py reads parser internals and runs the epilog examples.
+"tests/test_cli_help.py" = [
+    "private-member-access",    # parser._actions / _action_groups
+    "suspicious-subprocess-import",    # [sys.executable, -m ppgrid, ...] fixed argv
+    "subprocess-run-without-check",    # returncode asserted explicitly
+    "subprocess-without-shell-equals-true",    # fixed argv, no shell
+]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
 # tests/fixtures/*.py are runnable fixture generators; prints are the output.
