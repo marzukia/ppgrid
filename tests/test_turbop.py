@@ -608,6 +608,12 @@ def test_physical_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     empty = tmp_path / "empty"
     empty.write_text("MemFree:         1000 kB\n")
     monkeypatch.setattr(turbop, "MEMINFO_PATH", str(empty))
+
+    def _raise(*_a: object, **_k: object) -> None:
+        msg = "sysctl stubbed"  # real macOS runners have a working sysctl
+        raise OSError(msg)
+
+    monkeypatch.setattr(turbop.subprocess, "run", _raise)
     assert _read_physical_gb() is None
     # File missing (non-Linux, no /proc) -> unknown (None), not an error.
     monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "nope"))
