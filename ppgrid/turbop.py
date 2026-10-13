@@ -788,6 +788,30 @@ def resolve_cap(
 # Pre-check (3.5, regime-aware per 3.6.2)
 # ---------------------------------------------------------------------------
 
+# Plain-language names for the internal regime codes (issue #103): user-facing
+# output (--help, --plan, warnings) must not leak the design-doc codes. The
+# codes stay internal (sizing tables, tests); only the names are printed.
+REGIME_NAMES: dict[str, str] = {
+    "A": "full in-RAM",
+    "B": "input in-RAM, banded in-flight",
+    "C": "file-backed (page-cache)",
+    "per_box": "per-box low-RAM fallback",
+}
+
+
+def regime_name(regime: str) -> str:
+    """Plain-language name for a regime code (user-facing output, #103).
+
+    Args:
+        regime: Regime code from TurboPlan/PrecheckDecision
+            ("A" | "B" | "C" | "per_box").
+
+    Returns:
+        The plain-language name; unknown codes pass through unchanged.
+
+    """
+    return REGIME_NAMES.get(regime, regime)
+
 
 @dataclass(frozen=True)
 class PrecheckDecision:
@@ -844,8 +868,8 @@ def precheck(
     """
     budget_gb = plan.budget_bytes / GB
     summary = (
-        f"--turbo: cap {plan.cap_gb:g} GB ({cap_source}); budget 0.85*C = {budget_gb:.1f} GB; "
-        f"sizing Bt = {plan.sizing_bytes / GB:.1f} GB; regime {plan.regime} "
+        f"--turbo: cap {plan.cap_gb:g} GB ({cap_source}); budget 0.85 x cap = {budget_gb:.1f} GB; "
+        f"sizing {plan.sizing_bytes / GB:.1f} GB; {regime_name(plan.regime)} "
         f"(box_chunks={plan.box_chunks}, descent_bands={plan.descent_bands}, workers={plan.workers}, "
         f"write_scratch={plan.write_scratch_tiles}, zstd_ctx={plan.zstd_ctx_bytes / 1e6:.0f} MB)"
     )
@@ -879,8 +903,8 @@ def precheck(
             return PrecheckDecision("shared", "A", est_gb, budget_gb, 0, _note(None), summary)
         est_a_gb = plan.n_cells * PHASE_A_B_PER_CELL / GB
         message = (
-            f"[warn] --turbo: est peak {est_a_gb:.1f} GB (regime A, full in-RAM) "
-            f"> budget {budget_gb:.1f} GB; using regime {plan.regime} shared"
+            f"[warn] --turbo: est peak {est_a_gb:.1f} GB (full in-RAM) "
+            f"> budget {budget_gb:.1f} GB; using {regime_name(plan.regime)} instead"
         )
         return PrecheckDecision("shared", plan.regime, est_gb, budget_gb, 0, _note(message), summary)
 
