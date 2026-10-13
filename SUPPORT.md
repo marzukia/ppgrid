@@ -27,6 +27,10 @@ near-identical decoded pixels) on the other legs.
   - C interp JIT active (clang); np.interp fallback if no compiler.
   - CI: macos-latest, all 4 Pythons + anchor gate (proves the cross-OS
     C-build bytes).
+  - `--turbo`: bare auto-detect verified on the CI runners (no /proc/meminfo
+    there, so the conservative unknown-RAM cap is what runs: cgroup bound or
+    8 GB floor, named in the pre-check line). No fleet Mac hardware since
+    helium retired (2026-09-09); personal-Mac checks are optional, not a gate.
 - **Windows** (NOT in the CI matrix — excluded 2026-10-12, Unix-only scope)
   - Portability fixes from this wave are in the tree (CDLL guard,
     O_NOFOLLOW/ELOOP defaults, memmap-holder releases, platform-aware
