@@ -2817,8 +2817,111 @@ class Pipeline:
                 ph.summary = f"{self.nx}x{self.ny} cells @ {self.res:g} m"
             self._turbo_precheck()
 
+    def plan_data(self, args: argparse.Namespace) -> dict[str, Any]:
+        """Return the resolved run plan as a JSON-ready dict (single source of truth, #105).
+
+        The human --plan printer (:meth:`plan_text`) and the --plan --json
+        writer both read this dict, so the two surfaces cannot drift. Field
+        names mirror run_summary.json (#55/#117) where the same data
+        exists: the grid dict (incl. src_crs/work_crs/out_crs), ingest
+        counts, workers, the turbo decision/plan (cap_gb, budget_gb,
+        est_peak_gb — the fallback status), and outputs. Every value under
+        ``estimated`` is an estimate, not a measurement (s30 convention;
+        the measured peak-RAM value only exists after a run).
+
+        Call after :meth:`plan` (ingest/calibrate/grid/precheck resolved).
+
+        Args:
+            args: Parsed CLI namespace (input/out paths, --force).
+
+        Returns:
+            JSON-safe dict with schema_version 1.
+
+        """
+        d = self._turbo_decision
+        t = self._turbo_plan
+        turbo: dict[str, Any] | None = None
+        if d is not None and t is not None:
+            turbo = {
+                "enabled": True,
+                "decision": asdict(d),
+                "plan": asdict(t),
+                "budget_bytes": self._turbo_budget_bytes,
+            }
+        if d is not None:
+            est_peak_gb = float(d.est_peak_gb)
+        else:
+            # Non-turbo: same estimate the run summary's peak-RAM row uses.
+            est_peak_gb = float(turbop.est_peak(self.nx_padded * self.ny_padded, self.n) / turbop.GB)
+        out = Path(args.out)
+        # Overwrite behaviour of a real (non-plan) run: mirrors the #54
+        # guard (guarded names present without --force -> exit 2).
+        guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
+        existing = [name for name in guarded if (out / name).is_file()]
+        if out.is_dir() and existing:
+            overwrite = "force" if args.force else "guarded"
+        elif out.is_dir():
+            overwrite = "existing"
+        else:
+            overwrite = "create"
+        return {
+            "schema_version": 1,
+            "status": "plan",
+            "ppgrid_version": __version__,
+            "input": args.input,
+            "seed": self.seed,
+            "transform": self.tname,
+            "cap_km": float(self.cap_km_val),
+            "grid": {
+                "nx": self.nx,
+                "ny": self.ny,
+                "cells": self.nx * self.ny,
+                "res_m": float(self.res),
+                "x0_m": float(self.x0),
+                "y0_m": float(self.y0),
+                "nx_padded": self.nx_padded,
+                "ny_padded": self.ny_padded,
+                "levels": self.levels,
+                "step": self.step,
+                "halo": self.halo,
+                "bsize": self.bsize,
+                "nbx": self.nbx,
+                "nby": self.nby,
+                "n_tasks": len(self.tasks),
+                "n_empty_blocks": len(self.empty_blocks),
+                "src_crs": self.src_crs,
+                "work_crs": self.work_crs,
+                "out_crs": self.out_crs,
+                "saturation": float(self.saturation),
+                "scale": float(self.scale),
+                "percentile_step": self.percentile_step,
+                "block_size": self.block_size,
+                "compress": self.compress,
+            },
+            "ingest": self._ingest_summary_info(),
+            "workers": self.workers,
+            "strategy": self._strategy_text(),
+            "turbo": turbo,
+            "estimated": {
+                "peak_ram_gb": est_peak_gb,
+                # Raw int16 payload of the value + support bands (2 B/cell
+                # each); the compressed on-disk size is codec-dependent and
+                # unknown at plan time.
+                "disk_bytes": int(2 * self.nx * self.ny * 2),
+            },
+            "outputs": {
+                "value": str(out / "value.tif"),
+                "support": str(out / "support_km.tif"),
+            },
+            "out_dir": str(out),
+            "overwrite": overwrite,
+        }
+
     def plan_text(self, args: argparse.Namespace) -> str:
         """Human-readable run plan for --plan (issue #53); printed on stdout.
+
+        Formats :meth:`plan_data` (single source of truth, #105); the
+        --plan --json writer serializes the same dict.
 
         Args:
             args: Parsed CLI namespace (input/columns/out paths, --json).
@@ -2827,44 +2930,47 @@ class Pipeline:
             The multi-line plan text.
 
         """
+        data = self.plan_data(args)
+        g = data["grid"]
+        ing = data["ingest"]
         out = Path(args.out)
-        pct_step = f"{self.percentile_step:g}" if self.percentile_step is not None else "off"
+        pct_step = f"{g['percentile_step']:g}" if g["percentile_step"] is not None else "off"
         mbp = f"{args.max_band_parallel}" if args.max_band_parallel is not None else "default (--workers)"
         json_extra = " + run_summary.json" if args.json else ""
         cells_line = (
-            f"  grid cells:    {self.nx} x {self.ny} = {self.nx * self.ny:,} cells @ res={self.res:g} m "
-            f"(padded {self.nx_padded} x {self.ny_padded}, step {self.step})"
+            f"  grid cells:    {g['nx']} x {g['ny']} = {g['cells']:,} cells @ res={g['res_m']:g} m "
+            f"(padded {g['nx_padded']} x {g['ny_padded']}, step {g['step']})"
         )
         blocks_line = (
-            f"  blocks:        {self.nbx} x {self.nby} of bsize={self.bsize} "
-            f"({len(self.tasks)} tasks, {len(self.empty_blocks)} empty)"
+            f"  blocks:        {g['nbx']} x {g['nby']} of bsize={g['bsize']} "
+            f"({g['n_tasks']} tasks, {g['n_empty_blocks']} empty)"
         )
         lines = [
             "ppgrid run plan (--plan: nothing written, exit 0)",
             f"  input:         {args.input}",
             f"  columns:       value={args.value_col!r} lng={args.lng_col!r} lat={args.lat_col!r}",
             f"  out dir:       {args.out} ({'exists' if out.is_dir() else 'does not exist yet'})",
-            f"  ingest:        {self.n_total} rows -> {self.n} points ({self._drop_summary()})",
-            f"  grid extent:   x0={self.x0:.3f} m, y0={self.y0:.3f} m (work CRS EPSG:{self.work_crs}, metres)",
+            f"  ingest:        {ing['rows_read']} rows -> {ing['points']} points ({self._drop_summary()})",
+            f"  grid extent:   x0={g['x0_m']:.3f} m, y0={g['y0_m']:.3f} m (work CRS EPSG:{g['work_crs']}, metres)",
             cells_line,
-            f"  levels:        {self.levels} (halo {self.halo}, cap {self.cap_km_val:g} km)",
+            f"  levels:        {g['levels']} (halo {g['halo']}, cap {data['cap_km']:g} km)",
             blocks_line,
-            f"  transform:     {self.tname}",
-            f"  saturation:    {self.saturation:g}",
-            f"  scale:         {self.scale:g} (DN = percentile * scale), percentile-step: {pct_step}",
-            f"  seed:          {self.seed}",
-            f"  workers:       {self.workers}, max-band-parallel: {mbp}",
-            f"  compress:      {self.compress}",
-            f"  outputs:       value.tif (EPSG:{self.out_crs}) + support_km.tif{json_extra}",
+            f"  transform:     {data['transform']}",
+            f"  saturation:    {g['saturation']:g}",
+            f"  scale:         {g['scale']:g} (DN = percentile * scale), percentile-step: {pct_step}",
+            f"  seed:          {data['seed']}",
+            f"  workers:       {data['workers']}, max-band-parallel: {mbp}",
+            f"  compress:      {g['compress']}",
+            f"  outputs:       value.tif (EPSG:{g['out_crs']}) + support_km.tif{json_extra}",
         ]
-        if self.turbo and self._turbo_decision is not None and self._turbo_plan is not None:
-            d, t = self._turbo_decision, self._turbo_plan
-            mode = turbop.regime_name(d.regime)
-            if d.path == "shared":
+        if data["turbo"] is not None:
+            dec, pl = data["turbo"]["decision"], data["turbo"]["plan"]
+            mode = turbop.regime_name(dec["regime"])
+            if dec["path"] == "shared":
                 mode += " (shared path)"
             lines.append(
-                f"  turbo:         on — {mode}, cap {t.cap_gb:g} GB, "
-                f"budget {d.budget_gb:g} GB, est peak {d.est_peak_gb:g} GB, workers {t.workers}"
+                f"  turbo:         on — {mode}, cap {pl['cap_gb']:g} GB, "
+                f"budget {dec['budget_gb']:g} GB, est peak {dec['est_peak_gb']:g} GB, workers {pl['workers']}"
             )
         elif self.turbo:
             lines.append("  turbo:         on")
@@ -2922,6 +3028,9 @@ class Pipeline:
             return round(seconds * 1e3, 3)
 
         return {
+            # #105: schema version, shared with the --plan --json document.
+            # Additive only: existing keys keep their names and order.
+            "schema_version": 1,
             # Only JSON delta of issue #102: written only after a successful
             # run(), so it is always 'ok' (error surface = the exit code).
             "status": "ok",
@@ -4744,11 +4853,19 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
         p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=True, ui=_CURRENT_UI["ui"]), args.input)
         _map_pipeline_errors(p.plan, args.input)
-        # Concept X2: live mode boxes only the key/value block (the header
-        # line, env report and progress rows stay unboxed); plain mode is
-        # byte-identical to the pre-#102 print.
         plan_ui = _CURRENT_UI["ui"]
-        if plan_ui is not None:
+        if args.json:
+            # #105: machine-readable plan. stdout is exactly one JSON object
+            # (schema_version 1) and nothing else; the human printer is
+            # skipped. stderr (phase logs, the strict precheck line) keeps
+            # the run --json contract.
+            payload = json.dumps(_sanitize_json(p.plan_data(args)), indent=2, allow_nan=False) + "\n"
+            sys.stdout.write(payload)
+            sys.stdout.flush()
+        elif plan_ui is not None:
+            # Concept X2: live mode boxes only the key/value block (the header
+            # line, env report and progress rows stay unboxed); plain mode is
+            # byte-identical to the pre-#102 print.
             header, _, body = p.plan_text(args).partition("\n")
             plan_ui.print_plan(header, body.split("\n"))
         else:
