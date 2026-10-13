@@ -291,6 +291,32 @@ def _summary_lines(title: str, rows: list[tuple[str, str] | str]) -> list[str]:
     return out
 
 
+def _wrap_live_lines(lines: list[str], inner_width: int) -> list[str]:
+    r"""Wrap overlong hug-width panel content lines (fix-round F3/F4).
+
+    A hug-width panel/box clips a content line wider than the console.
+    Lines longer than ``inner_width`` (console width minus border +
+    padding) break there with a 4-space hanging continuation (the D-6
+    live-wrap style), so the full text survives and the panel hugs the
+    wrapped width. Short lines pass through untouched: at the approved-
+    frame widths (110/150) zero lines wrap, so those layouts are
+    byte-identical to the no-wrap render.
+
+    ``break_on_hyphens=False``: the overlong lines are output paths / kv
+    values, opaque tokens — break only on the hard width, never at a
+    hyphen, so a path like ``/tmp/pr118-review/...`` does not fragment
+    at its first hyphen.
+    """
+    out: list[str] = []
+    for line in lines:
+        if inner_width > 0 and len(line) > inner_width:
+            wrapped = textwrap.fill(line, width=inner_width, subsequent_indent="    ", break_on_hyphens=False)
+            out.extend(wrapped.split("\n"))
+        else:
+            out.append(line)
+    return out
+
+
 class _SpinnerColumn(ProgressColumn):
     r"""Spinner that stays blank until the task has run for ``min_s``.
 
@@ -674,7 +700,10 @@ class UI:
                 style="dim" if color else None,
             )
             # stdout console for live-only stdout artifacts (the --plan
-            # box, X2); the stderr console keeps the run surface.
+            # box, X2); the stderr console keeps the run surface. `width`
+            # is pinned exactly like the stderr console (tests, and
+            # terminals that report no size) so the box's wrap width and
+            # the run surface stay in lockstep.
             self._stdout_console = Console(
                 file=sys.stdout,
                 no_color=not color,
@@ -682,6 +711,7 @@ class UI:
                 highlight=False,
                 soft_wrap=False,
                 emoji=False,
+                width=width,
             )
             # D-3: rich's own refresh loop (10 fps) so the spinner and bar
             # animate between the pipeline's throttled manual refreshes.
@@ -907,8 +937,11 @@ class UI:
         the success marker (green when colored); the values are neutral.
 
         Live mode (concept X3): the block goes into a rounded panel titled
-        ``summary`` — the plain ``run summary`` header line becomes the
-        panel title; the rows keep their plain-text form.
+        ``summary`` (default foreground, per the owner-approved mock frame
+        — the green success marker stays on the ``ok:`` line above); the
+        rows keep their plain-text form. Overlong lines (typically output
+        paths on a narrow console) wrap inside the panel with a 4-space
+        hang at the inner width (fix-round F3), so nothing clips.
 
         Args:
             title: The block header (e.g. ``run summary``).
@@ -917,9 +950,12 @@ class UI:
         """
         lines = _summary_lines(title, rows)
         if self._live and self._console is not None:
+            # Inner width = console width minus border (2) + padding (2);
+            # the hug-width panel would otherwise clip the widest line.
+            inner = self._console.size.width - 4
             panel = Panel(
-                Text("\n".join(lines[1:]), no_wrap=True),
-                title=Text("summary", style="green" if self._color else ""),
+                Text("\n".join(_wrap_live_lines(lines[1:], inner)), no_wrap=True),
+                title="summary",
                 box=box.ROUNDED if self._unicode else box.ASCII,
                 expand=False,
             )
@@ -939,16 +975,21 @@ class UI:
         (byte-identical). Live (concept X2): the header stays a plain
         line; the key/value block goes into a square box (dim border when
         color is on), hug-width, with the kv lines' own indent kept
-        (padding (0, 0)). The env report and progress rows around it are
+        (padding (0, 0)). Overlong kv lines wrap at the box inner width
+        with a 4-space hanging continuation (fix-round F4), so nothing
+        clips. The env report and progress rows around it are
         unaffected (stderr, unboxed).
 
         """
         if self._live and self._stdout_console is not None:
             print(header, file=sys.stdout)  # ruff: ignore[print]
+            # Inner width = console width minus the border (2); padding
+            # is (0, 0), so the box hugs the wrapped kv lines.
+            inner = self._stdout_console.size.width - 2
             panel = Panel(
-                Text("\n".join(kv), no_wrap=True),
+                Text("\n".join(_wrap_live_lines(kv, inner)), no_wrap=True),
                 box=box.SQUARE if self._unicode else box.ASCII,
-                border_style="dim" if self._color else None,
+                border_style="dim" if self._color else "",
                 padding=(0, 0),
                 expand=False,
             )

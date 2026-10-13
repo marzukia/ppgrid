@@ -66,6 +66,74 @@ _EXPECTED_LIVE_PANEL = """╭────────────── summary 
 ╰──────────────────────────────────────╯
 """
 
+# F3: same rows but with 90-char output paths. At 80 cols the panel inner
+# width is 76, so each path wraps: 76-char first segment + 4-space-hung
+# continuation. The panel hugs the wrapped width (all lines exactly 80).
+_LONG_PATH_A = "/out/" + "a" * 85  # 90 chars
+_LONG_PATH_B = "/out/" + "b" * 85  # 90 chars
+_LONG_ROWS = [*_SUMMARY_ROWS[:9], _LONG_PATH_A, _LONG_PATH_B]
+_EXPECTED_LIVE_PANEL_LONG_80 = """╭────────────────────────────────── summary ───────────────────────────────────╮
+│   rows read:     13,580                                                      │
+│   rows accepted: 13,580                                                      │
+│   rows dropped:  0                                                           │
+│   grid:          11x8 (88 cells)                                             │
+│   strategy:      standard, workers 4                                         │
+│   elapsed:       12.34s                                                      │
+│   peak RAM:      14.8 GB (measured)                                          │
+│   value.tif:     5.2 MB                                                      │
+│   support_km.tif:3.1 MB                                                      │
+│ /out/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa │
+│     aaaaaaaaaaaaaa                                                           │
+│ /out/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb │
+│     bbbbbbbbbbbbbb                                                           │
+╰──────────────────────────────────────────────────────────────────────────────╯
+"""
+
+# F4: the real ``--plan`` kv block (equakes example) at 80 cols. Inner width
+# 78 clips the two longest kv lines at branch head; the fix wraps them with a
+# 4-space hang and the box hugs the wrapped content (all box lines exactly 80).
+_PLAN_HEADER = "ppgrid run plan (--plan: nothing written, exit 0)"
+_PLAN_KV = [
+    "  input:         data/all_equakes.csv",
+    "  columns:       value='mag' lng='longitude' lat='latitude'",
+    "  out dir:       out/ (does not exist yet)",
+    "  ingest:        44376 rows -> 44376 points (0 NaN/inf dropped)",
+    "  grid extent:   x0=-17367501.499 m, y0=-7308041.748 m (work CRS EPSG:6933, metres)",
+    "  grid cells:    69470 x 29267 = 2,033,178,490 cells @ res=500 m (padded 69632 x 29440, step 256)",
+    "  levels:        8 (halo 258, cap 128 km)",
+    "  blocks:        34 x 15 of bsize=2048 (483 tasks, 27 empty)",
+    "  transform:     identity",
+    "  saturation:    1",
+    "  scale:         100 (DN = percentile * scale), percentile-step: off",
+    "  seed:          0",
+    "  workers:       4, max-band-parallel: default (--workers)",
+    "  compress:      ZSTD",
+    "  outputs:       value.tif (EPSG:3857) + support_km.tif",
+    "  turbo:         off",
+]
+_EXPECTED_PLAN_BOX_80 = """ppgrid run plan (--plan: nothing written, exit 0)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  input:         data/all_equakes.csv                                         │
+│  columns:       value='mag' lng='longitude' lat='latitude'                   │
+│  out dir:       out/ (does not exist yet)                                    │
+│  ingest:        44376 rows -> 44376 points (0 NaN/inf dropped)               │
+│  grid extent:   x0=-17367501.499 m, y0=-7308041.748 m (work CRS EPSG:6933,   │
+│    metres)                                                                   │
+│  grid cells:    69470 x 29267 = 2,033,178,490 cells @ res=500 m (padded 69632│
+│    x 29440, step 256)                                                        │
+│  levels:        8 (halo 258, cap 128 km)                                     │
+│  blocks:        34 x 15 of bsize=2048 (483 tasks, 27 empty)                  │
+│  transform:     identity                                                     │
+│  saturation:    1                                                            │
+│  scale:         100 (DN = percentile * scale), percentile-step: off          │
+│  seed:          0                                                            │
+│  workers:       4, max-band-parallel: default (--workers)                    │
+│  compress:      ZSTD                                                         │
+│  outputs:       value.tif (EPSG:3857) + support_km.tif                       │
+│  turbo:         off                                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+"""
+
 _BAR = "\u2501"  # full bar block
 _PART = "\u2578"  # partial bar block
 
@@ -170,6 +238,49 @@ def test_summary_plain_mode_colour_title() -> None:
     assert lines[0] == "\x1b[32mrun summary\x1b[0m"
     for line in lines[1:]:
         assert "\x1b" not in line, f"non-title line carries escapes: {line!r}"
+
+
+def test_summary_panel_live_colour_title_default_fg() -> None:
+    """F5: colour-on live panel title is default fg; the ok line stays green.
+
+    Per the owner-approved mock frame: the green success marker is the
+    ``ok:`` line, not the panel chrome. Border and title carry no SGR.
+    """
+    fake = io.StringIO()
+    ui = _ui.UI(live=True, color=True, unicode=True, stream=fake, width=150, spinner_min_s=2.0)
+    ui.ok("8.04s -> value.tif, support_km.tif")
+    ui.summary("run summary", _SUMMARY_ROWS)
+    text = fake.getvalue()
+    lines = text.splitlines()
+    # the ok line is the single green SGR in the output
+    assert lines[0] == "\x1b[32mok: 8.04s -> value.tif, support_km.tif\x1b[0m"
+    title = next(line for line in lines if " summary " in line)
+    assert "\x1b" not in title
+    for line in lines[1:]:
+        assert "\x1b" not in line, f"panel line carries escapes: {line!r}"
+
+
+def test_summary_panel_80_long_paths_wrap_hang4() -> None:
+    """F3: overlong output paths wrap inside the 80-col panel, 4-space hang.
+
+    Nothing is lost: the 90-char path reassembles from the 76-char first
+    segment + the 4-space-hung continuation, and every panel line is
+    exactly 80 cols (the panel hugs the wrapped width).
+    """
+    fake = io.StringIO()
+    ui = _ui.UI(live=True, color=False, unicode=True, stream=fake, width=80, spinner_min_s=2.0)
+    ui.summary("run summary", _LONG_ROWS)
+    text = fake.getvalue()
+    assert "\x1b" not in text
+    assert text == _EXPECTED_LIVE_PANEL_LONG_80
+    lines = text.splitlines()
+    assert all(len(line) == 80 for line in lines)
+    # full-path survival: first segment = 76 cols (inner width), continuation
+    # hangs at 4 spaces; rejoining the segments recovers the exact path.
+    body = "\n".join(line[1:-1].rstrip() for line in lines)
+    for path in (_LONG_PATH_A, _LONG_PATH_B):
+        assert path[:76] in body
+        assert "    " + path[76:] in body
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +407,11 @@ def test_run_summary_in_stderr_default_verbosity(tmp_path: Path, monkeypatch: py
     # paths are one per line inside the panel
     assert f"│ {tmp_path / 'out' / 'value.tif'}" in text
     assert f"│ {tmp_path / 'out' / 'support_km.tif'}" in text
-    # only the panel title carries escapes after the table (no cursor/movement codes)
+    # F5: the X3 panel title is default fg (no SGR green) — the green
+    # success marker lives on the ok line above the panel, which the block
+    # below excludes. No escapes anywhere in the panel block.
     block = text[text.find(" summary ") :]
-    assert "\x1b" not in block.replace("\x1b[32m", "").replace("\x1b[0m", "")
+    assert "\x1b" not in block
 
 
 def test_quiet_suppresses_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -346,3 +459,56 @@ def test_summary_printed_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     argv = _run_argv(_drops_csv(tmp_path), tmp_path / "out")
     _pl.main(argv)
     assert fake.getvalue().count(" summary ") == 1
+
+
+# ---------------------------------------------------------------------------
+# --plan live box (X2): 80-col wrap + approved-frame no-wrap guards (F4)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_box_80_long_kv_wraps_hang4(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4: the two longest kv lines wrap inside the 80-col box, 4-space hang.
+
+    At branch head the hug-width box clipped them (grid extent 82 cols,
+    grid cells 93 cols vs inner 78). The wrapped box hugs its content
+    (every box line exactly 80) and nothing is lost: both full values
+    survive across their continuation lines.
+    """
+    fake_out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", fake_out)  # the stdout console binds it at UI build
+    ui = _ui.UI(live=True, color=False, unicode=True, width=80, spinner_min_s=2.0)
+    ui.print_plan(_PLAN_HEADER, _PLAN_KV)
+    text = fake_out.getvalue()
+    assert "\x1b" not in text
+    assert text == _EXPECTED_PLAN_BOX_80
+    box_lines = text.splitlines()[1:]
+    assert all(len(line) == 80 for line in box_lines)
+    # both clipped values survive: strip whitespace, the value must remain.
+    joined = "".join(line[1:-1] for line in box_lines).replace(" ", "")
+    for value in (
+        "x0=-17367501.499m,y0=-7308041.748m(workCRSEPSG:6933,metres)",
+        "69470x29267=2,033,178,490cells@res=500m(padded69632x29440,step256)",
+    ):
+        assert value in joined
+
+
+def test_plan_box_110_no_wrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4 guard: at 110 cols (approved frame) no kv line wraps.
+
+    The box is hug-width (content + border, <= 110); every kv line fits
+    inside the inner width verbatim, no continuation lines.
+    """
+    fake_out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", fake_out)
+    ui = _ui.UI(live=True, color=False, unicode=True, width=110, spinner_min_s=2.0)
+    ui.print_plan(_PLAN_HEADER, _PLAN_KV)
+    text = fake_out.getvalue()
+    lines = text.splitlines()
+    assert lines[0] == _PLAN_HEADER
+    box_lines = lines[1:]
+    box_w = max(len(kv) for kv in _PLAN_KV) + 2
+    assert box_w <= 110
+    assert all(len(line) == box_w for line in box_lines)
+    max_len = max(len(kv) for kv in _PLAN_KV)
+    for kv in _PLAN_KV:
+        assert (f"│{kv}│" if len(kv) == max_len else f"│{kv} ") in text

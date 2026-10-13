@@ -417,10 +417,15 @@ _CURRENT_UI: dict[str, _ui.UI | None] = {"ui": None}
 # stays byte-identical. With a UI, the marker is a display concern owned by
 # the UI layer (live markers / logging level letter) and the messages
 # below carry no state word.
+# Most warn sites embedded ``[warn] `` and most error sites ``error: ``; two
+# families carried a different legacy prefix (the stale-output sites embed
+# ``warning: ``; the strict precheck line keeps its ``error: `` marker
+# inside the message from turbop), so they pass an explicit ``legacy``
+# override instead of relying on the per-kind table.
 _LEGACY_MARKERS = {"error": "error: ", "warn": "[warn] ", "ok": "ok: ", "note": ""}
 
 
-def _ui_note(kind: str, text: str) -> None:
+def _ui_note(kind: str, text: str, legacy: str | None = None) -> None:
     """Emit a CLI stderr line via the presentation layer (issue #101).
 
     kind: ``note`` | ``ok`` | ``warn`` | ``error``. ``text`` carries the
@@ -428,11 +433,15 @@ def _ui_note(kind: str, text: str) -> None:
     shows ``ok: `` / ``[warn] `` / ``error: `` prefixes, plain shows the
     level letter of the unified ``L ppgrid.pipeline: msg`` line, and
     library mode (no active UI) re-adds the legacy raw marker and prints
-    as-is.
+    as-is. ``legacy`` overrides the library-mode marker for sites whose
+    pre-#102 raw print carried a different prefix (``"warning: "`` for the
+    stale-output family, ``""`` for the strict precheck line); display
+    modes never see it.
     """
     ui = _CURRENT_UI["ui"]
     if ui is None:
-        print(_LEGACY_MARKERS.get(kind, "") + text, file=sys.stderr)  # ruff: ignore[print]
+        marker = _LEGACY_MARKERS.get(kind, "") if legacy is None else legacy
+        print(marker + text, file=sys.stderr)  # ruff: ignore[print]
         return
     if kind == "ok":
         ui.ok(text)
@@ -442,6 +451,18 @@ def _ui_note(kind: str, text: str) -> None:
         ui.error(text)
     else:
         ui.note(text)
+
+
+def _ui_note_precheck(message: str) -> None:
+    """Emit one turbo precheck decision message (D-7).
+
+    The non-strict families carry an embedded ``[warn] `` prefix (stripped
+    here, re-added at display time); the strict line keeps its embedded
+    ``error: `` marker, so the library-mode re-append is empty for that
+    family (fix-round F2: ``[warn] error: ...`` was a double marker).
+    """
+    legacy = "" if message.startswith("error: ") else None
+    _ui_note("warn", message.removeprefix("[warn] "), legacy=legacy)
 
 
 def _ru_maxrss_gb() -> float | None:
@@ -637,6 +658,7 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
         "warn",
         f"this run failed before writing outputs; {', '.join(existing)} in {out} "
         "are from an earlier run and were left untouched",
+        legacy="warning: ",  # pre-#102 raw print embedded 'warning: ' (F1 family)
     )
 
 
@@ -3278,14 +3300,14 @@ class Pipeline:
             # --plan: the plan printout carries the decision; only a hard
             # failure (--turbo-strict infeasible) says its piece on stderr.
             if decision.exit_code == 3 and decision.message:
-                _ui_note("warn", decision.message.removeprefix("[warn] "))
+                _ui_note_precheck(decision.message)
         else:
             # stdout stays clean (the --json/--help contract): the summary
             # goes through the run logger (stderr, INFO; -q suppresses it,
             # like every other progress line) (#77).
             log.info("%s", decision.summary)
             if decision.message:
-                _ui_note("warn", decision.message.removeprefix("[warn] "))
+                _ui_note_precheck(decision.message)
         if decision.exit_code == 3:
             raise SystemExit(3)
 
@@ -3791,6 +3813,7 @@ class Pipeline:
                     "warn",
                     f"run failed during write; {vpath}, {spath} were not fully written "
                     "(any existing files are from an earlier run, left untouched)",
+                    legacy="warning: ",  # pre-#102 raw print embedded 'warning: ' (F1)
                 )
 
     def _write_rasters_turbo(
@@ -4070,6 +4093,7 @@ class Pipeline:
                     "warn",
                     f"run failed during write; {vpath}, {spath} were not fully written "
                     "(any existing files are from an earlier run, left untouched)",
+                    legacy="warning: ",  # pre-#102 raw print embedded 'warning: ' (F1)
                 )
 
 
