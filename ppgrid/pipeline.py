@@ -220,6 +220,9 @@ exit codes:
   2  validation error (bad flag value, missing input column, out dir not
      empty without --force)
   3  --turbo-strict: shared path infeasible under the RAM budget
+  130 interrupted (SIGINT): one `interrupted` line, no traceback; run
+      temp files removed (retained partials named), earlier run's rasters
+      warned as stale
 
 Run `ppgrid help` to print this text at any time."""
 
@@ -660,6 +663,50 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
         "are from an earlier run and were left untouched",
         legacy="warning: ",  # pre-#102 raw print embedded 'warning: ' (F1 family)
     )
+
+
+def _interrupted_exit(out: Path | None, p: Pipeline | None) -> NoReturn:
+    """Ctrl-C (SIGINT) mid-run: sweep temps, warn stale rasters, exit 130 (#106).
+
+    Replaces the default KeyboardInterrupt traceback with one clean line.
+    run()'s finally already sweeps run temps on a write-phase interrupt;
+    this sweep covers the rest (ingest, calibrate, preflight, a second
+    Ctrl-C mid-sweep). Any temp it cannot remove is named in the message.
+    The stale-outputs warning fires exactly once here: the in-run
+    BaseException handlers in main() skip it for KeyboardInterrupt.
+
+    Args:
+        out: Output directory; None only when the interrupt landed during
+            argument parsing, before the out path was read.
+        p: The Pipeline if constructed (its published set keeps the stale
+            warning from naming this run's own rasters, as in #77).
+
+    Raises:
+        SystemExit: code 130 (the SIGINT convention: 128 + SIGINT(2)).
+
+    """
+    retained: list[str] = []
+    if out is not None:
+        for fname in _RUN_TEMP_FILES:
+            fpath = out / fname
+            try:
+                fpath.unlink(missing_ok=True)
+            except OSError:
+                if fpath.is_file():
+                    retained.append(fname)
+        for scratch in sorted(out.glob("_stock_scratch_*.tif")):
+            try:
+                scratch.unlink(missing_ok=True)
+            except OSError:
+                if scratch.is_file():
+                    retained.append(scratch.name)
+    if retained:
+        print(f"interrupted; retained partials: {', '.join(retained)}", file=sys.stderr)  # ruff: ignore[print]
+    else:
+        print("interrupted", file=sys.stderr)  # ruff: ignore[print]
+    if out is not None:
+        _warn_stale_outputs(out, p.published if p is not None else None)
+    raise SystemExit(130)
 
 
 # O_NOFOLLOW and ELOOP are POSIX-only (Windows has no symlinks): getattr
@@ -3646,6 +3693,7 @@ class Pipeline:
         else:
             wtmp_v, wtmp_s = ftmp_v, ftmp_s
         partial = False
+        interrupted = False
         try:
             # Staging opens create fresh 0600 regular files and never follow
             # a pre-planted symlink (issues #15, #77); the ftmp finals are
@@ -3800,15 +3848,18 @@ class Pipeline:
             if wtmp_v is not ftmp_v:
                 wtmp_v.unlink(missing_ok=True)
                 wtmp_s.unlink(missing_ok=True)
-        except BaseException:
+        except BaseException as exc:
             # Mid-run failure (worker error, OOM, disk full): the finals were
             # not reached (os.replace is last). Warn so nobody consumes an
             # earlier run's files as this run's output (issues #15, #40).
+            # A Ctrl-C suppresses the warn: main() reports the interrupt
+            # itself, one line, exit 130 (issue #106).
             partial = True
+            interrupted = isinstance(exc, KeyboardInterrupt)
             raise
         finally:
             self._remove_run_temps()
-            if partial:
+            if partial and not interrupted:
                 _ui_note(
                     "warn",
                     f"run failed during write; {vpath}, {spath} were not fully written "
@@ -3864,6 +3915,7 @@ class Pipeline:
         out_dir = Path(self.out_dir)
 
         partial = False
+        interrupted = False
         try:
             with _prof.phase("write.dnfill"), _WallPhase("dnfill", self._phase_wall):
                 # File-backed (tmpfs) DN fields, not anon RAM (issue #39
@@ -4064,7 +4116,10 @@ class Pipeline:
             # Mid-run failure (worker error, OOM, disk full): the finals were
             # not reached (os.replace is last). Warn so nobody consumes an
             # earlier run's files as this run's output (issues #15, #40).
+            # A Ctrl-C suppresses the warn and the stack copy below: main()
+            # reports the interrupt itself, one line, exit 130 (issue #106).
             partial = True
+            interrupted = isinstance(exc, KeyboardInterrupt)
             # Copy the full stack to stderr for exceptions the CLI does not
             # map to a clean 'error: <msg>' (unmapped -> exit 1 + raw
             # traceback): the tb is dropped below because it pins the
@@ -4075,7 +4130,7 @@ class Pipeline:
             # flattened (review rev-os2 M2). Mapped exceptions (#16: clean
             # error line, no stack) are untouched. Exception type/message
             # are unchanged, so the CLI exit-code mapping is unaffected.
-            if not isinstance(exc, _CLI_MAPPED_EXCEPTIONS):
+            if not interrupted and not isinstance(exc, _CLI_MAPPED_EXCEPTIONS):
                 traceback.print_exception(exc, file=sys.stderr)
             exc.__traceback__ = None
             raise
@@ -4088,7 +4143,7 @@ class Pipeline:
             self._remove_run_temps()
             for p in out_dir.glob("_stock_scratch_*.tif"):
                 p.unlink(missing_ok=True)
-            if partial:
+            if partial and not interrupted:
                 _ui_note(
                     "warn",
                     f"run failed during write; {vpath}, {spath} were not fully written "
@@ -4307,7 +4362,13 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         # e.g. parquet input without the optional pyarrow extra.
         _die(str(e))
     except FileNotFoundError as e:
-        _die(f"input file not found: {e.filename or input_path}")
+        # Only the user-supplied input renders as "input file not found";
+        # any other missing path is an internal resource (meminfo, cgroup,
+        # run temp) and names itself (issue #106, attribution audit).
+        fname = e.filename
+        if fname is None or Path(fname).resolve() == Path(input_path).resolve():
+            _die(f"input file not found: {fname or input_path}")
+        _die(f"cannot open {fname}: {e.strerror or 'I/O error'}")
     except pd.errors.ParserError as e:
         _die(f"malformed input file: {e}")
     except RasterioIOError as e:
@@ -4325,7 +4386,11 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         _ui_note("error", str(e))  # D-7: unified error line
         raise SystemExit(2) from None
     except OSError as e:
-        # NotADirectoryError, disk full, etc.
+        # NotADirectoryError, disk full, etc. The actually failing path is
+        # named (issue #106): e.filename when the OS reports one, else the
+        # raw error (str(e) carries the path when it has one).
+        if e.filename:
+            _die(f"cannot access {e.filename}: {e.strerror or 'I/O error'}")
         _die(str(e))
 
 
@@ -4766,18 +4831,25 @@ def main(argv: list[str] | None = None) -> None:
 
     """
     parser = _build_parser()
-    args = parser.parse_args(argv)
-    out = Path(args.out)
-
-    # Presentation layer (issue #101): resolve live/color modes once for
-    # this invocation. main() is the only builder; library callers pass
-    # their own (or no) UI straight to Pipeline.
-    ui = _ui.UI.from_cli(quiet=args.quiet, color=args.color)
-    _CURRENT_UI["ui"] = ui
+    out: Path | None = None
     try:
-        _run_cli(parser, args, out, ui)
-    finally:
-        _CURRENT_UI["ui"] = None
+        args = parser.parse_args(argv)
+        out = Path(args.out)
+
+        # Presentation layer (issue #101): resolve live/color modes once for
+        # this invocation. main() is the only builder; library callers pass
+        # their own (or no) UI straight to Pipeline.
+        ui = _ui.UI.from_cli(quiet=args.quiet, color=args.color)
+        _CURRENT_UI["ui"] = ui
+        try:
+            _run_cli(parser, args, out, ui)
+        finally:
+            _CURRENT_UI["ui"] = None
+    except KeyboardInterrupt:
+        # Interrupt arg-parse through the _run_cli entry (issue #106): the
+        # mid-run contract applies here too — sweep, one line, exit 130.
+        # Interrupts inside _run_cli's body are handled there.
+        _interrupted_exit(out, None)
 
 
 def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Path, ui: _ui.UI) -> None:
@@ -4800,67 +4872,81 @@ def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Pat
             pipeline/IO errors (`_die`), exit 2 for missing input,
             validation errors, missing input columns (#57), or a non-empty
             out dir without --force (#54), exit 3 for `--turbo-strict`
-            shared-path infeasibility. Any non-zero exit over an earlier
+            shared-path infeasibility. Ctrl-C mid-run exits 130 with one
+            `interrupted` line, no traceback, run temps swept, retained
+            partials named (issue #106). Any non-zero exit over an earlier
             run's rasters also prints the stale-outputs warning
             (issues #40, #77).
 
     """
-    try:
-        # Preflight (input check, logging, flag validation, --plan branch):
-        # any non-zero exit over an earlier run's rasters warns instead of
-        # staying silent (issues #40, #77).
-        _main_preflight(parser, args, out)
-    except SystemExit as e:
-        if e.code not in (0, None):
-            _warn_stale_outputs(out)
-        raise
-    except BaseException:
-        _warn_stale_outputs(out)
-        raise
-
-    # #54: overwrite guard — a non-empty out dir means an earlier run's
-    # outputs; require --force to clobber them.
-    if not args.force:
-        guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
-        existing = [name for name in guarded if (out / name).is_file()]
-        if existing:
-            _ui_note("error", f"output directory {args.out} already contains: {', '.join(existing)}")
-            _ui_note(
-                "note",
-                "hint: pass --force to overwrite them",
-            )
-            raise SystemExit(2)
-
-    try:
-        # #57: friendly missing-column error before any pipeline work; inside
-        # the stale-outputs handler so a failed run over an earlier run's
-        # outputs still warns (issue #40).
-        _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
-        out.mkdir(parents=True, exist_ok=True)
-    except SystemExit:
-        _warn_stale_outputs(out)
-        raise
-    except OSError as e:
-        _die(f"cannot create output directory {args.out}: {e}")
     p: Pipeline | None = None
     try:
-        # Construction (init validation, e.g. --scale range) gets the same
-        # exit-code mapping as the run phase (review M-1, #56 contract).
-        p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False, ui=ui), args.input)
-        _map_pipeline_errors(p.run, args.input)
-        if args.json:
-            _write_json_summary(p, args, out)
-    except SystemExit as e:
-        # Any non-zero exit with an earlier run's rasters in place: warn
-        # instead of staying silent (issue #40). Rasters this run already
-        # published (a post-publish failure, e.g. a --json write error)
-        # are not stale (#77).
-        if e.code not in (0, None):
-            _warn_stale_outputs(out, p.published if p is not None else None)
-        raise
-    except BaseException:
-        _warn_stale_outputs(out, p.published if p is not None else None)
-        raise
+        try:
+            # Preflight (input check, logging, flag validation, --plan
+            # branch): any non-zero exit over an earlier run's rasters warns
+            # instead of staying silent (issues #40, #77).
+            _main_preflight(parser, args, out)
+        except SystemExit as e:
+            if e.code not in (0, None):
+                _warn_stale_outputs(out)
+            raise
+        except BaseException as e:
+            # KeyboardInterrupt is handled once, at the outer level below:
+            # sweep, stale warn, one line, exit 130 (issue #106).
+            if not isinstance(e, KeyboardInterrupt):
+                _warn_stale_outputs(out)
+            raise
+
+        # #54: overwrite guard — a non-empty out dir means an earlier run's
+        # outputs; require --force to clobber them.
+        if not args.force:
+            guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
+            existing = [name for name in guarded if (out / name).is_file()]
+            if existing:
+                _ui_note("error", f"output directory {args.out} already contains: {', '.join(existing)}")
+                _ui_note(
+                    "note",
+                    "hint: pass --force to overwrite them",
+                )
+                raise SystemExit(2)
+
+        try:
+            # #57: friendly missing-column error before any pipeline work;
+            # inside the stale-outputs handler so a failed run over an
+            # earlier run's outputs still warns (issue #40).
+            _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
+            out.mkdir(parents=True, exist_ok=True)
+        except SystemExit:
+            _warn_stale_outputs(out)
+            raise
+        except OSError as e:
+            _die(f"cannot create output directory {args.out}: {e}")
+        try:
+            # Construction (init validation, e.g. --scale range) gets the
+            # same exit-code mapping as the run phase (review M-1, #56
+            # contract).
+            p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False, ui=ui), args.input)
+            _map_pipeline_errors(p.run, args.input)
+            if args.json:
+                _write_json_summary(p, args, out)
+        except SystemExit as e:
+            # Any non-zero exit with an earlier run's rasters in place: warn
+            # instead of staying silent (issue #40). Rasters this run already
+            # published (a post-publish failure, e.g. a --json write error)
+            # are not stale (#77).
+            if e.code not in (0, None):
+                _warn_stale_outputs(out, p.published if p is not None else None)
+            raise
+        except BaseException as e:
+            # KeyboardInterrupt is handled once, at the outer level below:
+            # sweep, stale warn, one line, exit 130 (issue #106).
+            if not isinstance(e, KeyboardInterrupt):
+                _warn_stale_outputs(out, p.published if p is not None else None)
+            raise
+    except KeyboardInterrupt:
+        # One clean line, no traceback (issue #106): sweep run temps, name
+        # any retained partial, warn about an earlier run's rasters, exit 130.
+        _interrupted_exit(out, p)
 
 
 if __name__ == "__main__":
