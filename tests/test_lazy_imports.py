@@ -122,6 +122,23 @@ def test_lazy_coexists_with_monkeypatch() -> None:
     assert pgrid.reproject is original  # restored
 
 
+def test_deleted_lazy_name_self_heals_via_load_native() -> None:
+    """A deleted lazy name re-resolves on next access (review F1, PEP 562).
+
+    Pre-fix, the second getattr raised KeyError (globals()[name] after the
+    _load_native fast-return), not the lazy value.
+
+    """
+    import ppgrid.pipeline as pgrid
+
+    original = pgrid.reproject  # resolved + cached first
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delattr(pgrid, "reproject")
+        assert "reproject" not in vars(pgrid)
+        assert pgrid.reproject is original  # _load_native re-publishes
+    assert pgrid.reproject is original
+
+
 def test_zstdmt_lazy_names_resolve() -> None:
     """Lazy names in zstdmt resolve on first use."""
     from ppgrid import zstdmt
