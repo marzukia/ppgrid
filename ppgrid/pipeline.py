@@ -479,15 +479,30 @@ def _env_report_line(preset: float | None) -> str:
         parts.append(f"ram={cap:g}GB ({source})")
     except Exception as e:  # ruff: ignore[blind-except] - report line must not break the run
         parts.append(f"ram=unknown ({e})")
+    # Local imports, not the module-lazy names: the report runs in
+    # _main_preflight, before _load_native(), and a bare global lookup
+    # misses the PEP 562 __getattr__ (the lazy names are not in the module
+    # dict yet), so rasterio/gdal/pyproj would read as placeholders on every
+    # fresh --verbose run (F1, #115 review). Each field gets its own try so
+    # one failed probe cannot swallow the next field.
     try:
-        parts.extend([f"rasterio={rasterio.__version__}", f"gdal={rasterio.gdal_version()}"])
+        import rasterio as _rasterio
+
+        parts.append(f"rasterio={_rasterio.__version__}")
     except Exception:  # ruff: ignore[blind-except]
         parts.append("rasterio=unknown")
-    pyproj_mod = globals().get("pyproj")  # lazy name (PEP 562, #110)
-    if pyproj_mod is None:
-        parts.append("pyproj=not loaded")
-    else:
-        parts.append(f"pyproj={pyproj_mod.__version__}")
+    try:
+        import rasterio as _rasterio
+
+        parts.append(f"gdal={_rasterio.gdal_version()}")
+    except Exception:  # ruff: ignore[blind-except]
+        parts.append("gdal=unknown")
+    try:
+        import pyproj as _pyproj
+
+        parts.append(f"pyproj={_pyproj.__version__}")
+    except Exception:  # ruff: ignore[blind-except]
+        parts.append("pyproj=unknown")
     try:
         parts.append(f"numpy={np.__version__}")
     except Exception:  # ruff: ignore[blind-except]
@@ -2699,7 +2714,10 @@ class Pipeline:
             t_total = time.perf_counter() - t_total
             self._log_run_summary(t_ingest, t_calibrate, t_grid, t_write, t_total, vpath, spath)
             self._summary = self._collect_summary(vpath, spath, t_ingest, t_calibrate, t_grid, t_write, t_total)
-        if self.ui is not None:
+        # Final ok line is live-table-mode only: plain stderr (non-TTY,
+        # NO_COLOR, TERM=dumb, --quiet) stays byte-identical to the pre-#101
+        # logging output (F3/F4, #115 review).
+        if self.ui is not None and self.ui.live:
             self.ui.ok(f"{t_total:.2f}s -> {Path(vpath).name}, {Path(spath).name}")
         return vpath, spath
 
@@ -3775,7 +3793,9 @@ class Pipeline:
                 ("value", val_dn, vprof, ftmp_v, vtags, (1.0 / self.scale,)),
                 ("support", sup_dn, sprof, ftmp_s, stags, (1.0,)),
             ):
-                with self._phase("write", total=2 * dst_width * dst_height, unit="cells") as wph:
+                # Per-file total: the phase opens inside the per-file loop,
+                # so each bar must end at 100%, not 50% (F5, #115 review).
+                with self._phase("write", total=dst_width * dst_height, unit="cells") as wph:
 
                     def _wprogress(done: int) -> None:
                         wph.advance(done)
