@@ -12,6 +12,9 @@ API:
   (green = ok, yellow = warn, red = error); the state word is always in the
   text, so color is never the sole carrier.
 - ``UI.env_report`` — the ``--verbose`` one-line environment report.
+- ``UI.summary`` — the final run summary block (issue #102): aligned
+  ``label: value`` rows + bare output paths, at most 78 columns wide so it
+  never wraps or truncates at 80/120.
 
 Mode resolution (documented in the ``--color`` help):
 
@@ -37,7 +40,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any
@@ -45,6 +48,7 @@ from typing import Any
 from rich.console import Console
 from rich.progress import BarColumn, Progress, ProgressColumn, Task, TextColumn
 from rich.spinner import Spinner
+from rich.table import Column
 from rich.text import Text
 
 __all__ = ["UI", "Phase", "resolve_color", "resolve_live"]
@@ -138,6 +142,140 @@ def _human_rate(rate: float) -> str:
     return f"{rate:.0f}"
 
 
+def _compact_count(n: int) -> str:
+    """Compact SI-style count: 1_692_256 -> '1.7M', 365_000 -> '365K'.
+
+    The narrow-terminal fallback for the count column (issue #102); full
+    precision is used whenever the table fits the terminal (_plan_table).
+    """
+    if n >= 1e6:
+        s, suf = f"{n / 1e6:.1f}", "M"
+    elif n >= 1e3:
+        s, suf = f"{n / 1e3:.1f}", "K"
+    else:
+        return str(n)
+    return s.removesuffix(".0") + suf
+
+
+# Column count of the progress table: spinner, description, count, bar,
+# percent, elapsed, rate. Rich's Table.grid (padding=(0, 1)) renders a row
+# as " ".join(cells), and every column here is no_wrap, so: row width =
+# sum(column widths) + (n_cols - 1) (+ 1 trailing space when that row's
+# last cell is empty). Column widths are the max content across rows.
+_N_PROGRESS_COLS = 7
+
+# Standalone column units (no console): assume a wide terminal and a
+# single-row table, so the pre-#102 full-precision layout is what they render.
+_WIDE_DEFAULT = 10_000
+
+# Minimum usable bar width (issue #102): the rate column, then full count
+# precision, are sacrificed to keep the bar at least this wide.
+_BAR_MIN = 8
+
+
+def _elapsed_text(task: Task) -> str:
+    """H:MM:SS elapsed for the task (shared by _plan_table and the column)."""
+    elapsed = task.finished_time if task.finished else task.elapsed
+    if elapsed is None:
+        return "-:--:--"
+    return str(timedelta(seconds=max(0, int(elapsed))))
+
+
+def _rate_text(task: Task) -> str | None:
+    """Throughput text, or None when the warmup/zero guards hide it."""
+    if task.completed <= 0:
+        return None
+    elapsed = task.elapsed
+    if elapsed is None or elapsed < 0.25:
+        return None
+    unit = task.fields.get("unit", "")
+    return f"{_human_rate(task.completed / elapsed)}{unit}/s"
+
+
+def _count_text(task: Task, *, compact: bool) -> str:
+    """Count cell text for a task: full precision or compact SI-style."""
+    if task.completed <= 0:
+        return ""
+    n = int(task.completed)
+    unit = task.fields.get("unit", "")
+    count = f"{n:,}" if not compact else _compact_count(n)
+    return f"{count} {unit}".rstrip()
+
+
+def _plan_table(tasks: list[Task], width: int) -> tuple[list[str], list[str], int]:
+    """Pick the table layout that fits the terminal width (issue #102).
+
+    Rich's Table.grid sizes every column to the max content across the
+    visible rows, so the plan sizes the whole table, not one row. Column
+    widths are fixed by the plan and every column renders no_wrap, so
+    nothing truncates or wraps. The bar is elastic (0..24) within each
+    tier; tiers, highest first:
+
+    1. full-precision counts + rate, with a bar of at least 8;
+    2. full-precision counts, rate dropped, bar of at least 8;
+    3. compact counts (1.7M / 365K), rate dropped (the last tier accepts
+       any bar width down to 0).
+
+    A bar below 8 is noise, so the tier drops the rate (and, if needed,
+    count precision) to keep it usable. Wide terminals (>150 cols) keep
+    the pre-#102 full columns (full count, rate, 24-char bar) for every
+    realistic phase line.
+
+    Returns:
+        (counts, rates, bar_width) lists aligned with ``tasks``.
+
+    """
+    descs = [t.description for t in tasks]
+    pcts = [f"{t.percentage:.0f}%" if t.total else "" for t in tasks]
+    els = [_elapsed_text(t) for t in tasks]
+    counts_full = [_count_text(t, compact=False) for t in tasks]
+    counts_compact = [_count_text(t, compact=True) for t in tasks]
+    rates: list[str | None] = [_rate_text(t) for t in tasks]
+
+    desc_w = max((len(d) for d in descs), default=0)
+    pct_w = max((len(p) for p in pcts), default=0)
+    el_w = max((len(e) for e in els), default=0)
+
+    def table_width(counts: list[str], rate_texts: list[str], bar: int) -> int:
+        c_w = max((len(c) for c in counts), default=0)
+        r_w = max((len(r) for r in rate_texts), default=0)
+        w = 1 + desc_w + c_w + bar + pct_w + el_w + r_w + (_N_PROGRESS_COLS - 1)
+        if any(not r for r in rate_texts):
+            w += 1  # trailing space on rows whose last cell is empty
+        return w
+
+    rate_texts = [r or "" for r in rates]
+    if any(rates):
+        base = table_width(counts_full, rate_texts, 0)
+        bar = min(24, width - base)
+        if bar >= _BAR_MIN:
+            return (counts_full, rate_texts, bar)
+    rate_blank = [""] * len(tasks)
+    base = table_width(counts_full, rate_blank, 0)
+    bar = min(24, width - base)
+    if bar >= _BAR_MIN:
+        return (counts_full, rate_blank, bar)
+    base = table_width(counts_compact, rate_blank, 0)
+    return (counts_compact, rate_blank, max(0, min(24, width - base)))
+
+
+def _summary_lines(title: str, rows: list[tuple[str, str] | str]) -> list[str]:
+    """Build the aligned plain-text run summary block (issue #102).
+
+    ``label: value`` rows are padded to the longest label; bare strings
+    (output paths) sit at column 0, one per line, copyable.
+    """
+    label_w = max((len(row[0]) for row in rows if isinstance(row, tuple)), default=0)
+    out = [title]
+    for row in rows:
+        if isinstance(row, tuple):
+            label, value = row
+            out.append(f"  {label}:".ljust(label_w + 3) + value)
+        else:
+            out.append(row)
+    return out
+
+
 class _SpinnerColumn(ProgressColumn):
     r"""Spinner that stays blank until the task has run for ``min_s``.
 
@@ -161,30 +299,71 @@ class _SpinnerColumn(ProgressColumn):
 
 
 class _CountColumn(ProgressColumn):
-    """Completed count + unit, e.g. ``12,345 rows`` / ``2,000,000 cells``."""
+    """Completed count + unit, e.g. ``12,345 rows`` / ``1,692,256 cells``.
+
+    Full precision when the table fits the terminal; compact (``1.7M rows``)
+    on narrow terminals so nothing truncates (issue #102).
+    """
+
+    def __init__(
+        self,
+        width_fn: Callable[[], int] | None = None,
+        tasks_fn: Callable[[], list[Task]] | None = None,
+    ) -> None:
+        """Bind the terminal-width and visible-task probes (default: wide, self-only)."""
+        super().__init__()
+        self._width_fn = width_fn if width_fn is not None else (lambda: _WIDE_DEFAULT)
+        self._tasks_fn = tasks_fn if tasks_fn is not None else list
 
     @staticmethod
-    def render(task: Task) -> Text:
+    def get_table_column() -> Column:
+        return Column(no_wrap=True)
+
+    def render(self, task: Task) -> Text:
         if task.completed <= 0:
             return Text("")
-        unit = task.fields.get("unit", "")
-        return Text(f"{int(task.completed):,} {unit}".rstrip())
+        tasks = self._tasks_fn() or [task]
+        counts, _, _ = _plan_table(tasks, self._width_fn())
+        for i, t in enumerate(tasks):
+            if t is task:
+                return Text(counts[i])
+        return Text(_count_text(task, compact=False))
 
 
 class _BarColumn(BarColumn):
-    """Green (ok) bar; red (error) once the phase ended with a failure."""
+    """Green (ok) bar; red (error) once the phase ended with a failure.
+
+    Bar width comes from the table plan: 24 when the full table fits,
+    elastic (shrinking to 0) on narrow terminals (issue #102).
+    """
+
+    def __init__(
+        self,
+        width_fn: Callable[[], int] | None = None,
+        tasks_fn: Callable[[], list[Task]] | None = None,
+    ) -> None:
+        """Bind the terminal-width and visible-task probes (default: wide, self-only)."""
+        super().__init__()
+        self._width_fn = width_fn if width_fn is not None else (lambda: _WIDE_DEFAULT)
+        self._tasks_fn = tasks_fn if tasks_fn is not None else list
 
     @staticmethod
-    def render(task: Task) -> Text:
+    def get_table_column() -> Column:
+        return Column(no_wrap=True)
+
+    def render(self, task: Task) -> Text:
+        tasks = self._tasks_fn() or [task]
+        bar = _plan_table(tasks, self._width_fn())[2]
+        if bar <= 0:
+            return Text("")
         style = "red" if task.fields.get("failed") else "green"
-        bar = BarColumn(
-            bar_width=24,
+        return BarColumn(
+            bar_width=bar,
             style="none",
             complete_style=style,
             finished_style=style,
             pulse_style=style,
-        )
-        return bar.render(task)
+        ).render(task)
 
 
 class _PercentColumn(ProgressColumn):
@@ -193,6 +372,10 @@ class _PercentColumn(ProgressColumn):
     Indeterminate tasks render blank: an invented percent is never shown
     (issue #101).
     """
+
+    @staticmethod
+    def get_table_column() -> Column:
+        return Column(no_wrap=True)
 
     @staticmethod
     def render(task: Task) -> Text:
@@ -205,29 +388,43 @@ class _ElapsedColumn(ProgressColumn):
     """H:MM:SS elapsed for the task. Unstyled: semantic color only."""
 
     @staticmethod
+    def get_table_column() -> Column:
+        return Column(no_wrap=True)
+
+    @staticmethod
     def render(task: Task) -> Text:
-        elapsed = task.finished_time if task.finished else task.elapsed
-        if elapsed is None:
-            return Text("-:--:--")
-        return Text(str(timedelta(seconds=max(0, int(elapsed)))))
+        return Text(_elapsed_text(task))
 
 
 class _RateColumn(ProgressColumn):
     """Throughput, e.g. ``8.3Kcells/s``.
 
     Shown once the task has both counts and a little history (the first
-    samples are too noisy).
+    samples are too noisy); dropped by the table plan when the full table
+    no longer fits the terminal (issue #102).
     """
 
+    def __init__(
+        self,
+        width_fn: Callable[[], int] | None = None,
+        tasks_fn: Callable[[], list[Task]] | None = None,
+    ) -> None:
+        """Bind the terminal-width and visible-task probes (default: wide, self-only)."""
+        super().__init__()
+        self._width_fn = width_fn if width_fn is not None else (lambda: _WIDE_DEFAULT)
+        self._tasks_fn = tasks_fn if tasks_fn is not None else list
+
     @staticmethod
-    def render(task: Task) -> Text:
-        if task.completed <= 0:
-            return Text("")
-        elapsed = task.elapsed
-        if elapsed is None or elapsed < 0.25:
-            return Text("")
-        unit = task.fields.get("unit", "")
-        return Text(f"{_human_rate(task.completed / elapsed)}{unit}/s")
+    def get_table_column() -> Column:
+        return Column(no_wrap=True)
+
+    def render(self, task: Task) -> Text:
+        tasks = self._tasks_fn() or [task]
+        _, rates, _ = _plan_table(tasks, self._width_fn())
+        for i, t in enumerate(tasks):
+            if t is task:
+                return Text(rates[i])
+        return Text(_rate_text(task) or "")
 
 
 # ---------------------------------------------------------------------------
@@ -330,8 +527,14 @@ class UI:
         stream: Any | None = None,
         spinner_min_s: float = 2.0,
         refresh_interval: float = 0.15,
+        quiet: bool = False,
+        width: int | None = None,
     ) -> None:
-        """Store mode flags; build the rich Console/Progress when live."""
+        """Store mode flags; build the rich Console/Progress when live.
+
+        ``quiet`` suppresses the final run summary (#102); ``width`` pins
+        the console width (tests, and terminals that report no size).
+        """
         self._stream = stream if stream is not None else sys.stderr
         self._live = live
         self._color = color
@@ -339,6 +542,7 @@ class UI:
         self._spinner_min_s = spinner_min_s
         self._refresh_interval = refresh_interval
         self._last_refresh = 0.0
+        self._quiet = quiet
         self._console: Console | None = None
         self._progress: Progress | None = None
         self._log_handler: _UIStreamHandler | None = None
@@ -351,15 +555,27 @@ class UI:
                 highlight=False,
                 soft_wrap=False,
                 emoji=False,
+                width=width,
             )
+
+            def _layout_width() -> int:
+                """Live terminal width for the table layout plan (issue #102)."""
+                return self._console.size.width if self._console is not None else _WIDE_DEFAULT
+
+            def _visible_tasks() -> list[Task]:
+                """Return the visible tasks; the table plan sizes to all of them (#102)."""
+                if self._progress is None:
+                    return []
+                return [t for t in self._progress.tasks if t.visible]
+
             self._progress = Progress(
                 _SpinnerColumn(unicode=unicode, min_s=spinner_min_s),
                 TextColumn("{task.description}"),
-                _CountColumn(),
-                _BarColumn(),
+                _CountColumn(width_fn=_layout_width, tasks_fn=_visible_tasks),
+                _BarColumn(width_fn=_layout_width, tasks_fn=_visible_tasks),
                 _PercentColumn(),
                 _ElapsedColumn(),
-                _RateColumn(),
+                _RateColumn(width_fn=_layout_width, tasks_fn=_visible_tasks),
                 console=self._console,
                 auto_refresh=False,
                 redirect_stdout=False,
@@ -384,6 +600,7 @@ class UI:
             color=resolve_color(flag=color, stream=stream),
             unicode=_is_utf8(stream),
             stream=stream,
+            quiet=quiet,
         )
 
     # -- mode flags ----------------------------------------------------------
@@ -402,6 +619,11 @@ class UI:
     def unicode(self) -> bool:
         """True when the stream encoding supports unicode symbols."""
         return self._unicode
+
+    @property
+    def quiet(self) -> bool:
+        """True when --quiet suppresses the final run summary (issue #102)."""
+        return self._quiet
 
     # -- run scope -----------------------------------------------------------
 
@@ -556,6 +778,34 @@ class UI:
     def env_report(self, text: str) -> None:
         """Emit the ``--verbose`` one-line environment report (issue #101)."""
         self.note(text)
+
+    def summary(self, title: str, rows: list[tuple[str, str] | str]) -> None:
+        """Render the final run summary block (issue #102).
+
+        Aligned ``label: value`` rows (padded to the longest label) plus
+        bare path lines at column 0 (copyable). The block is built to fit
+        80 columns, so it never wraps or truncates at 80/120. The title is
+        the success marker (green when colored); the values are neutral.
+
+        Args:
+            title: The block header (e.g. ``run summary``).
+            rows: ``(label, value)`` pairs and/or bare path strings, in order.
+
+        """
+        lines = _summary_lines(title, rows)
+        if self._live and self._console is not None:
+            for i, text in enumerate(lines):
+                t = Text(text)
+                if i == 0 and self._color:
+                    t.stylize("green")
+                self._console.print(t, soft_wrap=True)  # paths must not wrap
+            self._refresh()
+            return
+        for i, text in enumerate(lines):
+            if i == 0 and self._color:
+                print(f"\x1b[{_SGR_OK}m{text}\x1b[{_SGR_RESET}m", file=self._stream)
+            else:
+                print(text, file=self._stream)
 
     def _emit(self, kind: str, text: str) -> None:
         if self._live and self._console is not None:
