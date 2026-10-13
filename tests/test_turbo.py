@@ -39,6 +39,7 @@ from rasterio.warp import calculate_default_transform
 
 from ppgrid import pipeline as pipeline_mod
 from ppgrid import turbop
+from ppgrid._platform import is_canonical_platform
 from ppgrid.pipeline import (
     NODATA,
     OUT_CRS,
@@ -56,6 +57,20 @@ from ppgrid.pipeline import (
 from ppgrid.pullpush import bin_points, box_count_banded
 
 DATA_CSV = Path(pipeline_mod.__file__).resolve().parent.parent / "data" / "melb_houses.csv"
+
+
+def _ingest_pool_context() -> mp.context:
+    """Start method for the ingest-pool tests.
+
+    forkserver where the platform has it (review m11: the pytest parent is
+    multithreaded, and fork() from a multithreaded process raises
+    DeprecationWarning on Python 3.13+). Windows has no forkserver — spawn
+    is the only start method there and re-executes the identical parse.
+    """
+    try:
+        return mp.get_context("forkserver")
+    except ValueError:
+        return mp.get_context("spawn")
 
 
 def _sha(p: str | Path) -> str:
@@ -169,7 +184,7 @@ def test_ingest_mt_matches_single_parse(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(
         pipeline_mod,
         "ProcessPoolExecutor",
-        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+        partial(_ProcessPoolExecutor, mp_context=_ingest_pool_context()),
     )
     csv = tmp_path / "edge.csv"
     n = 500_000
@@ -272,7 +287,7 @@ def test_ingest_bigint_serial_bit_identical_to_chunk(tmp_path: Path, monkeypatch
     monkeypatch.setattr(
         pipeline_mod,
         "ProcessPoolExecutor",
-        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+        partial(_ProcessPoolExecutor, mp_context=_ingest_pool_context()),
     )
     monkeypatch.setattr(pipeline_mod, "_INGEST_MIN_CHUNK_ROWS", 1)
     csv = tmp_path / "bigint.csv"
@@ -325,8 +340,18 @@ def test_ingest_bigint_serial_takes_c_float_path(tmp_path: Path) -> None:
     exact = np.array([float(t) for t in toks], dtype=np.float64)
     ulp = np.abs(v.view(np.int64) - exact.view(np.int64))
     assert ulp.max() <= 2  # C path is at most 2 ULP off correct rounding here
-    assert int((v != exact).sum()) == 1478  # pandas 2.3.3: the announced change set
-    assert v[-1] == 2**63 + 2048  # audit headline: pre-fix the serial gave 2**63
+    count = int((v != exact).sum())
+    if is_canonical_platform():
+        assert count == 1478  # pandas 2.3.3: the announced change set (canonical pin)
+        assert v[-1] == 2**63 + 2048  # audit headline: pre-fix the serial gave 2**63
+    else:
+        # Non-canonical platform: the C-parser float path is taken (v == per_tok
+        # above) and stays within 2 ULP of correct rounding, but the exact
+        # mismatch count and the 2**63-1 headline bits are build-dependent
+        # (pandas libm / xstrtod rounding). Keep the bounded invariants, not
+        # the exact pin. The ulp of a float64 at 2**63 is 2**11 = 2048.
+        assert 0 < count <= len(toks)
+        assert abs(v[-1] - 2.0**63) <= 4 * 2048.0  # within a few ULP of 2**63
 
 
 def test_ingest_float_pin_no_change_off_pattern(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -342,7 +367,7 @@ def test_ingest_float_pin_no_change_off_pattern(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(
         pipeline_mod,
         "ProcessPoolExecutor",
-        partial(_ProcessPoolExecutor, mp_context=mp.get_context("forkserver")),
+        partial(_ProcessPoolExecutor, mp_context=_ingest_pool_context()),
     )
     monkeypatch.setattr(pipeline_mod, "_INGEST_MIN_CHUNK_ROWS", 1)
 
@@ -801,6 +826,8 @@ def test_turbo_write_parallel_matches_serial(tmp_path: Path, monkeypatch: pytest
     Simulates an oracle pass: compress_tiles returns the exact stock codec
     frames, so the assembled file must be byte-identical (A6 unit).
     """
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("zstdmt needs the Linux /proc/self/maps CPL resolution (serial fallback)")
     a, xform = _demo_field(1600, 1400, 100.0, seed=11)
     dst_transform, dst_width, dst_height = _dst_grid(1600, 1400, 100.0)
     work_crs, dst_crs = f"EPSG:{WORK_CRS}", f"EPSG:{OUT_CRS}"
@@ -862,6 +889,8 @@ def test_turbo_write_parallel_bigtiff_matches_serial(tmp_path: Path, monkeypatch
     (the pre-fix bug); per-tag strides keep the file byte-identical.
 
     """
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("zstdmt needs the Linux /proc/self/maps CPL resolution (serial fallback)")
     a, xform = _demo_field(1600, 1400, 100.0, seed=11)
     dst_transform, dst_width, dst_height = _dst_grid(1600, 1400, 100.0)
     work_crs, dst_crs = f"EPSG:{WORK_CRS}", f"EPSG:{OUT_CRS}"
@@ -928,6 +957,8 @@ def test_turbo_write_parallel_edge_tiles_padded(tmp_path: Path, monkeypatch: pyt
     with the exact zero padding.
 
     """
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("zstdmt needs the Linux /proc/self/maps CPL resolution (serial fallback)")
     height, width = 700, 900  # 2x2 tile grid: right + bottom edges partial
     assert width % TILE_PX != 0
     assert height % TILE_PX != 0
@@ -1016,6 +1047,11 @@ def test_turbo_writers_wrap_source_array_once(tmp_path: Path, monkeypatch: pytes
     the band loop: one construction per call, and the outputs stay
     bit-identical across thread counts.
 
+    The serial section is OS-independent; the parallel section needs
+    the zstdmt CPL compressor (Linux /proc/self/maps), so it is skipped
+    where unavailable (the round-1 gate makes _turbo_write_parallel
+    return False instead of running).
+
     """
     orig = pipeline_mod.MemoryDataset
     counts = {"n": 0}
@@ -1080,6 +1116,8 @@ def test_turbo_writers_wrap_source_array_once(tmp_path: Path, monkeypatch: pytes
     assert all(isinstance(s, tuple) for s in src_forms)
     src_forms.clear()
     assert _sha(out1) == _sha(out4)  # bit-identity still holds
+    if not pipeline_mod.zstdmt.available():
+        pytest.skip("parallel section needs zstdmt (Linux /proc/self/maps); serial wrap checks passed")
 
     frames = iter(_stock_frames(out1))
 

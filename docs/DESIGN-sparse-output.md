@@ -436,7 +436,7 @@ PYTHONPATH=$PWD /home/monky/projects/ppgrid/.venv/bin/python bench/sparse_bench.
    `--compare <before>/f100m/value.tif <before>/f100m/support_km.tif` (and 200 m).
 3. Acceptance gates:
    - 100 m auto: `t_total ≤ 400 s` (≥ 17 % faster than 479.6),
-     `peak_rss_mb ≤ 16000`, compare `pass=true` for both bands.
+     `peak_rss_mib ≤ 16000`, compare `pass=true` for both bands.
    - 100 m cap 2: `t_total ≤ 280 s`, compare `pass=true`.
    - 500 m: `t_total ≤ 50 s` (no regression on the shared path).
    - `uv run pytest` green (53 tests) — byte-identity tests regenerated only if
@@ -501,7 +501,7 @@ results alive).
   follow-up ticket.
 
 **Acceptance (low-RAM):** on `data/au_gcc_sparse.csv`, 100 m, `out_crs=3857`:
-- `peak_rss_mb` AFTER <= BEFORE (the current 8.8 GB) — MUST NOT increase.
+- `peak_rss_mib` AFTER <= BEFORE (the current 8.8 GB) — MUST NOT increase.
 - C(ii): reproject time drops when tiles are skippable (cap-2 km case: 17/399
   skippable); unchanged at auto cap (0 skippable).
 - banded descent: wall time drops (parallel), bit-identical output (harness

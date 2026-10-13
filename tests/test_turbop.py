@@ -419,6 +419,30 @@ def test_detect_cap_auto() -> None:
     assert "unlimited" in source
 
 
+def test_detect_cap_unknown_physical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-Linux (no /proc/meminfo): physical unknown, plan conservatively.
+
+    A finite cgroup bound is the only visible ceiling, so it plans exactly
+    as on Linux; with no finite bound the cap is the floor (never an
+    unbounded figure), and the source says so.
+    """
+    monkeypatch.setattr(turbop, "_read_physical_gb", lambda: None)
+    # finite cgroup: cgroup - headroom, floored (same as the Linux path).
+    cap, source = detect_cap_gb(physical_gb=None, cgroup_gb=24.0)
+    assert cap == 16.0
+    assert "physical RAM unknown" in source
+    assert "cgroup 24.0 GB" in source
+    # small cgroup: floor applies and is named.
+    cap, source = detect_cap_gb(physical_gb=None, cgroup_gb=6.0)
+    assert cap == 8.0
+    assert "floored to 8 GB" in source
+    # no finite bound: the conservative floor, named.
+    cap, source = detect_cap_gb(physical_gb=None, cgroup_gb=math.inf)
+    assert cap == 8.0
+    assert "cgroup unlimited" in source
+    assert "conservative floor 8 GB" in source
+
+
 def test_resolve_cap_clamp_and_floor() -> None:
     """Preset >= available clamps to available - 8; sub-floor presets hit 8."""
     cap, source = resolve_cap(32.0, physical_gb=64.0)
@@ -574,11 +598,26 @@ def test_cgroup_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert _read_cgroup_max_gb() == pytest.approx(16.0, abs=1e-6)
 
 
-def test_physical_reader(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_read_physical_gb parses MemTotal kB from /proc/meminfo."""
-    monkeypatch.setattr(turbop, "MEMINFO_PATH", "/dev/null")
-    with pytest.raises(ValueError, match="MemTotal"):
-        _read_physical_gb()
+def test_physical_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_read_physical_gb parses MemTotal kB; unknown (non-Linux) -> None."""
+    f = tmp_path / "meminfo"
+    f.write_text("MemTotal:       100000000 kB\nMemFree:         1000 kB\n")
+    monkeypatch.setattr(turbop, "MEMINFO_PATH", str(f))
+    assert _read_physical_gb() == pytest.approx(102.4, abs=1e-6)
+    # No MemTotal line -> unknown (None), not an error.
+    empty = tmp_path / "empty"
+    empty.write_text("MemFree:         1000 kB\n")
+    monkeypatch.setattr(turbop, "MEMINFO_PATH", str(empty))
+
+    def _raise(*_a: object, **_k: object) -> None:
+        msg = "sysctl stubbed"  # real macOS runners have a working sysctl
+        raise OSError(msg)
+
+    monkeypatch.setattr(turbop.subprocess, "run", _raise)
+    assert _read_physical_gb() is None
+    # File missing (non-Linux, no /proc) -> unknown (None), not an error.
+    monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "nope"))
+    assert _read_physical_gb() is None
 
 
 # ---------------------------------------------------------------------------

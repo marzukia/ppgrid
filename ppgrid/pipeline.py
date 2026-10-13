@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import errno
+import importlib
 import io
 import json
 import logging
@@ -20,6 +21,7 @@ import subprocess  # ruff: ignore[suspicious-subprocess-import] — git rev-pars
 import sys
 import threading
 import time
+import traceback
 import warnings
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -27,20 +29,10 @@ from dataclasses import asdict, dataclass
 from functools import partial
 from itertools import starmap
 from pathlib import Path
-from typing import Any, NoReturn, Self
+from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 import numpy as np
 import pandas as pd
-import rasterio
-from pyproj import Transformer
-from pyproj.exceptions import CRSError
-from rasterio._io import MemoryDataset
-from rasterio.crs import CRS
-from rasterio.errors import CRSError as RasterioCRSError
-from rasterio.errors import NotGeoreferencedWarning, RasterioIOError
-from rasterio.transform import Affine, from_bounds, from_origin
-from rasterio.warp import Resampling, reproject
-from rasterio.windows import Window
 
 from . import __version__, _prof, turbop, zstdmt
 from ._tempfiles import _open_fresh_memmap
@@ -67,14 +59,132 @@ from .pullpush import (
     pull_push,
 )
 
+# --- lazy native imports (PEP 562) ------------------------------------------
+# rasterio (GDAL C extension) and pyproj (PROJ) cost tens of ms of import
+# time together and are only needed once the pipeline does geospatial work
+# (point projection, warping, raster I/O). `import ppgrid` and `ppgrid
+# --help` must not pay for them, so the names below resolve on first
+# attribute access and are then cached in the module namespace. The public
+# surface is unchanged: `from ppgrid.pipeline import reproject` and
+# `monkeypatch.setattr(ppgrid.pipeline, "reproject", ...)` keep working, a
+# patched attribute lives in the module dict, which shadows __getattr__ (it
+# only fires on a lookup miss).
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "Affine": ("rasterio.transform", "Affine"),
+    "CRS": ("rasterio.crs", "CRS"),
+    "CRSError": ("pyproj.exceptions", "CRSError"),
+    "MemoryDataset": ("rasterio._io", "MemoryDataset"),
+    "NotGeoreferencedWarning": ("rasterio.errors", "NotGeoreferencedWarning"),
+    "RasterioCRSError": ("rasterio.errors", "CRSError"),
+    "RasterioIOError": ("rasterio.errors", "RasterioIOError"),
+    "Resampling": ("rasterio.warp", "Resampling"),
+    "Transformer": ("pyproj", "Transformer"),
+    "Window": ("rasterio.windows", "Window"),
+    "from_bounds": ("rasterio.transform", "from_bounds"),
+    "from_origin": ("rasterio.transform", "from_origin"),
+    "reproject": ("rasterio.warp", "reproject"),
+    "rasterio": ("rasterio", ""),
+}
+
+if TYPE_CHECKING:  # static bindings only; _load_native() provides the runtime values
+    import rasterio
+    from pyproj import Transformer
+    from pyproj.exceptions import CRSError
+    from rasterio._io import MemoryDataset
+    from rasterio.crs import CRS
+    from rasterio.errors import CRSError as RasterioCRSError
+    from rasterio.errors import NotGeoreferencedWarning, RasterioIOError
+    from rasterio.transform import Affine, from_bounds, from_origin
+    from rasterio.warp import Resampling, reproject
+    from rasterio.windows import Window
+
+
+def _load_native() -> None:
+    """Import rasterio + pyproj and publish all lazy names in the module dict.
+
+    CPython's LOAD_GLOBAL does not consult a module __getattr__, so function
+    bodies can only see these names once they are in the module dict. This
+    runs the one-time import (sys.modules-cached afterwards) and populates
+    the dict. Idempotent; names already present (e.g. monkeypatched) are
+    left alone. Call it at every entry point that can run the functions
+    below directly (CLI, Pipeline methods, reproject helpers).
+
+    """
+    if not all(name in globals() for name in _LAZY_IMPORTS):
+        for name, (module_name, attr) in _LAZY_IMPORTS.items():
+            if name in globals():
+                continue
+            module = importlib.import_module(module_name)
+            globals()[name] = module if not attr else getattr(module, attr)
+    # _CLI_MAPPED_EXCEPTIONS references lazy names, so it is built here, not
+    # at import time (module-level, but unevaluable before the native stack
+    # is published).
+    if not globals().get("_CLI_MAPPED_EXCEPTIONS"):
+        globals()["_CLI_MAPPED_EXCEPTIONS"] = (
+            CRSError,
+            RasterioCRSError,
+            ImportError,
+            FileNotFoundError,
+            pd.errors.ParserError,
+            RasterioIOError,
+            IndexError,
+            OverflowError,
+            ZeroDivisionError,
+            RuntimeError,
+            KeyError,
+            ValueError,
+            OSError,
+            SystemExit,
+        )
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a lazily imported rasterio/pyproj name (see _LAZY_IMPORTS).
+
+    Raises:
+        AttributeError: If name is not a lazy import.
+
+    """
+    if name in _LAZY_IMPORTS:
+        _load_native()
+        val = globals().get(name)
+        if val is not None:
+            return val
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg) from None
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_IMPORTS))
+
+
 # rasterio's MemoryDataset.__init__ (used by reproject for ndarray buffers)
 # always warns NotGeoreferencedWarning on the initial transform read of the
 # MEM::: dataset, then sets the real transform immediately after. It normally
 # hides the warning in a nested warnings.catch_warnings, but CPython warning
 # filters are process-global, not thread-safe: with concurrent warps (S3.3)
 # another thread can restore a stale filter snapshot and leak the benign
-# warning. It carries no information here, so ignore the category.
-warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+# warning. It carries no information here, so ignore the category. The filter
+# is installed lazily in _ensure_warp_ready (first warp, before the pool
+# starts) because the category lives in the heavy rasterio package.
+_WARP_READY: dict[str, bool] = {}
+
+
+def _ensure_warp_ready() -> None:
+    """Load the native stack and install the NotGeoreferencedWarning filter.
+
+    Call at the top of every function that warps, before its thread pool
+    starts: _load_native makes the module globals visible to the warp
+    functions, and the process-global filter (installed once per process)
+    then covers every warp thread.
+
+    """
+    _load_native()
+    if _WARP_READY.get("filter"):
+        return
+    warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+    _WARP_READY["filter"] = True
+
 
 # Module logger (pattern shared with turbop.py). The CLI configures the
 # `ppgrid` logger (level + compact stderr format) in main(); library users
@@ -371,13 +481,22 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
     )
 
 
+# O_NOFOLLOW and ELOOP are POSIX-only (Windows has no symlinks): getattr
+# defaults keep the same code path total on every platform (PR #97, OS matrix).
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_STAGING_RETRY_ERRNOS: tuple[int, ...] = (errno.EEXIST, getattr(errno, "ELOOP", errno.EEXIST))
+
+
 def _staging_fd(path: Path) -> int:
     """Create `path` as a fresh 0600 regular file and return an open write fd.
 
     Symlinks are replaced, never followed (issues #15, #77): the path is
     unlinked, then recreated with O_CREAT | O_EXCL | O_NOFOLLOW — a symlink
     (or any file) planted in that window makes os.open fail (ELOOP / EEXIST)
-    instead of being followed, and one retry resolves it.
+    instead of being followed, and one retry resolves it. O_NOFOLLOW and
+    ELOOP are POSIX-only; on Windows (no symlinks) the _O_NOFOLLOW /
+    _STAGING_RETRY_ERRNOS getattr defaults degrade them to no-ops without
+    changing the Linux open/retry semantics (PR #97).
 
     Args:
         path: Staging path in the output dir.
@@ -390,15 +509,16 @@ def _staging_fd(path: Path) -> int:
             after one retry.
 
     """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
     path.unlink(missing_ok=True)
     try:
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        return os.open(path, flags, 0o600)
     except OSError as e:
-        if e.errno not in (errno.EEXIST, errno.ELOOP):
+        if e.errno not in _STAGING_RETRY_ERRNOS:
             raise
         # Planted in the unlink->open window: replace it once, try again.
         path.unlink(missing_ok=True)
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        return os.open(path, flags, 0o600)
 
 
 def _open_tiff_staging(path: Path, **profile: Any) -> rasterio.DatasetBase:
@@ -781,6 +901,7 @@ def _warp_dst_tile(
         Tuple of (tile column origin i0, warped int16 tile buffer).
 
     """
+    _ensure_warp_ready()
     band_w = min(warp_tile, dst_width - i0)
     with rasterio.open(src_path) as src:
         w = Window(i0, j0, band_w, band_h)
@@ -844,6 +965,7 @@ def _warp_dst_tile_arr(
         (i0, buf) - buf shape (band_h, band_w).
 
     """
+    _ensure_warp_ready()
     band_w = min(warp_tile, dst_width - i0)
     w = Window(i0, j0, band_w, band_h)
     w_bounds = rasterio.windows.bounds(w, dst_transform)
@@ -902,6 +1024,7 @@ def _reproject_core(
         n_threads: Warp threads. 1 = fully serial (A8 path).
 
     """
+    _ensure_warp_ready()
     dst_profile = dict(
         profile,
         width=dst_width,
@@ -1029,6 +1152,7 @@ def _reproject_band(
     no tile is skippable (or task_info is None) the output is identical to
     the unskipped path.
     """
+    _load_native()
     with rasterio.open(src_path) as src:
         skip = task_info is not None
         if skip:
@@ -1136,6 +1260,8 @@ def _reproject_band_array(
         n_threads: Warp threads. 1 = fully serial (A8 path).
 
     """
+    _load_native()
+
     # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
     # pass 3, ported to the serial array reproject - audit #78 P1-3):
     # reproject's ndarray source form copies the whole band into a fresh
@@ -1289,7 +1415,17 @@ def _turbo_write_parallel(
         >= 4 GiB assembled file).
 
     """
+    _ensure_warp_ready()
     warp_tile = 2048
+    # The parallel ZSTD writer resolves the GDAL CPL zstd function pointer
+    # from /proc/self/maps (Linux only). Where it is unavailable (macOS,
+    # Windows, or a GDAL build without the CPL zstd compressor) this writer
+    # cannot run: return False so the caller falls back to the stock-codec
+    # path instead of a ZstdmtError. The production dispatch already gates
+    # on _turbo_zstd_ok() (== zstdmt.available()), so this only makes the
+    # direct call total; Linux behaviour is unchanged (available() is True).
+    if not zstdmt.available():
+        return False
     # Wrap the source array in a MEM dataset ONCE, no copy (issue #39
     # pass 3, ported to the zstd writer - audit #78 P1-3): reproject's
     # ndarray source form copies the whole band into a fresh MEM dataset
@@ -1510,6 +1646,7 @@ def _turbo_write_stock_parallel(
         the serial array reproject (layout guards).
 
     """
+    _ensure_warp_ready()
     warp_tile = 2048
     # 1. Reference raster: stock GDAL head + exact tag layout. The head
     # (IFD + tag arrays) is sized from the raster dimensions at creation,
@@ -1812,6 +1949,7 @@ class Pipeline:
             ValueError: If seed is not >= 0.
 
         """
+        _load_native()
         self.input_path = input_path
         self.value_col = value_col
         self.lng_col = lng_col
@@ -1917,7 +2055,10 @@ class Pipeline:
         self.tasks: list[tuple[int, int]]
         self.empty_blocks: list[tuple[int, int]]
         self.pts_path: Path
-        self.cfg: _WorkerConfig
+        # None until grid() builds the worker config: run()'s finally
+        # cleanup must not raise AttributeError when grid() failed first
+        # (review rev-os2 M1: the mask hid the original ValueError).
+        self.cfg: _WorkerConfig | None = None
         self._cal: dict[str, Any] | None
 
     @property
@@ -2284,6 +2425,14 @@ class Pipeline:
             pts[PTS_Y] = self.y[order]
             pts[PTS_TV] = self.tv[order]
             pts.flush()
+            # Drop the reference now, not at frame end: the write phase
+            # re-opens the file (mmap read). On Windows the OS handle
+            # stays open while the mmap object is alive, and a frame
+            # pinned by an in-flight traceback would keep _points.npy
+            # locked past _remove_run_temps (WinError 32, CI run
+            # 38207801346 W1). numpy 2.4+ has no memmap.close() API;
+            # CPython refcounting releases the handle.
+            pts = None
 
         # Task list (one pass: blocks whose 3x3 neighbourhood holds points
         # are computed, the rest are written as nodata)
@@ -2654,10 +2803,45 @@ class Pipeline:
         except Exception:  # ruff: ignore[blind-except, try-except-pass] — logging must never fail a successful run
             pass
 
-    def _remove_run_temps(self) -> None:
-        """Remove every run temp file in out_dir (idempotent, best effort)."""
+    def _remove_run_temps(self, keep: tuple[str, ...] = ()) -> None:
+        """Remove every run temp file in out_dir (idempotent, best effort).
+
+        `keep` names files that the caller still holds open (the turbo DN
+        fields are live memmaps through the write phase; the final cleanup
+        from run()'s finally removes them once the run ends).
+
+        The main process's own memmaps are released first: on Windows an
+        mmap holds an OS file handle until close(), and unlinking a held
+        file raises WinError 32, which would mask the real run error and
+        break the CLI exit codes (CI run 38207801346 W1). The unlink
+        errors themselves are never swallowed.
+
+        """
+        self._release_run_fields()
+        out = Path(self.out_dir)
         for fname in _RUN_TEMP_FILES:
-            (Path(self.out_dir) / fname).unlink(missing_ok=True)
+            if fname in keep:
+                continue
+            (out / fname).unlink(missing_ok=True)
+
+    def _release_run_fields(self) -> None:
+        """Drop the main-process references held on cfg (idempotent).
+
+        Worker-pool handles are per-process and die with the workers; only
+        the main process's fields can still be open at cleanup time. The
+        fields are plain ndarrays in the in-RAM regime and memmaps in the
+        memmap regime; dropping the last reference releases the OS handle
+        (numpy 2.4+ has no memmap.close() API; CPython refcounting).
+
+        cfg is None when grid() raised before building it (halo > bsize
+        etc.); the finally cleanup must release what exists, not raise
+        AttributeError on the absent config (review rev-os2 M1).
+
+        """
+        if self.cfg is None:
+            return
+        for field in ("pts", "val_full", "sup_full", "near_full"):
+            setattr(self.cfg, field, None)
 
     def _resolve_turbo_cap(self) -> tuple[float, str]:
         """Resolve the turbo RAM cap with the cgroup-aware preset clamp (M-2).
@@ -2730,11 +2914,13 @@ class Pipeline:
         plan = turbop.plan(cap_gb, n_cells, self.nx_padded, radius)
         # The process's actual memory ceiling (audit #78 P1-2): the 8 GB
         # cap floor can plan a budget above it on a small cgroup slice;
-        # precheck names the OOM risk instead of staying green.
-        available_gb = min(
-            turbop._read_physical_gb(),  # ruff: ignore[private-member-access]
-            turbop._read_cgroup_max_gb(),  # ruff: ignore[private-member-access]
-        )
+        # precheck names the OOM risk instead of staying green. Only finite,
+        # known bounds count; with none (non-Linux: no /proc/meminfo, cgroup
+        # unlimited) available_gb is None and precheck skips the ceiling note.
+        physical_gb = turbop._read_physical_gb()  # ruff: ignore[private-member-access]
+        cgroup_gb = turbop._read_cgroup_max_gb()  # ruff: ignore[private-member-access]
+        finite = [g for g in (physical_gb, cgroup_gb) if g is not None and math.isfinite(g)]
+        available_gb = min(finite) if finite else None
         decision = turbop.precheck(
             plan,
             strict=self.turbo_strict,
@@ -2916,6 +3102,13 @@ class Pipeline:
             else:
                 with _prof.phase("shared.boxcount"):
                     near_full = box_count(c0, cap_cells) > 0
+
+        # pts is fully consumed above (ix/iy copies + the binned TV row).
+        # Drop the reference here, not at frame end: on Windows the OS
+        # handle stays open while the mmap object is alive, and a frame
+        # pinned by an in-flight traceback would keep _points.npy locked
+        # past _remove_run_temps (WinError 32, CI run 38207801346 W1).
+        pts = None
 
         with _prof.phase("shared.pyramid"):
             sums: list[np.ndarray] = [s0]
@@ -3238,6 +3431,7 @@ class Pipeline:
         identical profile - frames byte-equal to the serial flush by
         construction on any stack (_turbo_write_stock_parallel).
         """
+        _load_native()  # mid-run failure path references _CLI_MAPPED_EXCEPTIONS
         budget = self._turbo_budget_bytes
         if budget is not None and self.nx * self.ny * 4 > budget // 2:
             self._write_rasters_serial(vprof, sprof, vpath, spath, vtags, stags)
@@ -3299,8 +3493,11 @@ class Pipeline:
                     cfg.val_full = cfg.sup_full = cfg.near_full = None
             # Same position as before the restructure: the DN fields are
             # still open memmaps (the inode outlives the unlink), but the
-            # tmpfs space is freed while the write phase runs.
-            self._remove_run_temps()
+            # tmpfs space is freed while the write phase runs. The two DN
+            # files stay out of this mid-removal: on Windows an unlink of a
+            # held mmap is WinError 32; this method's finally releases the
+            # local holders, then the final cleanup removes the files.
+            self._remove_run_temps(keep=("_val_dn.npy", "_sup_dn.npy"))
 
             # Both bands share the same work-CRS source grid (identical
             # bounds/size), so the output grid is identical too: compute the
@@ -3395,13 +3592,31 @@ class Pipeline:
             self._published.add(vpath.name)
             ftmp_s.replace(spath)
             self._published.add(spath.name)
-        except BaseException:
+        except BaseException as exc:
             # Mid-run failure (worker error, OOM, disk full): the finals were
             # not reached (os.replace is last). Warn so nobody consumes an
             # earlier run's files as this run's output (issues #15, #40).
             partial = True
+            # Copy the full stack to stderr for exceptions the CLI does not
+            # map to a clean 'error: <msg>' (unmapped -> exit 1 + raw
+            # traceback): the tb is dropped below because it pins the
+            # writer frames, whose args still reference the DN memmaps
+            # (Windows: a held mmap keeps the OS file handle and the
+            # finally's unlink raises WinError 32, CI run 38215575734 C1).
+            # Without the print, the displayed stack for unmapped errors is
+            # flattened (review rev-os2 M2). Mapped exceptions (#16: clean
+            # error line, no stack) are untouched. Exception type/message
+            # are unchanged, so the CLI exit-code mapping is unaffected.
+            if not isinstance(exc, _CLI_MAPPED_EXCEPTIONS):
+                traceback.print_exception(exc, file=sys.stderr)
+            exc.__traceback__ = None
             raise
         finally:
+            # Release the local DN memmap holders before the final unlink
+            # (same WinError 32 on Windows): `val_dn` / `sup_dn` would
+            # otherwise live to the function end, and `arr` is the warp-loop
+            # variable still bound to the last band's field.
+            val_dn = sup_dn = arr = None
             self._remove_run_temps()
             for p in out_dir.glob("_stock_scratch_*.tif"):
                 p.unlink(missing_ok=True)
@@ -3576,6 +3791,18 @@ def _make_pipeline(args: argparse.Namespace, *, dry_run: bool) -> Pipeline:
     )
 
 
+# Exception types the CLI maps to a clean named exit (see
+# _map_pipeline_errors below): reported as an 'error: <msg>' line + exit
+# code, no stack trace (#16). Shared with _write_rasters_turbo's failure
+# path, which must know which exceptions already get clean reporting (so
+# no full stack is pre-printed before the traceback is released). SystemExit
+# is included too: pass-through control flow (e.g. --turbo-strict exit 3),
+# not a failure warranting a stack.
+# _CLI_MAPPED_EXCEPTIONS: populated by _load_native() (it references lazy
+# names, so it cannot be built at import time); empty until first native use.
+_CLI_MAPPED_EXCEPTIONS: tuple[type[BaseException], ...] = ()
+
+
 def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
     """Run a pipeline phase, mapping exceptions to the CLI exit-code contract.
 
@@ -3594,6 +3821,7 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         SystemExit: 1 (pipeline/IO) or 2 (validation, unknown EPSG).
 
     """
+    _load_native()  # the except clauses below reference CRSError (pyproj)
     try:
         return fn()
     except (CRSError, RasterioCRSError) as e:

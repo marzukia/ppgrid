@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 import rasterio
 from rasterio.transform import Affine
 
+from ppgrid._platform import is_canonical_platform
 from ppgrid.calibrate import PercentileTransform
 from ppgrid.pipeline import NODATA, WORK_CRS, Pipeline, _check_default_transform
 
@@ -92,6 +94,55 @@ def test_halo_exceeds_block_error(tmp_path: Path) -> None:
     p.calibrate()
     with pytest.raises(ValueError, match=r"halo.*exceeds block size"):
         p.grid()
+
+
+def test_halo_exceeds_block_run_survives_finally(tmp_path: Path) -> None:
+    """Halo > bsize via run(): the original ValueError survives the finally.
+
+    run()'s finally calls _remove_run_temps() -> _release_run_fields(),
+    which touches self.cfg — only assigned at the end of grid(). When
+    grid() raises the halo check, cfg must be None (initialised in
+    __init__), not absent: the pre-fix AttributeError in the finally
+    masked the original ValueError and the CLI mapped it to exit 1
+    instead of 2 (review rev-os2 M1).
+    """
+    csv = tmp_path / "data.csv"
+    csv.write_text("value,longitude,latitude\n1.0,0.0,0.0\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # same halo/bsize setup as test_halo_exceeds_block_error
+    p = Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(out_dir),
+        cap_km=1.0,
+        block_size=3,
+        skip_calibration=True,
+    )
+    with pytest.raises(ValueError, match=r"halo.*exceeds block size"):
+        p.run()
+    assert not (out_dir / "_points.npy").exists()
+
+
+def test_cli_halo_exceeds_block_exit_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#16/M1: halo > bsize via CLI is a clean validation error, exit 2."""
+    csv = tmp_path / "data.csv"
+    csv.write_text("value,longitude,latitude\n1.0,0.0,0.0\n")
+    code, err = _run_cli(
+        capsys,
+        str(csv),
+        "-o",
+        str(tmp_path / "out"),
+        "--cap-km",
+        "1",
+        "--block",
+        "3",
+        "--skip-calibration",
+    )
+    assert code == 2, f"expected exit 2 (validation), got {code}: {err!r}"
+    _assert_clean_error(code, err, "exceeds block size")
 
 
 def test_percentile_step_validation(tmp_path: Path) -> None:
@@ -660,7 +711,13 @@ def test_midrun_worker_failure_cleans_temps_and_warns(
     # Issue #40 (d): a mid-write crash no longer leaves truncated finals.
     assert not (out / "value.tif").exists()
     assert not (out / "support_km.tif").exists()
-    assert observed.get("mode") == 0o600, f"temp was {oct(observed.get('mode'))}, expected 0600"
+    if os.name == "posix":
+        assert observed.get("mode") == 0o600, f"temp was {oct(observed.get('mode'))}, expected 0600"
+    else:
+        # Windows ignores the os.open() mode bits (observed 0o666, CI run
+        # 38215575734 C4); the 0600 guarantee is a POSIX property. The probe
+        # itself must have run (the temp existed while the worker held it).
+        assert "mode" in observed, "mode probe never ran (temp absent when worker fired)"
 
 
 def test_preplanted_symlink_not_followed(tmp_path: Path) -> None:
@@ -810,17 +867,103 @@ def test_cli_calibration_missing_file_clean_error(tmp_path: Path, capsys: pytest
 ANCHOR = Path(__file__).parent / "fixtures" / "auto_anchor"
 
 
+def _assert_transform_equivalent(t_a: Affine, t_b: Affine, name: str) -> None:
+    """Per-coefficient transform compare with a measured cross-OS drift bound.
+
+    The bound is the worst measured cross-OS drift plus margin, not a
+    last-ulp bound: cross-OS PROJ/warp builds drift the transform
+    coefficients by 1 ULP on macOS arm64 (538.1210527474219 vs
+    538.121052747422, CI run 38205315707) and by thousands of ULP on
+    windows-3.11 (origin coef f, 1.13e-3 m at ~1.1e6 m, rel ~1e-9, CI run
+    38218917436); an exact transform assert is unachievable across PROJ
+    builds. abs_tol=1e-7 (0.1 um) covers the windows x64 pixel-size drift
+    (3.9e-8 m, CI run 38215575734 C2) with ~2.5x headroom while staying
+    far below physical meaning at pixel scale (hundreds of metres per
+    pixel). rel_tol=1e-8 bounds the measured windows-3.11 origin drift
+    with 10x margin — still ~1e-6 of a 538 m pixel.
+
+    """
+    for coef, (x, y) in zip("abcdef", zip(t_a[:6], t_b[:6], strict=True), strict=True):
+        assert math.isclose(x, y, rel_tol=1e-8, abs_tol=1e-7), f"{name} transform {coef} differs: {x!r} != {y!r}"
+
+
+def _assert_rasters_equivalent(out_path: Path, ref_path: Path) -> None:
+    """Non-canonical raster gate: same grid/metadata, near-identical pixels.
+
+    Cross-OS tile bytes differ (vendored GDAL/zstd encoder), so compare the
+    decoded arrays with a tight tolerance instead of raw bytes: width, height,
+    count, dtype, CRS and nodata must match exactly, the transform must match
+    within the measured cross-OS drift bound (cross-OS PROJ/warp builds
+    compute the grid transform up to thousands of ULP apart — exact transform
+    match is unachievable across PROJ builds), and the DN values may differ
+    only in a vanishing fraction of cells by a vanishing amount (cross-OS
+    encoder/FP drift from the platform PROJ/warp build).
+
+    """
+    with rasterio.open(out_path) as a, rasterio.open(ref_path) as b:
+        assert a.width == b.width
+        assert a.height == b.height
+        assert a.count == b.count
+        assert a.dtypes == b.dtypes, f"{out_path.name} dtype differs"
+        assert a.crs == b.crs, f"{out_path.name} CRS differs"
+        _assert_transform_equivalent(a.transform, b.transform, out_path.name)
+        assert a.nodata == b.nodata, f"{out_path.name} nodata differs"
+        da = a.read(1)
+        db = b.read(1)
+    assert da.shape == db.shape
+    diff = da != db
+    n_diff = int(diff.sum())
+    n_cells = da.size
+    max_diff = int(np.abs(da.astype(np.int32) - db.astype(np.int32)).max()) if n_diff else 0
+    # Tight functional tolerance: a real regression moves many cells or moves
+    # them far; cross-OS encoder/FP drift moves almost none by almost nothing.
+    assert n_diff / n_cells <= 0.005, f"{out_path.name}: {n_diff}/{n_cells} cells differ from anchor (>0.5%)"
+    assert max_diff <= 4, f"{out_path.name}: max DN delta {max_diff} > 4"
+
+
+def _assert_json_equivalent(a: Any, b: Any, path: str = "") -> None:
+    """Recursive JSON compare: exact for str/int keys+values, numeric tol for floats."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        assert set(a) == set(b), f"{path or '<root>'}: keys differ {set(a) ^ set(b)}"
+        for k in a:
+            _assert_json_equivalent(a[k], b[k], f"{path}.{k}")
+        return
+    if isinstance(a, list) and isinstance(b, list):
+        assert len(a) == len(b), f"{path}: list length {len(a)} != {len(b)}"
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):
+            _assert_json_equivalent(x, y, f"{path}[{i}]")
+        return
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not (isinstance(a, bool) or isinstance(b, bool)):
+        assert math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9), f"{path}: {a!r} != {b!r} beyond numeric tolerance"
+        return
+    assert a == b, f"{path}: {a!r} != {b!r}"
+
+
 def test_auto_path_byte_identical_to_af13522_anchor(tmp_path: Path) -> None:
     """#23: the auto (non-forced) path must stay byte-identical to af13522.
 
     The cal file write moved after transform resolution; its content must not
     have changed. Anchor was generated with the af13522 code.
+
+    On the canonical platform (x86_64 Linux, where the anchor was cut) the
+    comparison is byte-exact. On other platforms the vendored PROJ/GDAL/zstd
+    wheels emit different (functionally equivalent) tile bytes, so the rasters
+    are compared as decoded arrays + exact metadata and the calibration as
+    structured values (see the platform predicate in ppgrid._platform).
     """
     out = tmp_path / "out"
     p = Pipeline(str(ANCHOR / "input.csv"), "val", "lon", "lat", str(out), res=500.0, workers=1)
     p.run()
-    for name in ("value.tif", "support_km.tif", "calibration.json"):
-        assert (out / name).read_bytes() == (ANCHOR / name).read_bytes(), f"{name} differs from af13522 anchor"
+    if is_canonical_platform():
+        for name in ("value.tif", "support_km.tif", "calibration.json"):
+            assert (out / name).read_bytes() == (ANCHOR / name).read_bytes(), f"{name} differs from af13522 anchor"
+        return
+    for name in ("value.tif", "support_km.tif"):
+        _assert_rasters_equivalent(out / name, ANCHOR / name)
+    _assert_json_equivalent(
+        json.loads((out / "calibration.json").read_text(encoding="utf-8")),
+        json.loads((ANCHOR / "calibration.json").read_text(encoding="utf-8")),
+    )
 
 
 def _skewed_csv(path: Path, n: int = 500) -> Path:

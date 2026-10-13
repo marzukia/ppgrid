@@ -7,14 +7,38 @@ on:
     branches: [main]
 
 jobs:
-  # PRs: full interpreter sweep on GitHub-hosted runners, pinned versions
+  # PRs: full interpreter x OS sweep on GitHub-hosted runners, pinned versions
   # (requires-python >=3.11, classifiers 3.11-3.14; review m6).
+  #
+  # OS matrix (2026-10-12): explicit Linux/macOS pathways. Windows was
+  # EXCLUDED from the matrix 2026-10-12 (operator decision: Unix-only support
+  # scope for now) after the portability fixes landed — the CDLL/O_NOFOLLOW/
+  # memmap-release fixes stay in the tree as the re-enable base (a windows-
+  # latest leg passed everything but one anchor test: melb10 DN data drift
+  # on the 3.11 pyproj wheel, 772 max DN delta on cap-boundary cells).
+  # - ubuntu-latest  (x86_64, 4 vCPU, 16 GB) — primary; C interp JIT via cc/gcc.
+  # - macos-latest   (arm64, ~16 GB) — C interp JIT via clang; proves the
+  #   cross-OS C-build bytes in the anchor gate below.
+  # All 34 unique packages (36 lock entries) have wheels for cp311-cp314
+  # x every platform above (verified against uv.lock 2026-10-12), so
+  # `uv sync --all-extras --locked` never needs a source build.
+  #
+  # Anchor gate: every leg re-runs the CI-safe configs (melb10 + melb500,
+  # 2.4 GB peak RSS measured) and fails when outputs drift from the
+  # committed examples/ anchors — byte-exact on canonical x86_64 Linux,
+  # functional-equivalence (grid/metadata + decoded pixels) on the other
+  # legs. Cross-OS writer drift (GDAL/zstd/libtiff build deltas) is a leg
+  # failure, not a warning. equakes-scale anchors
+  # (8.1-8.4 GB peak) stay out of the CI anchor scope (Linux/hydrogen-
+  # verified via compare_tier2.py); melb10+melb500 are the conservative
+  # CI-safe choice.
   test:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +49,8 @@ jobs:
       - run: uv run --extra dev ruff check .
       - run: uv run --extra dev ruff format --check .
       - run: uv run pytest
+      - name: Anchor gate (byte-exact on canonical x86_64 Linux; functional-equivalence elsewhere)
+        run: uv run python bench/check_anchors.py
 
   # Pushes to main: GitHub-hosted, single leg (review m6: matrix is PR-only).
   # 2026-10-08: was runs-on 'nf' — that label points at the
@@ -32,6 +58,8 @@ jobs:
   # named 'nf' is registered on the marzukia account, so the first main
   # push (#39 merge) queued 9.5h starved. Wire real self-hosted runners
   # to this account before switching back.
+  # Anchor gate added 2026-10-12: melb10+melb500 fit the 16 GB runner
+  # (2.4 GB peak RSS, measured on hydrogen).
   test-main:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -46,3 +74,5 @@ jobs:
       - run: uv run --extra dev ruff check .
       - run: uv run --extra dev ruff format --check .
       - run: uv run pytest
+      - name: Anchor gate (outputs must be byte-identical to committed examples)
+        run: uv run python bench/check_anchors.py
