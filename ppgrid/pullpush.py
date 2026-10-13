@@ -639,6 +639,7 @@ def _pull_push_descent(
     band_rows: int = 512,
     out_val: np.ndarray | None = None,
     out_sup: np.ndarray | None = None,
+    progress: Callable[[int], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Descend a prebuilt pull-push pyramid (coarsest -> finest).
 
@@ -669,6 +670,9 @@ def _pull_push_descent(
             output fields with tmpfs, whose pages reclaim as clean file
             cache instead of anon swap I/O under external pressure.
         out_sup: Same as out_val, for the support field.
+        progress: Optional callback invoked once per descended level with
+            that level's cell count (issue #101 progress; thread-safe in
+            _pull_push_descent's call context, which is serial per level).
 
     Returns:
         Tuple of interpolated value grid and support grid in metres, at
@@ -688,6 +692,7 @@ def _pull_push_descent(
     # parent multiplied by zero (0*NaN = NaN) cannot corrupt them.
     threaded = n_threads > 1 and upsample in (upsample_nearest, upsample_bilinear)
     for k in range(levels - 1, stop_level - 1, -1):
+        cells_k = sums[k].shape[0] * sums[k].shape[1]
         if threaded:
             n0 = sums[k].shape[0]
             n1 = sums[k].shape[1]
@@ -758,6 +763,8 @@ def _pull_push_descent(
         if free_levels:
             sums[k + 1] = None
             counts[k + 1] = None
+        if progress is not None:
+            progress(int(cells_k))
 
     return val, sup
 
@@ -798,6 +805,7 @@ def _descent_banded(
     band_rows: int = 1024,
     n_threads: int = 1,
     nworkers: int | None = None,
+    progress: Callable[[int], None] | None = None,
 ) -> None:
     """Compute the descent from level start_level down to level 0, row-banded.
 
@@ -861,6 +869,8 @@ def _descent_banded(
             if avail is not None and avail < need:
                 nw = 1
         _thread_bands(bands, _band, nw)
+        if progress is not None:
+            progress(int(n0 * sums[k].shape[1]))
         if k > 0:
             val, sup = out, outs
 
