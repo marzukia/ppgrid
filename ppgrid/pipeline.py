@@ -4086,14 +4086,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="GB",
         help="Turbo mode: parallel phases + RAM-budgeted shared cap (S3.3). "
-        "Optional RAM cap preset 16|32|64|128; bare --turbo = auto-detect.",
+        "Optional RAM cap preset 16|32|64|128 (GB, decimal 1e9 bytes); bare --turbo = auto-detect. "
+        "Presets are common sizes; use --max-ram GB for any value.",
     )
     parser.add_argument(
         "--max-ram",
         type=_pos_float,
         default=None,
         metavar="GB",
-        help="Explicit RAM cap in GB (overrides the --turbo preset). Implies --turbo.",
+        help="Explicit RAM cap in GB (decimal, 1e9 bytes; overrides the --turbo preset). Implies --turbo.",
     )
     parser.add_argument("--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram.")
     parser.add_argument(
@@ -4160,7 +4161,10 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         if val <= 0:
             parser.error(f"{flag} must be a positive EPSG code")
     if args.turbo is not None and args.turbo not in ("auto", "16", "32", "64", "128"):
-        parser.error(f"--turbo preset must be auto|16|32|64|128: {args.turbo}")
+        parser.error(
+            f"--turbo preset must be auto|16|32|64|128: {args.turbo} "
+            "(presets are common sizes; use --max-ram GB for any value)"
+        )
     if args.max_ram is None:
         args.max_ram = args.ram_gb
     if args.ram_gb is not None and args.max_ram != args.ram_gb:
