@@ -26,8 +26,10 @@ Mode resolution (documented in the ``--color`` help):
 - unicode symbols = stream encoding is UTF-8; anything else falls back to
   ASCII (``|/-/\\`` spinner, ``-``/``#`` bar).
 
-Plain (non-live) output with color off is byte-identical to the pre-#101
-logging output: no escape sequences.
+Plain (non-live) output is the unified logging surface: every event
+(phase lines, notes, warnings, errors) is one ``L ppgrid.pipeline: msg``
+line (D-7), with semantic SGR on WARNING/ERROR only when color is on.
+Without color there are no escape sequences.
 
 ``rich`` is imported at module top: it is an unconditional runtime
 dependency (pyproject), so there is no lazy-import cost to save.
@@ -39,14 +41,18 @@ import contextlib
 import logging
 import os
 import sys
+import textwrap
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any
 
-from rich.console import Console
+from rich import box
+from rich.console import Console, RenderableType
+from rich.panel import Panel
 from rich.progress import BarColumn, Progress, ProgressColumn, Task, TextColumn
+from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.table import Column
 from rich.text import Text
@@ -72,6 +78,15 @@ _SGR_OK = "32"
 _SGR_WARN = "33"
 _SGR_ERROR = "31"
 _SGR_RESET = "0"
+
+# Display markers (D-7): the state word is a presentation concern owned by
+# this layer. Call sites carry the message only; live output re-adds the
+# marker here, plain output carries it as the logging level letter
+# (I/W/E) instead. Library mode (no UI) re-adds the legacy raw marker in
+# pipeline._ui_note to stay byte-identical.
+_LIVE_MARKERS = {"ok": "ok: ", "warn": "[warn] ", "error": "error: ", "note": ""}
+_LIVE_STYLES = {"ok": "green", "warn": "yellow", "error": "red"}
+_PLAIN_SGR = {"ok": _SGR_OK, "warn": _SGR_WARN, "error": _SGR_ERROR}
 
 
 def _is_tty(stream: Any) -> bool:
@@ -276,6 +291,32 @@ def _summary_lines(title: str, rows: list[tuple[str, str] | str]) -> list[str]:
     return out
 
 
+def _wrap_live_lines(lines: list[str], inner_width: int) -> list[str]:
+    r"""Wrap overlong hug-width panel content lines (fix-round F3/F4).
+
+    A hug-width panel/box clips a content line wider than the console.
+    Lines longer than ``inner_width`` (console width minus border +
+    padding) break there with a 4-space hanging continuation (the D-6
+    live-wrap style), so the full text survives and the panel hugs the
+    wrapped width. Short lines pass through untouched: at the approved-
+    frame widths (110/150) zero lines wrap, so those layouts are
+    byte-identical to the no-wrap render.
+
+    ``break_on_hyphens=False``: the overlong lines are output paths / kv
+    values, opaque tokens — break only on the hard width, never at a
+    hyphen, so a path like ``/tmp/pr118-review/...`` does not fragment
+    at its first hyphen.
+    """
+    out: list[str] = []
+    for line in lines:
+        if inner_width > 0 and len(line) > inner_width:
+            wrapped = textwrap.fill(line, width=inner_width, subsequent_indent="    ", break_on_hyphens=False)
+            out.extend(wrapped.split("\n"))
+        else:
+            out.append(line)
+    return out
+
+
 class _SpinnerColumn(ProgressColumn):
     r"""Spinner that stays blank until the task has run for ``min_s``.
 
@@ -357,9 +398,14 @@ class _BarColumn(BarColumn):
         if bar <= 0:
             return Text("")
         style = "red" if task.fields.get("failed") else "green"
+        # D-4: the unfinished track (and the indeterminate pulse tail) is
+        # DIM, not the terminal default color: an unstyled track rendered
+        # brighter than the green fill and read as inverted. No-color
+        # consoles drop the dim entirely (rich then leaves the track as
+        # spaces, as before).
         return BarColumn(
             bar_width=bar,
-            style="none",
+            style="dim",
             complete_style=style,
             finished_style=style,
             pulse_style=style,
@@ -440,13 +486,14 @@ class _UIStreamHandler(logging.Handler):
     ``UI._end_run``). Phase INFO lines the progress table already renders
     are dropped here so they do not double-print; every other record
     (DEBUG perf lines under --verbose, WARNING, ERROR) is emitted as a
-    semantic-color line above the table.
+    semantic-color line above the table (D-7 re-adds the ``[warn]`` /
+    ``error:`` display markers in ``UI._emit``; the record message itself
+    carries no logging prefix).
     """
 
     def __init__(self, ui: UI) -> None:
         super().__init__()
         self._ui = ui
-        self._formatter = logging.Formatter(_LOG_FORMAT)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -459,9 +506,82 @@ class _UIStreamHandler(logging.Handler):
                 kind = "warn"
             else:
                 kind = "note"
-            self._ui._emit(kind, self._formatter.format(record))
+            self._ui._emit(kind, msg)
         except Exception:  # ruff: ignore[blind-except] - logging must never raise
             self.handleError(record)
+
+
+class _RuleProgress(Progress):
+    """Progress with a thin dim Rule rendered directly above the tasks table.
+
+    Concept X1: live notes print into the live region, and the divider
+    (titled ``ppgrid``) sits immediately above the table. rich's Progress
+    feeds its Live a ``get_renderable`` built from ``get_renderables()``,
+    so the divider must come from that iterator — an instance-level
+    ``live.update(...)`` would be ignored.
+    """
+
+    def __init__(self, *columns: Any, rule: Rule | None = None, **kwargs: Any) -> None:
+        # Set before super().__init__: Live renders once at construction,
+        # which already calls get_renderables().
+        self._rule = rule
+        super().__init__(*columns, **kwargs)
+
+    def get_renderables(self) -> Iterable[RenderableType]:
+        if self._rule is not None:
+            yield self._rule
+        try:
+            yield from super().get_renderables()
+        except RuntimeError:
+            # Auto-refresh tick raced a phase start (main thread inserted
+            # into the tasks dict mid-iteration). Skip the table for this
+            # tick; the next refresh (100 ms) renders it. Without this
+            # guard the exception would kill the refresh thread (D-3).
+            return
+
+
+class _PlainLogFormatter(logging.Formatter):
+    """The unified plain-mode line format: ``L ppgrid.name: msg`` (D-7).
+
+    WARNING and ERROR records carry semantic SGR (yellow/red) when color
+    is on; everything else is unstyled. No other colors are emitted.
+    """
+
+    def __init__(self, *, color: bool) -> None:
+        super().__init__(_LOG_FORMAT)
+        self._color = color
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if not self._color:
+            return text
+        if record.levelno >= logging.ERROR:
+            code = _SGR_ERROR
+        elif record.levelno >= logging.WARNING:
+            code = _SGR_WARN
+        else:
+            return text
+        return f"\x1b[{code}m{text}\x1b[{_SGR_RESET}m"
+
+
+def plain_log_formatter(*, color: bool) -> logging.Formatter:
+    """Build the unified plain-mode formatter (D-7) for the CLI handler."""
+    return _PlainLogFormatter(color=color)
+
+
+def _has_ppgrid_handler() -> bool:
+    """Check for an installed CLI run handler.
+
+    True when a CLI run installed its ppgrid stderr handler (or the live
+    UI handler). Plain-mode events then go through the unified logging
+    format; without one (library mode) they keep the legacy direct-print
+    surface.
+
+    """
+    return any(
+        getattr(h, "ppgrid_handler", False) or isinstance(h, _UIStreamHandler)
+        for h in logging.getLogger("ppgrid").handlers
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +664,7 @@ class UI:
         self._last_refresh = 0.0
         self._quiet = quiet
         self._console: Console | None = None
+        self._stdout_console: Console | None = None
         self._progress: Progress | None = None
         self._log_handler: _UIStreamHandler | None = None
         self._saved_handlers: list[logging.Handler] = []
@@ -568,7 +689,33 @@ class UI:
                     return []
                 return [t for t in self._progress.tasks if t.visible]
 
-            self._progress = Progress(
+            # Concept X1: one thin dim divider, titled `ppgrid`, directly
+            # above the tasks table. `dim` (rule and title) only when color
+            # is on: a no-color console drops it, and the point is "dimmer
+            # than the green fill", not a specific gray. This rich has no
+            # Rule(title_style=...): a Text title carries the style.
+            rule = Rule(
+                Text("ppgrid", style="dim") if color else "ppgrid",
+                characters="─" if unicode else "-",
+                style="dim" if color else None,
+            )
+            # stdout console for live-only stdout artifacts (the --plan
+            # box, X2); the stderr console keeps the run surface. `width`
+            # is pinned exactly like the stderr console (tests, and
+            # terminals that report no size) so the box's wrap width and
+            # the run surface stay in lockstep.
+            self._stdout_console = Console(
+                file=sys.stdout,
+                no_color=not color,
+                force_terminal=True,
+                highlight=False,
+                soft_wrap=False,
+                emoji=False,
+                width=width,
+            )
+            # D-3: rich's own refresh loop (10 fps) so the spinner and bar
+            # animate between the pipeline's throttled manual refreshes.
+            self._progress = _RuleProgress(
                 _SpinnerColumn(unicode=unicode, min_s=spinner_min_s),
                 TextColumn("{task.description}"),
                 _CountColumn(width_fn=_layout_width, tasks_fn=_visible_tasks),
@@ -576,8 +723,10 @@ class UI:
                 _PercentColumn(),
                 _ElapsedColumn(),
                 _RateColumn(width_fn=_layout_width, tasks_fn=_visible_tasks),
+                rule=rule,
                 console=self._console,
-                auto_refresh=False,
+                auto_refresh=True,
+                refresh_per_second=10,
                 redirect_stdout=False,
                 redirect_stderr=False,
             )
@@ -764,7 +913,7 @@ class UI:
         self._emit("note", text)
 
     def ok(self, text: str) -> None:
-        """Success line (green in colored output; the text says it too)."""
+        """Success line (green; shown with an ``ok: `` prefix in live mode — D-8)."""
         self._emit("ok", text)
 
     def warn(self, text: str) -> None:
@@ -787,6 +936,13 @@ class UI:
         80 columns, so it never wraps or truncates at 80/120. The title is
         the success marker (green when colored); the values are neutral.
 
+        Live mode (concept X3): the block goes into a rounded panel titled
+        ``summary`` (default foreground, per the owner-approved mock frame
+        — the green success marker stays on the ``ok:`` line above); the
+        rows keep their plain-text form. Overlong lines (typically output
+        paths on a narrow console) wrap inside the panel with a 4-space
+        hang at the inner width (fix-round F3), so nothing clips.
+
         Args:
             title: The block header (e.g. ``run summary``).
             rows: ``(label, value)`` pairs and/or bare path strings, in order.
@@ -794,11 +950,16 @@ class UI:
         """
         lines = _summary_lines(title, rows)
         if self._live and self._console is not None:
-            for i, text in enumerate(lines):
-                t = Text(text)
-                if i == 0 and self._color:
-                    t.stylize("green")
-                self._console.print(t, soft_wrap=True)  # paths must not wrap
+            # Inner width = console width minus border (2) + padding (2);
+            # the hug-width panel would otherwise clip the widest line.
+            inner = self._console.size.width - 4
+            panel = Panel(
+                Text("\n".join(_wrap_live_lines(lines[1:], inner)), no_wrap=True),
+                title="summary",
+                box=box.ROUNDED if self._unicode else box.ASCII,
+                expand=False,
+            )
+            self._console.print(panel)
             self._refresh()
             return
         for i, text in enumerate(lines):
@@ -807,16 +968,68 @@ class UI:
             else:
                 print(text, file=self._stream)
 
+    def print_plan(self, header: str, kv: list[str]) -> None:
+        r"""Emit the ``--plan`` printout on stdout (issue #53).
+
+        Plain: ``header + '\n' + kv`` exactly as the pre-#102 ``print``
+        (byte-identical). Live (concept X2): the header stays a plain
+        line; the key/value block goes into a square box (dim border when
+        color is on), hug-width, with the kv lines' own indent kept
+        (padding (0, 0)). Overlong kv lines wrap at the box inner width
+        with a 4-space hanging continuation (fix-round F4), so nothing
+        clips. The env report and progress rows around it are
+        unaffected (stderr, unboxed).
+
+        """
+        if self._live and self._stdout_console is not None:
+            print(header, file=sys.stdout)  # ruff: ignore[print]
+            # Inner width = console width minus the border (2); padding
+            # is (0, 0), so the box hugs the wrapped kv lines.
+            inner = self._stdout_console.size.width - 2
+            panel = Panel(
+                Text("\n".join(_wrap_live_lines(kv, inner)), no_wrap=True),
+                box=box.SQUARE if self._unicode else box.ASCII,
+                border_style="dim" if self._color else "",
+                padding=(0, 0),
+                expand=False,
+            )
+            self._stdout_console.print(panel)
+            return
+        print(header + "\n" + "\n".join(kv), file=sys.stdout)  # ruff: ignore[print]
+
     def _emit(self, kind: str, text: str) -> None:
+        """Emit one status line in the active mode (D-7).
+
+        Live: the semantic marker (``ok: `` / ``[warn] `` / ``error: ``)
+        is re-added here — call sites carry the message only once — and a
+        line longer than the terminal wraps with a hanging indent (D-6).
+        Plain with an installed ppgrid handler: one
+        ``L ppgrid.pipeline: msg`` record (WARNING/ERROR carry semantic
+        SGR when color is on). Plain without one (library mode): legacy
+        direct print, byte-identical.
+        """
         if self._live and self._console is not None:
-            style = {"ok": "green", "warn": "yellow", "error": "red"}.get(kind)
-            t = Text(text)
+            shown = _LIVE_MARKERS[kind] + text
+            width = self._console.width
+            if len(shown) > width:
+                shown = textwrap.fill(shown, width=width, subsequent_indent="    ")
+            t = Text(shown)
+            style = _LIVE_STYLES.get(kind)
             if style and self._color:
                 t.stylize(style)
-            self._console.print(t)
+            self._console.print(t, soft_wrap=True)
             self._refresh()
             return
-        code = {"ok": _SGR_OK, "warn": _SGR_WARN, "error": _SGR_ERROR}.get(kind) if self._color else None
+        if _has_ppgrid_handler():
+            pipe_log = logging.getLogger("ppgrid.pipeline")
+            if kind == "error":
+                pipe_log.error("%s", text)
+            elif kind == "warn":
+                pipe_log.warning("%s", text)
+            else:
+                pipe_log.info("%s", text)
+            return
+        code = _PLAIN_SGR.get(kind) if self._color else None
         if code:
             print(f"\x1b[{code}m{text}\x1b[{_SGR_RESET}m", file=self._stream)
         else:

@@ -412,17 +412,36 @@ _CTX: dict[str, Any] = {}
 # module-level `global` statement (ruff PLW0603).
 _CURRENT_UI: dict[str, _ui.UI | None] = {"ui": None}
 
+# Library-mode markers (D-7): without an active UI the line goes to stderr
+# exactly as the pre-#102 raw prints emitted it, so the library surface
+# stays byte-identical. With a UI, the marker is a display concern owned by
+# the UI layer (live markers / logging level letter) and the messages
+# below carry no state word.
+# Most warn sites embedded ``[warn] `` and most error sites ``error: ``; two
+# families carried a different legacy prefix (the stale-output sites embed
+# ``warning: ``; the strict precheck line keeps its ``error: `` marker
+# inside the message from turbop), so they pass an explicit ``legacy``
+# override instead of relying on the per-kind table.
+_LEGACY_MARKERS = {"error": "error: ", "warn": "[warn] ", "ok": "ok: ", "note": ""}
 
-def _ui_note(kind: str, text: str) -> None:
+
+def _ui_note(kind: str, text: str, legacy: str | None = None) -> None:
     """Emit a CLI stderr line via the presentation layer (issue #101).
 
-    kind: ``note`` | ``ok`` | ``warn`` | ``error``. Without an active UI
-    (library mode, or a print that fires before ``main`` builds one) the
-    text goes to stderr as-is.
+    kind: ``note`` | ``ok`` | ``warn`` | ``error``. ``text`` carries the
+    message only (D-7): the state word is re-added at display time — live
+    shows ``ok: `` / ``[warn] `` / ``error: `` prefixes, plain shows the
+    level letter of the unified ``L ppgrid.pipeline: msg`` line, and
+    library mode (no active UI) re-adds the legacy raw marker and prints
+    as-is. ``legacy`` overrides the library-mode marker for sites whose
+    pre-#102 raw print carried a different prefix (``"warning: "`` for the
+    stale-output family, ``""`` for the strict precheck line); display
+    modes never see it.
     """
     ui = _CURRENT_UI["ui"]
     if ui is None:
-        print(text, file=sys.stderr)  # ruff: ignore[print]
+        marker = _LEGACY_MARKERS.get(kind, "") if legacy is None else legacy
+        print(marker + text, file=sys.stderr)  # ruff: ignore[print]
         return
     if kind == "ok":
         ui.ok(text)
@@ -432,6 +451,18 @@ def _ui_note(kind: str, text: str) -> None:
         ui.error(text)
     else:
         ui.note(text)
+
+
+def _ui_note_precheck(message: str) -> None:
+    """Emit one turbo precheck decision message (D-7).
+
+    The non-strict families carry an embedded ``[warn] `` prefix (stripped
+    here, re-added at display time); the strict line keeps its embedded
+    ``error: `` marker, so the library-mode re-append is empty for that
+    family (fix-round F2: ``[warn] error: ...`` was a double marker).
+    """
+    legacy = "" if message.startswith("error: ") else None
+    _ui_note("warn", message.removeprefix("[warn] "), legacy=legacy)
 
 
 def _ru_maxrss_gb() -> float | None:
@@ -552,13 +583,15 @@ def _die(msg: str) -> NoReturn:
     """Print a clean CLI error (no traceback) and exit 1.
 
     Args:
-        msg: Error message, printed as 'error: <msg>'.
+        msg: Error message, routed to the UI layer as an error (D-7):
+            live shows ``error: <msg>``, plain ``E ppgrid.pipeline: <msg>``,
+            library ``error: <msg>``.
 
     Raises:
         SystemExit: Always, with status code 1.
 
     """
-    _ui_note("error", f"error: {msg}")
+    _ui_note("error", msg)
     raise SystemExit(1)
 
 
@@ -623,8 +656,9 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
         return
     _ui_note(
         "warn",
-        f"warning: this run failed before writing outputs; {', '.join(existing)} in {out} "
+        f"this run failed before writing outputs; {', '.join(existing)} in {out} "
         "are from an earlier run and were left untouched",
+        legacy="warning: ",  # pre-#102 raw print embedded 'warning: ' (F1 family)
     )
 
 
@@ -1689,11 +1723,11 @@ def _turbo_write_parallel(
     try:
         info = _tif_parse_ifd(data)
     except ValueError as e:
-        _ui_note("warn", f"[warn] turbo zstd head parse: {e}; serial write")
+        _ui_note("warn", f"turbo zstd head parse: {e}; serial write")
         return False
     t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
     if n_tiles != len(tiles):
-        _ui_note("warn", f"[warn] turbo zstd head: tile count {n_tiles} != {len(tiles)}; serial write")
+        _ui_note("warn", f"turbo zstd head: tile count {n_tiles} != {len(tiles)}; serial write")
         return False
     # All external value arrays must end before the first stored tile, so
     # the head cut keeps every array and drops every reference tile.
@@ -1701,10 +1735,10 @@ def _turbo_write_parallel(
     for typ, count, voff in info["tags"].values():
         total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
-            _ui_note("warn", "[warn] turbo zstd head: value array overlaps tiles; serial write")
+            _ui_note("warn", "turbo zstd head: value array overlaps tiles; serial write")
             return False
     if not info["big"] and head_end + sum(len(t) for t in tiles) > _TIFF_CLASSIC_MAX_BYTES:
-        _ui_note("warn", "[warn] turbo zstd head: assembled file beyond classic 4 GiB; serial write")
+        _ui_note("warn", "turbo zstd head: assembled file beyond classic 4 GiB; serial write")
         return False
 
     head = bytearray(data[:head_end])
@@ -1858,19 +1892,19 @@ def _turbo_write_stock_parallel(
     try:
         info = _tif_parse_ifd(data)
     except ValueError as e:
-        _ui_note("warn", f"[warn] turbo stock head parse: {e}; serial write")
+        _ui_note("warn", f"turbo stock head parse: {e}; serial write")
         return False
     t324, t325, n_tiles = info["t324"], info["t325"], info["n_tiles"]
     head_end = info["first"]
     for typ, count, voff in info["tags"].values():
         total = zstdmt.TIFF_TYPE_SIZES[typ] * count
         if total > info["inline"] and voff + total > info["first"]:
-            _ui_note("warn", "[warn] turbo stock head: value array overlaps tiles; serial write")
+            _ui_note("warn", "turbo stock head: value array overlaps tiles; serial write")
             return False
     # Compressed frames are never longer than the raw band, so raw size is
     # a sound classic-4GiB upper bound.
     if not info["big"] and head_end + arr.nbytes > _TIFF_CLASSIC_MAX_BYTES:
-        _ui_note("warn", "[warn] turbo stock head: assembled file may exceed classic 4 GiB; serial write")
+        _ui_note("warn", "turbo stock head: assembled file may exceed classic 4 GiB; serial write")
         return False
 
     # 2. Warp blocks in parallel; each block compresses through its thread's
@@ -1953,7 +1987,7 @@ def _turbo_write_stock_parallel(
         for bc, cl in col_map:
             tiles.append(block_frames[br * n_bcols + bc][tl * tcols_by_bc[bc] + cl])
     if len(tiles) != n_tiles:
-        _ui_note("warn", f"[warn] turbo stock: tile count {len(tiles)} != {n_tiles}; serial write")
+        _ui_note("warn", f"turbo stock: tile count {len(tiles)} != {n_tiles}; serial write")
         return False
 
     # 3. Patch the head and assemble: head + frames in raster-scan order.
@@ -2198,12 +2232,9 @@ class Pipeline:
         # the summary's fallbacks line names.
         self._zstd_gate_reason: str | None = None
         # Presentation (issue #101): the active phase handle for the current
-        # _phase() scope (None in library mode or outside a phase) and the
-        # shared-descent cell count measured in _prepare_shared (so the
-        # interpolate phase can budget its bar before the block loop).
+        # _phase() scope (None in library mode or outside a phase).
         self.ui = ui
         self._active_phase: _ui.Phase | None = None
-        self._shared_descent_cells = 0
         # Set by run() on success: machine-readable summary for --json (#55).
         self._summary: dict[str, Any] | None = None
 
@@ -3269,14 +3300,14 @@ class Pipeline:
             # --plan: the plan printout carries the decision; only a hard
             # failure (--turbo-strict infeasible) says its piece on stderr.
             if decision.exit_code == 3 and decision.message:
-                _ui_note("warn", decision.message)
+                _ui_note_precheck(decision.message)
         else:
             # stdout stays clean (the --json/--help contract): the summary
             # goes through the run logger (stderr, INFO; -q suppresses it,
             # like every other progress line) (#77).
             log.info("%s", decision.summary)
             if decision.message:
-                _ui_note("warn", decision.message)
+                _ui_note_precheck(decision.message)
         if decision.exit_code == 3:
             raise SystemExit(3)
 
@@ -3303,7 +3334,7 @@ class Pipeline:
             # failure must mean "stock parallel write", never a crash.
             if not zstdmt.available():
                 self._zstd_gate_reason = "CPL zstd unavailable"
-                _ui_note("warn", "[warn] turbo zstd oracle: CPL zstd unavailable; stock parallel write")
+                _ui_note("warn", "turbo zstd oracle: CPL zstd unavailable; stock parallel write")
                 return False
             with rasterio.open(
                 probe,
@@ -3328,10 +3359,10 @@ class Pipeline:
             if verdict.ok:
                 return True
             self._zstd_gate_reason = "oracle mismatch"
-            _ui_note("warn", f"[warn] {verdict.detail}")
+            _ui_note("warn", f"{verdict.detail}")
         except Exception as e:  # ruff: ignore[blind-except] - any probe failure means the stock parallel writer runs
             self._zstd_gate_reason = "oracle probe error"
-            _ui_note("warn", f"[warn] turbo zstd oracle: {e}; stock parallel write")
+            _ui_note("warn", f"turbo zstd oracle: {e}; stock parallel write")
         finally:
             probe.unlink(missing_ok=True)
         return False
@@ -3378,11 +3409,6 @@ class Pipeline:
         step = self.step
         bsize = self.bsize
         halo = self.halo
-        # Descent work estimate for the progress bar (issue #101): pyramid
-        # build (~1x) + descent levels (geometric, ~1.33x) of the padded
-        # grid. A round 2.5x bound keeps the bar honest (it can finish
-        # under 100%, never invented over it).
-        self._shared_descent_cells = int(self.nx_padded * self.ny_padded * 2.5)
         for bx in range(self.nbx):
             for by in range(self.nby):
                 i0, j0, i1, j1 = _block_bounds(bx, by, bsize, self.nx, self.ny)
@@ -3652,17 +3678,32 @@ class Pipeline:
                     cfg.pct = PercentileTransform(cfg.pct_quantiles)
                     _CTX["cfg"] = cfg
                     # Progress (issue #101): the interpolate bar budgets the
-                    # shared descent (measured in _prepare_shared) plus every
-                    # task block, and advances as each block is written.
+                    # shared descent plus every task block, and advances as
+                    # each block is written.
                     task_cells: list[int] = []
                     for bx, by in self.tasks:
                         w = _block_window(bx, by, self.cfg)
                         task_cells.append(w.width * w.height)
                     with self._phase("interpolate", unit="cells") as iph:
+                        # D-1: the shared-descent total is MEASURED, not
+                        # estimated. The descent advances its own cell
+                        # counts (pyramid proxy + per-level work); the old
+                        # 2.5x padded-grid estimate overshot, so the bar
+                        # froze under 100% (and was added even on the
+                        # per-block path, where nothing advanced it).
+                        # Accumulate what actually advanced; total = that +
+                        # the task blocks, so the phase ends at exactly
+                        # 100% (no forced finish percent).
+                        desc: list[int] = [0]
+
+                        def _desc_advance(n: int) -> None:
+                            desc[0] += n
+                            iph.advance(n)
+
                         with _WallPhase("descent", self._phase_wall):
-                            if self._prepare_shared(progress=iph.advance):
+                            if self._prepare_shared(progress=_desc_advance):
                                 cfg.shared = True
-                        iph.set_total(sum(task_cells) + self._shared_descent_cells)
+                        iph.set_total(sum(task_cells) + desc[0])
                         with (
                             ThreadPoolExecutor(max_workers=self.workers) as ex,
                             _prof.phase("write.serial"),
@@ -3770,8 +3811,9 @@ class Pipeline:
             if partial:
                 _ui_note(
                     "warn",
-                    f"warning: run failed during write; {vpath}, {spath} were not fully written "
+                    f"run failed during write; {vpath}, {spath} were not fully written "
                     "(any existing files are from an earlier run, left untouched)",
+                    legacy="warning: ",  # pre-#102 raw print embedded 'warning: ' (F1)
                 )
 
     def _write_rasters_turbo(
@@ -3853,10 +3895,18 @@ class Pipeline:
                         w = _block_window(bx, by, self.cfg)
                         task_cells.append(w.width * w.height)
                     with self._phase("interpolate", unit="cells") as iph:
+                        # D-1: measured shared-descent total (see the serial
+                        # block) — the phase ends at exactly 100%.
+                        desc: list[int] = [0]
+
+                        def _desc_advance(n: int) -> None:
+                            desc[0] += n
+                            iph.advance(n)
+
                         with _WallPhase("descent", self._phase_wall):
-                            if self._prepare_shared(progress=iph.advance):
+                            if self._prepare_shared(progress=_desc_advance):
                                 cfg.shared = True
-                        iph.set_total(sum(task_cells) + self._shared_descent_cells)
+                        iph.set_total(sum(task_cells) + desc[0])
                         # The workers write the DN grids straight into the tmpfs
                         # fields (issue #84): the main thread used to do those
                         # copies as results arrived and sat on the critical path
@@ -3952,7 +4002,7 @@ class Pipeline:
                                     progress_refresh=_wrefresh,
                                 )
                             except Exception as e:  # ruff: ignore[blind-except] - layout surprise: fall back
-                                _ui_note("warn", f"[warn] turbo zstd parallel: {e}; stock parallel write")
+                                _ui_note("warn", f"turbo zstd parallel: {e}; stock parallel write")
                             if not wrote:
                                 self._fallbacks.append("zstd parallel write guard -> stock parallel")
                         if not wrote:
@@ -3976,7 +4026,7 @@ class Pipeline:
                                     progress_refresh=_wrefresh,
                                 )
                             except Exception as e:  # ruff: ignore[blind-except] - any surprise: serial
-                                _ui_note("warn", f"[warn] turbo stock parallel: {e}; serial write")
+                                _ui_note("warn", f"turbo stock parallel: {e}; serial write")
                             if not wrote:
                                 self._fallbacks.append("stock parallel write guard -> serial write")
                         if not wrote:
@@ -4041,8 +4091,9 @@ class Pipeline:
             if partial:
                 _ui_note(
                     "warn",
-                    f"warning: run failed during write; {vpath}, {spath} were not fully written "
+                    f"run failed during write; {vpath}, {spath} were not fully written "
                     "(any existing files are from an earlier run, left untouched)",
+                    legacy="warning: ",  # pre-#102 raw print embedded 'warning: ' (F1)
                 )
 
 
@@ -4115,14 +4166,14 @@ def _check_columns(path: str, value_col: str, lng_col: str, lat_col: str) -> Non
         if name in cols:
             continue
         shown = ", ".join(cols[:24]) + (f", ... ({len(cols)} total)" if len(cols) > 24 else "")
-        lines = [
-            f"error: {flag} {name!r} not found in {path}",
-            f"  columns found: {shown}",
-        ]
+        _ui_note("error", f"{flag} {name!r} not found in {path}")
+        # Auxiliary detail lines, not standalone events: raw indented print
+        # right after the unified error line (D-7).
+        detail = [f"  columns found: {shown}"]
         close = difflib.get_close_matches(name, cols, n=3)
         if close:
-            lines.append(f"  did you mean: {', '.join(close)}?")
-        print("\n".join(lines), file=sys.stderr)  # ruff: ignore[print]
+            detail.append(f"  did you mean: {', '.join(close)}?")
+        print("\n".join(detail), file=sys.stderr)  # ruff: ignore[print]
         raise SystemExit(2)
 
 
@@ -4250,7 +4301,7 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         # rasterio's CRSError (--out-crs, a ValueError subclass) both land
         # here — one exit code for all three CRS flags: 2, "bad flag value"
         # per the README exit-code table (#77). The message names the code.
-        print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
+        _ui_note("error", str(e))  # D-7: unified error line, exit 2 for all CRS flags
         raise SystemExit(2) from None
     except ImportError as e:
         # e.g. parquet input without the optional pyarrow extra.
@@ -4271,7 +4322,7 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         # other pipeline failures rather than exit 2 (audit #83).
         _die(f"{type(e).__name__}: {e} (input: {input_path})")
     except (KeyError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)  # ruff: ignore[print] — CLI error output
+        _ui_note("error", str(e))  # D-7: unified error line
         raise SystemExit(2) from None
     except OSError as e:
         # NotADirectoryError, disk full, etc.
@@ -4364,40 +4415,60 @@ def _resolve_log_level(*, verbose: bool, log_level: str | None, quiet: bool = Fa
         val = "debug"
     if val in _LOG_LEVELS:
         return val
-    _ui_note("warn", f"warning: unrecognized LOGGING={raw!r}; using 'info'")
+    # Stash, don't emit: this runs before _configure_logging installs the
+    # unified handler, and the warning must land in the same format as
+    # every other CLI event (D-7).
+    _PENDING_LOG_WARN.append(f"unrecognized LOGGING={raw!r}; using 'info'")
     return "info"
 
 
-def _configure_logging(level_name: str) -> None:
-    """Configure the `ppgrid` logger for one CLI run (stderr, compact format).
+# Unrecognized-LOGGING warnings stashed by _resolve_log_level and emitted by
+# _configure_logging (the unified line needs the handler to exist first).
+_PENDING_LOG_WARN: list[str] = []
+
+
+def _configure_logging(level_name: str, *, color: bool = False) -> None:
+    """Configure the `ppgrid` logger for one CLI run (stderr, unified format).
 
     Only the `ppgrid` logger is touched — never the root logger — so library
     users' logging setup is undisturbed and stdout stays clean for any
-    machine-readable output. Idempotent: repeated main() calls in one
-    process (tests) update the level instead of stacking handlers.
+    machine-readable output. Every CLI event (phase lines, notes, warnings,
+    errors) shares this one handler and the `L ppgrid.pipeline: msg` format
+    (D-7); WARNING/ERROR lines carry semantic SGR when ``color`` is on.
+    Idempotent: repeated main() calls in one process (tests) update the
+    level + formatter + stream instead of stacking handlers.
 
     Args:
         level_name: Resolved level name from _resolve_log_level.
+        color: Emit semantic SGR on WARNING/ERROR (``--color always`` on a
+            non-TTY).
 
     """
     levels = {"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO, "debug": logging.DEBUG}
     root = logging.getLogger("ppgrid")
     root.setLevel(levels[level_name])
-    for handler in root.handlers:
-        if getattr(handler, "ppgrid_handler", False):
-            # Rebind to the current stderr: tests (capsys) and TTY swaps
-            # replace sys.stderr between runs; holding the first run's
-            # stream object sends later records into a closed file
-            # (logging-error spam, #77).
-            if handler.stream is not sys.stderr:  # type: ignore[attr-defined]
-                # Assign directly: setStream() flushes the old stream first,
-                # and that raises on a closed file (capsys test teardown).
-                handler.stream = sys.stderr  # type: ignore[attr-defined]
-            return
-    handler = logging.StreamHandler(stream=sys.stderr)
-    handler.ppgrid_handler = True  # type: ignore[attr-defined]
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-    root.addHandler(handler)
+    handler = None
+    for h in root.handlers:
+        if getattr(h, "ppgrid_handler", False):
+            handler = h
+            break
+    if handler is None:
+        handler = logging.StreamHandler(stream=sys.stderr)
+        handler.ppgrid_handler = True  # type: ignore[attr-defined]
+        root.addHandler(handler)
+    elif handler.stream is not sys.stderr:  # type: ignore[attr-defined]
+        # Rebind to the current stderr: tests (capsys) and TTY swaps
+        # replace sys.stderr between runs; holding the first run's
+        # stream object sends later records into a closed file
+        # (logging-error spam, #77).
+        # Assign directly: setStream() flushes the old stream first,
+        # and that raises on a closed file (capsys test teardown).
+        handler.stream = sys.stderr  # type: ignore[attr-defined]
+    handler.setFormatter(_ui.plain_log_formatter(color=color))
+    if _PENDING_LOG_WARN:
+        for warn in _PENDING_LOG_WARN:
+            _ui_note("warn", warn)
+        _PENDING_LOG_WARN.clear()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -4591,13 +4662,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Path) -> None:
-    """Preflight phase of main(): input check, logging, validation, --plan.
+    """Preflight phase of main(): logging, input check, validation, --plan.
 
-    Runs the whole pre-run sequence: the missing-input error, the `help`
-    pseudo-command, logging setup, all parser.error flag validations, the
-    out-is-a-file check, and the --plan branch (which exits 0). main() wraps
-    the call so every non-zero exit here can warn about stale outputs
-    (issues #40, #77).
+    Runs the whole pre-run sequence: logging setup, the missing-input
+    error, the `help` pseudo-command, all parser.error flag validations,
+    the out-is-a-file check, and the --plan branch (which exits 0). main()
+    wraps the call so every non-zero exit here can warn about stale
+    outputs (issues #40, #77). Logging is configured FIRST so every later
+    event lands in the unified `L ppgrid.pipeline: msg` format (D-7).
 
     Args:
         parser: The argument parser (for print_help / error).
@@ -4608,8 +4680,12 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         SystemExit: 0 (help, plan), 1 (out is a file), 2 (validation).
 
     """
+    _configure_logging(
+        _resolve_log_level(verbose=args.verbose, log_level=args.log_level, quiet=args.quiet),
+        color=_CURRENT_UI["ui"].color if _CURRENT_UI["ui"] is not None else False,
+    )
     if args.input is None:
-        _ui_note("error", "error: missing input file (CSV or Parquet)")
+        _ui_note("error", "missing input file (CSV or Parquet)")
         _ui_note(
             "note",
             "hint: run 'ppgrid help' for usage and examples",
@@ -4619,8 +4695,6 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         # A literal file named "help" wins over the pseudo-command (use --help).
         parser.print_help()
         raise SystemExit(0)
-
-    _configure_logging(_resolve_log_level(verbose=args.verbose, log_level=args.log_level, quiet=args.quiet))
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
@@ -4670,7 +4744,15 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         _check_columns(args.input, args.value_col, args.lng_col, args.lat_col)
         p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=True, ui=_CURRENT_UI["ui"]), args.input)
         _map_pipeline_errors(p.plan, args.input)
-        print(p.plan_text(args))  # ruff: ignore[print]
+        # Concept X2: live mode boxes only the key/value block (the header
+        # line, env report and progress rows stay unboxed); plain mode is
+        # byte-identical to the pre-#102 print.
+        plan_ui = _CURRENT_UI["ui"]
+        if plan_ui is not None:
+            header, _, body = p.plan_text(args).partition("\n")
+            plan_ui.print_plan(header, body.split("\n"))
+        else:
+            print(p.plan_text(args))  # ruff: ignore[print]
         raise SystemExit(0)
 
 
@@ -4742,7 +4824,7 @@ def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Pat
         guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
         existing = [name for name in guarded if (out / name).is_file()]
         if existing:
-            _ui_note("error", f"error: output directory {args.out} already contains: {', '.join(existing)}")
+            _ui_note("error", f"output directory {args.out} already contains: {', '.join(existing)}")
             _ui_note(
                 "note",
                 "hint: pass --force to overwrite them",
