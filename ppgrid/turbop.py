@@ -26,6 +26,8 @@ import contextlib
 import logging
 import math
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -627,12 +629,14 @@ def _read_cgroup_max_gb() -> float:
 
 
 def _read_physical_gb() -> float | None:
-    """Read physical RAM in GB from /proc/meminfo MemTotal (kB).
+    """Read physical RAM in GB.
+
+    Linux: /proc/meminfo MemTotal (kB). macOS: sysctl hw.memsize (bytes).
 
     Returns:
-        Physical RAM in GB, or None when /proc/meminfo is absent or has no
-        MemTotal line (non-Linux: macOS/Windows). Callers treat None as
-        "unknown RAM" and must not gate on a physical-RAM ceiling.
+        Physical RAM in GB, or None when unknown (Windows, or both probes
+        fail). Callers treat None as "unknown RAM" and must not gate on a
+        physical-RAM ceiling.
 
     """
     try:
@@ -641,7 +645,23 @@ def _read_physical_gb() -> float | None:
                 if line.startswith("MemTotal:"):
                     return float(line.split()[1]) * 1024.0 / GB
     except OSError:
-        return None
+        pass
+    if sys.platform == "darwin":
+        # macOS has no /proc/meminfo; hw.memsize (bytes) via sysctl keeps the
+        # preset clamp + precheck ceiling functional (a 128 GB preset on a
+        # 128 GB box must clamp to box - headroom, not plan the whole box).
+        try:
+            out = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=5,
+            )
+            if out.returncode == 0:
+                return float(out.stdout.strip()) / GB
+        except (OSError, ValueError):
+            pass
     return None
 
 
@@ -656,7 +676,7 @@ def detect_cap_gb(physical_gb: float | None = None, cgroup_gb: float | None = No
     not double-count the 0.85 planning factor.
 
     Args:
-        physical_gb: Physical RAM in GB; read from /proc/meminfo if None.
+        physical_gb: Physical RAM in GB; read from the platform probe if None.
         cgroup_gb: cgroup memory.max in GB; read if None (inf = unlimited).
 
     Returns:
