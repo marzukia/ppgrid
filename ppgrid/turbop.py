@@ -763,16 +763,13 @@ def resolve_cap(
     available = min(physical_gb, cgroup_gb) if cgroup_gb is not None else physical_gb
     if preset_gb >= available:
         cap = available - AUTO_HEADROOM_GB
-        if cgroup_gb is not None:
-            cgroup_str = "unlimited" if math.isinf(cgroup_gb) else f"{cgroup_gb:g} GB"
-            source = (
-                f"preset {preset_gb:g} GB >= min(physical {physical_gb:g} GB, cgroup {cgroup_str}); "
-                f"clamped to available {available:g} GB - {AUTO_HEADROOM_GB:g} GB"
-            )
-        else:
-            source = (
-                f"preset {preset_gb:g} GB >= physical {physical_gb:g} GB; clamped to physical - {AUTO_HEADROOM_GB:g} GB"
-            )
+        # The clamp event prints its cause in a pinned format (issue #104):
+        # preset 128 GB >= detected 96.0 GB; using 88.0 GB (96.0 - 8.0 GB headroom)
+        # ("detected" = the process-visible ceiling min(physical, cgroup)).
+        source = (
+            f"preset {preset_gb:g} GB >= detected {available:.1f} GB; "
+            f"using {cap:.1f} GB ({available:.1f} - {AUTO_HEADROOM_GB:.1f} GB headroom)"
+        )
     else:
         cap = preset_gb
         source = f"preset {preset_gb:g} GB"

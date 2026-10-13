@@ -151,6 +151,8 @@ ppgrid help
 
 `--turbo` enables the multithreaded pipeline. The RAM cap `C` (a preset, `--max-ram`, or bare `--turbo` auto-detect) drives a planning budget **`Bt = 0.85 * C - 4 GB`** and a regime, printed by a pre-check after gridding. None of the turbo settings change the output bytes.
 
+**Units and presets.** GB values are decimal (1e9 bytes). Presets `16|32|64|128` are common box sizes; use `--max-ram GB` for any value. A preset at or above the process-visible RAM (`min(physical, cgroup)`) clamps to visible - 8 GB, and the clamp prints its cause, e.g. `preset 128 GB >= detected 96.0 GB; using 88.0 GB (96.0 - 8.0 GB headroom)`.
+
 - **A** — full in-RAM shared fields. Fastest; needs the most RAM.
 - **B** — input in RAM, output bands file-backed with a limited number of descent bands in flight.
 - **C** — shared all-memmap banded descent: input and output bands file-backed (reclaimable memmap), with an 8 GB page-cache floor in its peak accounting.
