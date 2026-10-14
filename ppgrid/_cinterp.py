@@ -27,6 +27,13 @@ interpreter headers. ``_load`` is called once at import time:
 3. Otherwise fall back to ``np.interp`` (the fallback is bit-identical by
    construction: it IS np.interp).
 
+User opt-out (issue #109): set ``PPGRID_CINTERP=0`` in the environment
+BEFORE importing this module to force the ``np.interp`` fallback — no JIT
+build, no C kernel. ``PPGRID_CINTERP=1`` (or the variable unset) keeps the
+default. The backend is resolved once at import; the variable is read at
+that moment only. Both modes are bit-identical, so the switch never
+changes pipeline output bytes.
+
 The GIL is released inside the C loop, so block worker threads
 interpolate in parallel (matching numpy's NPY_BEGIN_THREADS behaviour).
 """
@@ -142,9 +149,16 @@ def _build(src: Path, dst: Path) -> bool:
 
 
 def _load() -> None:
-    """Locate or build the C module exactly once (import-time, main thread)."""
+    """Locate or build the C module exactly once (import-time, main thread).
+
+    PPGRID_CINTERP=0 (documented user opt-out, see module docstring)
+    forces the np.interp fallback before any compiler work happens.
+    """
     global _reason
     if _mod is not None or _reason is not None:
+        return
+    if os.environ.get("PPGRID_CINTERP") == "0":
+        _reason = "PPGRID_CINTERP=0"
         return
     cands = _candidate_paths()
     if not cands:
@@ -229,17 +243,30 @@ def interp(x: np.ndarray, xp: np.ndarray, fp: np.ndarray, slopes: np.ndarray) ->
 
 
 def available() -> bool:
-    """Report whether the C kernel is active (False = np.interp fallback)."""
+    """Report whether the C kernel is active (False = np.interp fallback).
+
+    False when PPGRID_CINTERP=0 was set at import time (the documented
+    user opt-out), or when no working compiler/build existed.
+    """
     return _mod is not None
 
 
 def backend() -> str:
-    """Human-readable backend tag for logs/tests."""
+    """Human-readable backend tag for logs/tests.
+
+    'cinterp (C)' when the kernel is active, else 'np.interp (<reason>)'
+    where <reason> is 'PPGRID_CINTERP=0' for the documented user opt-out
+    or the compiler/build diagnostic.
+    """
     return "cinterp (C)" if _mod is not None else f"np.interp ({_reason or 'disabled'})"
 
 
 def reason() -> str | None:
-    """Why the C kernel is unavailable (None when available)."""
+    """Why the C kernel is unavailable (None when available).
+
+    'PPGRID_CINTERP=0' when the documented user opt-out forced the
+    np.interp fallback; otherwise the compiler/build diagnostic.
+    """
     return _reason
 
 

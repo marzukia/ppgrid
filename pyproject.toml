@@ -91,6 +91,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# ppgrid/__init__.py: the public surface (issue #109) is exposed lazily via
+# PEP 562 __getattr__; the __all__ names are undefined at module scope by
+# design, and the lazy layer is the module's reason to exist.
+"ppgrid/__init__.py" = [
+    "undefined-export",        # F822: __all__ names resolve via __getattr__
+    "non-empty-init-module",   # RUF067: __getattr__/version are the lazy surface
+]
 # ppgrid/turbop.py probes platform RAM via /usr/sbin/sysctl on darwin (fixed
 # argv, no shell); the strict subprocess rules fit build glue, not a probe.
 "ppgrid/turbop.py" = [
@@ -113,9 +120,13 @@ ignore = [
 "ppgrid/ui.py" = [
     "private-member-access",
 ]
-# tests/test_cinterp.py pokes at private state (_mod, _p) on purpose.
+# tests/test_cinterp.py pokes at private state (_mod, _p) on purpose and
+# resolves the PPGRID_CINTERP backend in fresh interpreters (issue #109).
 "tests/test_cinterp.py" = [
     "private-member-access",    # fallback simulation + transform internals
+    "suspicious-subprocess-import",   # S404: own interpreter, fixed argv
+    "subprocess-run-without-check",   # returncode asserted explicitly
+    "subprocess-without-shell-equals-true",   # no shell, fixed argv
 ]
 # tests/test_os_portability.py simulates other OSes: it pokes private state
 # (_MADVISE, _STATE, _read_physical_gb) and runs the venv interpreter directly.
@@ -132,10 +143,17 @@ ignore = [
 ]
 # Lazy native stack (PEP 562): the TYPE_CHECKING blocks declare the names
 # for static analysis; _load_native() binds them at first use (runtime).
-"ppgrid/pipeline.py" = ["TC004"]
+# run()/main() document the exceptions the phases (ingest/grid/turbo
+# precheck) raise; they propagate, not raise in-body (DOC502).
+"ppgrid/pipeline.py" = ["TC004", "DOC502"]
 "ppgrid/zstdmt.py" = ["TC004"]
 # Fresh-interpreter probes: the code strings are our own constants.
 "tests/test_lazy_imports.py" = [
+    "S404",   # suspicious subprocess import
+    "S603",   # subprocess.run([sys.executable, -c, <own constant>])
+]
+# tests/test_public_api.py runs fresh-interpreter guards (issue #109).
+"tests/test_public_api.py" = [
     "S404",   # suspicious subprocess import
     "S603",   # subprocess.run([sys.executable, -c, <own constant>])
 ]
