@@ -15,6 +15,24 @@ You have `N` points with `(longitude, latitude, value)`. You want a raster where
 
 Standard IDW in QGIS or ArcGIS is `O(N*M)` (hours to days at 16M points, depending on the IDW implementation and machine). This tool uses pull-push mipmap interpolation to reduce cost to `O(M)`, independent of N.
 
+## Known limitations
+
+Two behaviours are by design, not bugs. Each carries a one-line workaround.
+
+1. **IDW approximation, not a spatially exact interpolator.** Pull-push
+   evaluates the IDW kernel fast (`O(M)`, independent of point count) and
+   trades a small amount of accuracy for that speed: output is for
+   visualisation, not downstream calculation.
+   *Workaround:* when values feed further computation, run a spatially exact
+   IDW (e.g. `gdal_grid`) on the same points and keep ppgrid for the map.
+2. **`--ram-gb` / `--max-ram` cap the shared-field budget, not process RSS.**
+   Write and descent buffers sit outside the budget, so a budgeted run can
+   peak well above the cap (measured: 39.4 GB RSS under a 20 GB cap). Only
+   the per-box path is genuinely low-RAM (measured 8.5 GB peak).
+   *Workaround:* check the planned path with `--plan` first; a small enough
+   cap lands the run on the per-box path, and `--turbo-strict` fails fast
+   (exit 3) when the budget is infeasible instead of OOMing mid-run.
+
 ## How it works
 
 ### Pull-Push (mipmap) Interpolation
@@ -54,7 +72,7 @@ Before interpolation, the tool can:
 
 ## Install
 
-Requires Python 3.11+ (older interpreters fail the pip resolver with a bare error).
+Requires Python 3.11-3.14 (older interpreters fail the pip resolver with a bare error; see Support below).
 
 ```bash
 pip install ppgrid
@@ -72,6 +90,22 @@ git clone https://github.com/marzukia/ppgrid.git
 cd ppgrid
 uv sync
 ```
+
+## Support
+
+**Python 3.11-3.14.** All four interpreters are tested in CI on every PR;
+outside that range no fixes are targeted.
+
+**Operating systems:**
+
+- **Linux** — supported, CI-covered (ubuntu-latest: full test matrix + anchor gate).
+- **macOS** — supported, CI-covered (macos-latest: full test matrix including
+  `--turbo` + anchor gate, arm64).
+- **Windows** — **unsupported**. Not in the CI matrix; no fixes targeted at it.
+
+The full scope — what "CI-covered" means, per-OS notes, the Windows
+re-enable plan — and the feedback path (issues, discussions, email) live in
+[SUPPORT.md](https://github.com/marzukia/ppgrid/blob/main/SUPPORT.md).
 
 ## Quick Start
 
@@ -139,6 +173,7 @@ ppgrid help
 | `--log-level` | `info` | Progress log level on stderr: `error`, `warning`, `info`, `debug` (env `LOGGING`; `verbose` = debug) |
 | `--max-band-parallel` | (none) | Cap parallel row-band workers for the low-RAM shared descent (default: `--workers`) |
 | `-q, --quiet` | False | Suppress stderr below WARNING (beats `--verbose` / `LOGGING`; an explicit `--log-level` wins) |
+| `--color` | (none) = auto | Color output: `auto` (TTY, no NO_COLOR/TERM=dumb), `always`, `never` (live progress also needs a TTY stderr and no `--quiet`) |
 
 ### Exit codes
 

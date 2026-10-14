@@ -162,6 +162,11 @@ ignore = [
     "FBT001",   # no_unlink mirrors Path.unlink(missing_ok=False)
     "FBT002",
 ]
+# tests/test_readme_flags.py cross-checks the --help text parse against the
+# parser's own action list (issue #100 docs smoke).
+"tests/test_readme_flags.py" = [
+    "private-member-access",    # parser._actions cross-check
+]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
 # tests/fixtures/*.py are runnable fixture generators; prints are the output.
