@@ -10,6 +10,12 @@ a stale table row fails the comparison.
 The argparse meta options (`-h`, `--help`, `--version`) are excluded from the
 table contract: argparse injects them and the table documents the pipeline
 flags plus the `input` positional.
+
+Scope note (accepted, review of #121): the comparison is on the flag SET
+(first table column) only. A row that documents the wrong description for a
+correctly-named flag is out of scope — a description check would need either a
+hand-maintained list of expected texts or fuzzy matching, both of which run
+against the no-hand-maintained-list rule above.
 """
 
 import io
@@ -42,19 +48,29 @@ def _help_text() -> str:
 
 
 def _option_line_tokens(line: str) -> list[str]:
-    """Flag tokens of one help option line: the leading run of dash tokens.
+    """Flag tokens of one help option line: the dash tokens before the help text.
 
-    Stops at the first non-flag token (a metavar like VALUE_COL or the start
-    of the help text), so dash strings inside help text can never leak in.
-    Alias lists (`-o, --out`, `--quiet, -q`) yield every alias.
+    argparse renders the metavar per option string on Python 3.11/3.12
+    (`-o OUT, --out OUT`) but once, shared, on 3.13+ (`-o, --out OUT`). So
+    after a flag token skip AT MOST ONE following non-flag token (that flag's
+    metavar) and keep scanning; break only on TWO consecutive non-flag tokens,
+    which marks the start of the help text. That sees every alias on all four
+    interpreters while keeping dash strings inside help text out.
+    Alias lists (`-o, --out`) yield every alias.
     """
     out: list[str] = []
+    seen_flag = False
+    after_metavar = False
     for tok in line.split():
         clean = tok.rstrip(",")
         if _FLAG_TOKEN.match(clean):
             out.append(clean)
+            seen_flag = True
+            after_metavar = False
+        elif seen_flag and not after_metavar:
+            after_metavar = True  # this flag's metavar; keep scanning
         else:
-            break
+            break  # non-flag before any flag, or two consecutive non-flags
     return out
 
 
