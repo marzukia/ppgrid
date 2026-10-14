@@ -36,7 +36,6 @@ import numpy as np
 import pandas as pd
 
 from . import __version__, _cinterp, _prof, turbop, zstdmt
-from . import ui as _ui
 from ._tempfiles import _open_fresh_memmap
 from .calibrate import (
     M_PER_KM,
@@ -100,6 +99,8 @@ if TYPE_CHECKING:  # static bindings only; _load_native() provides the runtime v
     from rasterio.warp import Resampling, reproject
     from rasterio.windows import Window
 
+    from . import ui as _ui
+
 
 def _load_native() -> None:
     """Import rasterio + pyproj and publish all lazy names in the module dict.
@@ -143,6 +144,10 @@ def _load_native() -> None:
 def __getattr__(name: str) -> Any:
     """Resolve a lazily imported rasterio/pyproj name (see _LAZY_IMPORTS).
 
+    Also serves ``_ui`` (the ui module -> rich): importing it eagerly at
+    module load would pull the terminal-render stack into ``import
+    ppgrid.pipeline`` (issue #109).
+
     Raises:
         AttributeError: If name is not a lazy import.
 
@@ -152,12 +157,16 @@ def __getattr__(name: str) -> Any:
         val = globals().get(name)
         if val is not None:
             return val
+    if name == "_ui":
+        from . import ui as _ui_mod
+
+        return _ui_mod
     msg = f"module {__name__!r} has no attribute {name!r}"
     raise AttributeError(msg) from None
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(_LAZY_IMPORTS))
+    return sorted(set(globals()) | set(_LAZY_IMPORTS) | {"_ui"})
 
 
 # rasterio's MemoryDataset.__init__ (used by reproject for ndarray buffers)
@@ -435,16 +444,23 @@ def _ui_note(kind: str, text: str, legacy: str | None = None) -> None:
     message only (D-7): the state word is re-added at display time — live
     shows ``ok: `` / ``[warn] `` / ``error: `` prefixes, plain shows the
     level letter of the unified ``L ppgrid.pipeline: msg`` line, and
-    library mode (no active UI) re-adds the legacy raw marker and prints
-    as-is. ``legacy`` overrides the library-mode marker for sites whose
-    pre-#102 raw print carried a different prefix (``"warning: "`` for the
-    stale-output family, ``""`` for the strict precheck line); display
-    modes never see it.
+    library mode (no active UI) routes the line to the ppgrid logger
+    (issue #109: the library never prints directly), keeping the legacy
+    raw marker in the message text. ``legacy`` overrides that marker for
+    sites whose pre-#102 raw print carried a different prefix (``"warning: "``
+    for the stale-output family, ``""`` for the strict precheck line);
+    display modes never see it.
     """
     ui = _CURRENT_UI["ui"]
     if ui is None:
         marker = _LEGACY_MARKERS.get(kind, "") if legacy is None else legacy
-        print(marker + text, file=sys.stderr)  # ruff: ignore[print]
+        text = marker + text
+        if kind == "error":
+            log.error("%s", text)
+        elif kind == "warn":
+            log.warning("%s", text)
+        else:
+            log.info("%s", text)
         return
     if kind == "ok":
         ui.ok(text)
@@ -2164,8 +2180,72 @@ def _csv_chunk_tasks(
         return tasks, data_rows
 
 
+class TurboInfeasibleError(Exception):
+    """Turbo strict mode is infeasible (library mode, issue #109).
+
+    Raised by ``Pipeline.run()`` / ``Pipeline.plan()`` (via the turbo
+    precheck) when ``turbo_strict`` is True, no UI is attached
+    (``ui=None``, i.e. library mode), and the full-grid turbo path does
+    not fit the RAM budget — the condition the CLI reports as exit code
+    3 with the identical message on stderr.
+
+    Library callers should catch this and surface it in their own way;
+    the library never raises SystemExit or prints directly.
+
+    Attributes:
+        message: The precheck decision message — the exact line the CLI
+            prints, e.g. "error: --turbo est peak 30.5 GB > budget 13.6 GB;
+            shared path infeasible; per-box est peak 8.6 GB fits in the
+            budget". Also available as ``args[0]`` via Exception.
+
+    """
+
+    def __init__(self, message: str) -> None:
+        """Store the precheck line as ``message`` (and ``args[0]``)."""
+        super().__init__(message)
+        self.message = message
+
+
 class Pipeline:
-    """Pull-push interpolation pipeline."""
+    """Pull-push scattered-data interpolation pipeline.
+
+    Turns a CSV/Parquet table of geolocated point values into a pair of
+    int16 GeoTIFFs (value percentiles + support km) at an arbitrary
+    resolution and CRS, on CPU only.
+
+    Units and CRS expectations:
+        - ``res``: output grid resolution in metres (working CRS).
+        - ``cap_km``: support (influence) radius in kilometres; "auto"
+          resolves a data-driven cap from the point density.
+        - ``saturation``: per-cell count saturation (points per cell).
+        - ``scale``: DN per percentile point (default 100 -> DN 0..10000,
+          the int16 value band; raw values come back via calibration.json).
+        - ``src_crs`` / ``work_crs`` / ``out_crs``: positive EPSG codes.
+          Defaults: input lon/lat 4326 (WGS 84), interpolation in 6933
+          (Wagner VII, equal-area metres), output 3857 (Web Mercator).
+
+    Side effects:
+        ``run()`` creates ``out_dir`` and writes ``value.tif``,
+        ``support_km.tif`` and ``calibration.json`` into it (each via an
+        atomic rename), plus staging files (``_points.npy``, ``_tmp``
+        rasters) that are removed on every exit path. With ``dry_run``
+        True (``plan()``) nothing is written. Progress and warnings go
+        to the ``ppgrid`` logger (stderr under the CLI); with ``ui=None``
+        nothing is printed directly (issue #109).
+
+    Exceptions:
+        ``__init__`` raises ``ValueError`` on invalid parameters (scale * 100
+        > int16 max, percentile_step outside (0, 100], saturation <= 0,
+        n_threads < 1, unknown turbo preset, ...).
+        ``run()`` / ``plan()`` raise ``ValueError`` on validation failures
+        (missing input columns, no valid points, non-positive geometry
+        values), ``OSError``/``FileNotFoundError`` on I/O errors (missing
+        input file, unwritable out dir, disk full), pyproj
+        ``CRSError`` on an unknown EPSG code, and ``TurboInfeasibleError``
+        in library mode (``ui=None``) when ``turbo_strict`` is set and the
+        full-grid turbo path does not fit the RAM budget. In CLI mode the
+        same condition is ``SystemExit(3)``.
+    """
 
     def __init__(
         self,
@@ -2796,6 +2876,14 @@ class Pipeline:
         Returns:
             Tuple of value and support GeoTIFF file paths.
 
+        Raises:
+            ValueError: validation failures (see the class docstring).
+            OSError: I/O errors (missing input file, unwritable out dir,
+                disk full).
+            CRSError: unknown EPSG code on src_crs/work_crs/out_crs.
+            TurboInfeasibleError: turbo_strict infeasible in library mode
+                (ui=None); the CLI reports the same condition as exit 3.
+
         """
         self._phase_wall = {}
         self._fallbacks = []
@@ -2848,7 +2936,8 @@ class Pipeline:
 
         Runs ingest -> calibrate -> grid -> turbo precheck; with dry_run
         active no files or directories are created. A --turbo-strict
-        infeasibility in the precheck exits 3 (SystemExit propagates).
+        infeasibility in the precheck exits 3 (SystemExit propagates) in
+        CLI mode, or raises TurboInfeasibleError in library mode (ui=None).
 
         """
         scope = self.ui.run_scope() if self.ui is not None else nullcontext()
@@ -3413,15 +3502,22 @@ class Pipeline:
 
         Runs after grid() (which knows n, cells, levels) and before
         _prepare_shared's first big allocation. Prints the budget value
-        actually used. Shared infeasible: strict -> stderr error + exit 3;
-        non-strict -> [warn] + continue on the per-box path (exit 0, correct
-        output, turbo warp/write still apply). When the per-box est peak
-        itself exceeds the budget the warning is explicit: best-effort,
-        OOM risk, output may be partial (M-3).
+        actually used. Shared infeasible: strict -> stderr error + exit 3
+        (CLI) or TurboInfeasibleError (library mode, issue #109);
+        non-strict -> [warn] + continue on the per-box path (exit 0,
+        correct output, turbo warp/write still apply). When the per-box
+        est peak itself exceeds the budget the warning is explicit:
+        best-effort, OOM risk, output may be partial (M-3).
+
+        Library mode (``ui=None``) never prints directly: the summary and
+        any message travel the ``ppgrid`` logger (stderr only if the
+        caller configured it), and the strict infeasibility raises.
 
         Raises:
-            SystemExit: code 3 when --turbo-strict and the shared path does
-                not fit under the budget.
+            SystemExit: code 3 in CLI mode when --turbo-strict and the
+                shared path does not fit under the budget.
+            TurboInfeasibleError: the same condition in library mode
+                (issue #109: the library never raises SystemExit).
 
         """
         if not self.turbo:
@@ -3452,7 +3548,19 @@ class Pipeline:
         self._turbo_plan = plan
         self._turbo_decision = decision
         self._turbo_budget_bytes = plan.budget_bytes
-        if self.dry_run:
+        if self.ui is None:
+            # Library mode (issue #109): no direct prints. The summary and
+            # any message travel the ppgrid logger (stderr only if the
+            # caller configured it; the default lastResort handler shows
+            # WARNING and above), and a strict infeasibility becomes a
+            # TurboInfeasibleError below instead of SystemExit(3).
+            log.info("%s", decision.summary)
+            if decision.message:
+                if decision.exit_code == 3:
+                    log.error("%s", decision.message)
+                else:
+                    log.warning("%s", decision.message.removeprefix("[warn] "))
+        elif self.dry_run:
             # --plan: the plan printout carries the decision; only a hard
             # failure (--turbo-strict infeasible) says its piece on stderr.
             if decision.exit_code == 3 and decision.message:
@@ -3465,6 +3573,8 @@ class Pipeline:
             if decision.message:
                 _ui_note_precheck(decision.message)
         if decision.exit_code == 3:
+            if self.ui is None:
+                raise TurboInfeasibleError(decision.message)
             raise SystemExit(3)
 
     def _turbo_zstd_ok(self) -> bool:
@@ -4619,6 +4729,8 @@ def _configure_logging(level_name: str, *, color: bool = False) -> None:
 
     """
     levels = {"error": logging.ERROR, "warning": logging.WARNING, "info": logging.INFO, "debug": logging.DEBUG}
+    from . import ui as _ui_mod  # local: LOAD_GLOBAL does not consult the module __getattr__ (#109)
+
     root = logging.getLogger("ppgrid")
     root.setLevel(levels[level_name])
     handler = None
@@ -4638,7 +4750,7 @@ def _configure_logging(level_name: str, *, color: bool = False) -> None:
         # Assign directly: setStream() flushes the old stream first,
         # and that raises on a closed file (capsys test teardown).
         handler.stream = sys.stderr  # type: ignore[attr-defined]
-    handler.setFormatter(_ui.plain_log_formatter(color=color))
+    handler.setFormatter(_ui_mod.plain_log_formatter(color=color))
     if _PENDING_LOG_WARN:
         for warn in _PENDING_LOG_WARN:
             _ui_note("warn", warn)
@@ -4939,14 +5051,29 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Parse CLI arguments and run the pipeline.
+    """Command-line entry point (the ``ppgrid`` console script).
 
-    Exit codes: as documented on _run_cli (propagated unchanged).
+    Parses ``argv`` (defaults to ``sys.argv[1:]``), runs the pipeline
+    end-to-end, and reports through the CLI presentation layer. stdout is
+    reserved for ``--plan``, ``help`` and ``--version``; every other line
+    (progress, warnings, errors, the run summary) goes to stderr.
+
+    Side effects: creates the output directory and writes ``value.tif``,
+    ``support_km.tif`` and ``calibration.json`` into it (plus
+    ``run_summary.json`` with ``--json``); configures the ``ppgrid``
+    logger for the rest of the process.
 
     Args:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
 
+    Raises:
+        SystemExit: 0 (ok, help, --plan), 1 (pipeline/IO error),
+            2 (validation error), 3 (--turbo-strict infeasible) — as
+            documented on _run_cli (propagated unchanged).
+
     """
+    from . import ui as _ui
+
     parser = _build_parser()
     out: Path | None = None
     try:

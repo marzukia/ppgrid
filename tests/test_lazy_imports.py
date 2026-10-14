@@ -1,9 +1,10 @@
-"""Verify rasterio/pyproj are lazy-loaded (not imported by `import ppgrid`).
+"""Verify rasterio/pyproj/rich are lazy-loaded (not imported by `import ppgrid`).
 
-The CLI and library only need the native stack at first use (ingest/warp/
-write), so importing ppgrid must not pay the rasterio+pyproj+GDAL import
-cost. Regression guard for the PEP 562 lazy-import layer in
-pipeline.py / zstdmt.py.
+The CLI and library only need the native stack (rasterio+pyproj+GDAL) and
+the terminal-render stack (ui -> rich) at first use (ingest/warp/write/
+CLI), so importing ppgrid must not pay those costs. Regression guard for
+the PEP 562 lazy-import layer in pipeline.py / zstdmt.py (rich + ui since
+issue #109).
 """
 
 from __future__ import annotations
@@ -20,6 +21,24 @@ _NOT_LOADED = (
     "import sys, ppgrid, ppgrid.pipeline, ppgrid.zstdmt\n"
     "assert 'rasterio' not in sys.modules, 'rasterio loaded at import time'\n"
     "assert 'pyproj' not in sys.modules, 'pyproj loaded at import time'\n"
+    "assert 'rich' not in sys.modules, 'rich loaded at import time'\n"
+    "assert 'ppgrid.ui' not in sys.modules, 'ppgrid.ui loaded at import time'\n"
+)
+
+# Bare `import ppgrid` must be cheap (issue #109): nothing beyond the
+# stdlib, and the beta public surface resolves lazily on first access.
+_PKG_LAZY = (
+    "import sys, ppgrid\n"
+    "for mod in ('rasterio', 'pyproj', 'rich', 'numpy', 'pandas', 'ppgrid.pipeline', 'ppgrid.ui'):\n"
+    "    assert mod not in sys.modules, f'{mod} loaded by bare `import ppgrid`'\n"
+    "assert ppgrid.__all__ == ['Pipeline', 'main', 'version']\n"
+    "assert ppgrid.version() == ppgrid.__version__\n"
+    "assert ppgrid.Pipeline.__name__ == 'Pipeline'  # triggers the lazy import\n"
+    "assert 'ppgrid.pipeline' in sys.modules\n"
+    "assert ppgrid.main.__name__ == 'main'\n"
+    "assert issubclass(ppgrid.TurboInfeasibleError, Exception)\n"
+    "for mod in ('rasterio', 'pyproj', 'rich'):\n"
+    "    assert mod not in sys.modules, f'{mod} loaded by attribute access'\n"
 )
 
 _HELP_CHECK = (
@@ -46,8 +65,14 @@ def _fresh_python(code: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_import_ppgrid_defers_native_modules() -> None:
-    """Importing ppgrid leaves rasterio and pyproj out of sys.modules."""
+    """Importing ppgrid leaves rasterio, pyproj and rich out of sys.modules."""
     result = _fresh_python(_NOT_LOADED)
+    assert result.returncode == 0, result.stderr
+
+
+def test_package_import_is_lazy() -> None:
+    """Bare `import ppgrid` loads nothing heavy; the public surface resolves lazily (#109)."""
+    result = _fresh_python(_PKG_LAZY)
     assert result.returncode == 0, result.stderr
 
 
