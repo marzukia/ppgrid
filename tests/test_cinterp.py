@@ -8,8 +8,12 @@ where the C module is required, skip cleanly when no compiler is present.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import subprocess
+import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +25,7 @@ from ppgrid.calibrate import PercentileTransform
 C = pytest.mark.skipif(not ci.available(), reason="C kernel unavailable (np.interp fallback active)")
 
 SEED = 20261011
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _bits(a: np.ndarray) -> np.ndarray:
@@ -394,3 +399,103 @@ def test_backend_string() -> None:
         assert "C" in tag
     else:
         assert ci.reason() is not None
+
+
+# ---------------------------------------------------------------------------
+# PPGRID_CINTERP user opt-out (issue #109): 0 = force np.interp, 1/unset =
+# default. Fresh-interpreter probes (the backend resolves once at import).
+# ---------------------------------------------------------------------------
+
+_BACKEND_PROBE = "import ppgrid._cinterp as ci; print(ci.available()); print(ci.backend())"
+
+
+def _probe_backend(env_val: str | None) -> tuple[bool, str]:
+    """Resolve the backend in a fresh interpreter with PPGRID_CINTERP set (or unset)."""
+    env = dict(os.environ)
+    env.pop("PPGRID_CINTERP", None)
+    if env_val is not None:
+        env["PPGRID_CINTERP"] = env_val
+    proc = subprocess.run(
+        [sys.executable, "-c", _BACKEND_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    available, backend = proc.stdout.strip().splitlines()
+    return available == "True", backend
+
+
+def test_ppgrid_cinterp_env_switch() -> None:
+    """PPGRID_CINTERP=0 cleanly selects the np.interp fallback (issue #109).
+
+    0 is checked before any compiler work, so it holds even when a
+    compiler exists; 1 is the same as unset (C kernel when buildable).
+    """
+    default_available, default_backend = _probe_backend(None)
+    off_available, off_backend = _probe_backend("0")
+    on_available, on_backend = _probe_backend("1")
+    # 0: always off, for the documented reason.
+    assert off_available is False
+    assert off_backend == "np.interp (PPGRID_CINTERP=0)"
+    # 1: identical to the unset default (the switch is on/off, not a third mode).
+    assert on_available == default_available
+    assert on_backend == default_backend
+
+
+_RUN_SNIPPET = (
+    "import sys\n"
+    "from ppgrid.pipeline import main\n"
+    "main([sys.argv[1], '--value-col', 'value', '--lng-col', 'lng', '--lat-col', 'lat',\n"
+    "      '--res', '5000', '--cap-km', '10', '--workers', '1', '-o', sys.argv[2]])\n"
+)
+
+
+def _write_guard_csv(path: Path) -> Path:
+    """400 deterministic points around Melbourne (small, fast e2e)."""
+    import pandas as pd
+
+    rng = np.random.default_rng(20261014)
+    n = 400
+    lng = 144.9 + rng.random(n) * 0.1
+    lat = -37.8 - rng.random(n) * 0.1
+    value = rng.integers(100_000, 2_000_000, n).astype(float)
+    pd.DataFrame({"value": value, "lng": lng, "lat": lat}).to_csv(path, index=False)
+    return path
+
+
+def test_ppgrid_cinterp_switch_bit_identity(tmp_path: Path) -> None:
+    """Small e2e: PPGRID_CINTERP=0 and =1 outputs are bit-identical (issue #109)."""
+    csv = _write_guard_csv(tmp_path / "pts.csv")
+    outs: dict[str, Path] = {}
+    for val in ("1", "0"):
+        out = tmp_path / f"out_{val}"
+        env = dict(os.environ)
+        env["PPGRID_CINTERP"] = val
+        proc = subprocess.run(
+            [sys.executable, "-c", _RUN_SNIPPET, str(csv), str(out)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=env,
+            cwd=REPO_ROOT,
+            check=False,
+        )
+        assert proc.returncode == 0, (val, proc.stderr)
+        outs[val] = out
+    for name in ("value.tif", "support_km.tif", "calibration.json"):
+        b_on = (outs["1"] / name).read_bytes()
+        b_off = (outs["0"] / name).read_bytes()
+        assert hashlib.sha256(b_on).hexdigest() == hashlib.sha256(b_off).hexdigest(), (
+            f"{name} differs between PPGRID_CINTERP=1 and =0"
+        )
+    # Non-vacuous when a compiler exists: the two runs must have used
+    # different backends (C vs np.interp), proving the switch was exercised.
+    default_available, _default_backend = _probe_backend(None)
+    if default_available:
+        off_available, off_backend = _probe_backend("0")
+        assert off_available is False
+        assert "PPGRID_CINTERP=0" in off_backend

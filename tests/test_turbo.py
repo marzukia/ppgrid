@@ -17,6 +17,7 @@ import bz2
 import gzip
 import hashlib
 import io
+import logging
 import lzma
 import math
 import multiprocessing as mp
@@ -654,10 +655,48 @@ def test_a9_pin_32gb_regime_b() -> None:
     assert turbop.precheck(p).exit_code == 0
 
 
-def test_turbo_precheck_strict_exit3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """--turbo-strict: shared infeasible (per_box) -> SystemExit(3)."""
+def test_turbo_precheck_strict_library_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Library mode (ui=None): strict infeasible -> TurboInfeasibleError, no SystemExit (#109).
+
+    The exception message is the exact precheck line the CLI prints, and
+    the line travels the ppgrid logger (an ERROR record) — not a direct
+    print.
+    """
     monkeypatch.setattr(pipeline_mod.turbop, "resolve_cap", _identity_cap)
+    # Deterministic ceiling: no memory-ceiling note prepended to the line.
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_physical_gb", lambda: 128.0)
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_cgroup_max_gb", lambda: None)
     p = _a9_pipeline(tmp_path, 16.0, strict=True)
+    with (
+        caplog.at_level(logging.ERROR, logger="ppgrid.pipeline"),
+        pytest.raises(pipeline_mod.TurboInfeasibleError) as ei,
+    ):
+        p._turbo_precheck()  # ruff: ignore[private-member-access]
+    assert p._turbo_decision is not None  # ruff: ignore[private-member-access]
+    assert p._turbo_decision.path == "per_box"  # ruff: ignore[private-member-access]
+    # Message == the exact CLI 'error: ...' line (byte-identical contract).
+    assert ei.value.message == p._turbo_decision.message  # ruff: ignore[private-member-access]
+    assert ei.value.message.startswith("error: ")
+    assert "shared path infeasible" in ei.value.message
+    # It was logged (ppgrid logger), not printed.
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == [ei.value.message]
+
+
+def test_turbo_precheck_strict_cli_exit3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI mode (UI attached): strict infeasible -> SystemExit(3), unchanged (#109).
+
+    The end-to-end byte-exact stderr line is pinned by test_cli_turbo_wiring
+    (exit code) and tests/test_cli_help.py::test_strict_precheck_stderr_is_jargon_free
+    (stderr); this pins the mode split itself.
+    """
+    monkeypatch.setattr(pipeline_mod.turbop, "resolve_cap", _identity_cap)
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_physical_gb", lambda: 128.0)
+    monkeypatch.setattr(pipeline_mod.turbop, "_read_cgroup_max_gb", lambda: None)
+    p = _a9_pipeline(tmp_path, 16.0, strict=True)
+    p.ui = pipeline_mod._ui.UI(live=False, color=False, unicode=True)  # ruff: ignore[private-member-access]
+    monkeypatch.setitem(pipeline_mod._CURRENT_UI, "ui", p.ui)  # ruff: ignore[private-member-access]
     with pytest.raises(SystemExit) as ei:
         p._turbo_precheck()  # ruff: ignore[private-member-access]
     assert ei.value.code == 3
