@@ -425,7 +425,13 @@ def _probe_backend(env_val: str | None) -> tuple[bool, str]:
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    available, backend = proc.stdout.strip().splitlines()
+    lines = proc.stdout.strip().splitlines()
+    # Line 1 is the available() flag; the rest is the backend() tag.
+    # When the JIT build fails (pre-existing on macOS), the fallback reason
+    # embeds multi-line compiler stderr, so join the tail instead of
+    # assuming exactly two lines.
+    assert len(lines) >= 2, proc.stdout
+    available, backend = lines[0], "\n".join(lines[1:])
     return available == "True", backend
 
 
