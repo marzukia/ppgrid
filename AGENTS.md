@@ -31,6 +31,10 @@ not downstream calculation).
 - Releasing: bump `version` + `uv.lock`, update CHANGELOG, push a tag, the
   `publish.yml` workflow uploads to PyPI. The README PyPI badge shows the *published*
   version, so it lags the repo until a tag is cut.
+- The GitHub release body is written from `docs/RELEASE_NOTES.md` (issue #100):
+  mandatory sections = what's new (issue-cited), performance claims with full
+  scope (hardware, versions, dataset, CRS, resolution, options), and the
+  support/feedback path linking SUPPORT.md at the tag ref.
 
 ## Rules — do not break these
 
