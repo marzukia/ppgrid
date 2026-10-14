@@ -88,12 +88,13 @@ not downstream calculation).
 
 ## Git / pushing
 
-- The repo lives under the `marzukia` GitHub org. The `monkytheluffy` bot identity is
-  NOT a collaborator (push 403s). Push with the `marzukia` PAT:
+- The repo lives under the `marzukia` GitHub org. The `franktropic` identity is a
+  collaborator with write (verified 2026-10-14 via API + dry-run push). Push plain:
   ```bash
-  PAT=$(cat ~/.config/marzukia-pat)
-  git push "https://x-access-token:${PAT}@github.com/marzukia/ppgrid" <branch>
+  git push <branch>          # gh CLI auth (franktropic)
+  gh pr create ...           # PRs are authored by franktropic
   ```
+  The `monkytheluffy` bot identity is NOT a collaborator (push 403s).
 - Branches go to a PR, not main, per the fleet merge gate.
 
 ## Change history
