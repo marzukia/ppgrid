@@ -449,7 +449,15 @@ def test_ppgrid_cinterp_env_switch() -> None:
     assert off_backend == "np.interp (PPGRID_CINTERP=0)"
     # 1: identical to the unset default (the switch is on/off, not a third mode).
     assert on_available == default_available
-    assert on_backend == default_backend
+    if default_available:
+        # C kernel active: the tag is a stable literal, compare it exactly.
+        assert on_backend == default_backend == "cinterp (C)"
+    else:
+        # Fallback: the tag embeds the compiler diagnostic, which names a
+        # per-attempt random temp .o file (cinterp-<hex>.o), so the two
+        # strings differ only in that hex. Compare the stable mode prefix.
+        assert on_backend.startswith("np.interp (")
+        assert default_backend.startswith("np.interp (")
 
 
 _RUN_SNIPPET = (
