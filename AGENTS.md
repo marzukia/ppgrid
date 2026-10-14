@@ -31,6 +31,10 @@ not downstream calculation).
 - Releasing: bump `version` + `uv.lock`, update CHANGELOG, push a tag, the
   `publish.yml` workflow uploads to PyPI. The README PyPI badge shows the *published*
   version, so it lags the repo until a tag is cut.
+- The GitHub release body is written from `docs/RELEASE_NOTES.md` (issue #100):
+  mandatory sections = what's new (issue-cited), performance claims with full
+  scope (hardware, versions, dataset, CRS, resolution, options), and the
+  support/feedback path linking SUPPORT.md at the tag ref.
 
 ## Rules — do not fuck these up
 
@@ -89,9 +93,10 @@ not downstream calculation).
 ## Git / pushing
 
 - The repo lives under the `marzukia` GitHub org. The `monkytheluffy` bot identity is
-  NOT a collaborator (push 403s). Push with the `marzukia` PAT:
+  NOT a collaborator (push 403s). Push with the `marzukia` PAT
+  (franktropic's `gh` auth also has push, `gh auth git-credential`):
   ```bash
-  PAT=$(cat ~/.config/marzukia-pat)
+  PAT=$(cat ~/.secrets/github-andryo.pat)   # 0600
   git push "https://x-access-token:${PAT}@github.com/marzukia/ppgrid" <branch>
   ```
 - Branches go to a PR, not main, per the fleet merge gate.
