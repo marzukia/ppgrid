@@ -123,5 +123,8 @@ exit codes:
   2  validation error (bad flag value, missing input column, out dir not
      empty without --force)
   3  --turbo-strict: shared path infeasible under the RAM budget
+  130 interrupted (SIGINT): one `interrupted` line, no traceback; run
+      temp files removed (retained partials named), earlier run's rasters
+      warned as stale
 
 Run `ppgrid help` to print this text at any time.

@@ -152,6 +152,16 @@ ignore = [
     "subprocess-run-without-check",    # returncode asserted explicitly
     "subprocess-without-shell-equals-true",    # fixed argv, no shell
 ]
+# tests/test_cli_interrupt.py spawns the venv interpreter to send it SIGINT
+# mid-run, and pokes private state (_EPILOG, _turbo_precheck); no_unlink must
+# keep Path.unlink's boolean signature.
+"tests/test_cli_interrupt.py" = [
+    "suspicious-subprocess-import",   # S404: own interpreter, fixed argv
+    "subprocess-without-shell-equals-true",   # no shell
+    "private-member-access",    # _EPILOG / _turbo_precheck on purpose
+    "FBT001",   # no_unlink mirrors Path.unlink(missing_ok=False)
+    "FBT002",
+]
 # examples/run_melb.py is a runnable repro script; its prints are the output.
 "examples/run_melb.py" = ["print"]
 # tests/fixtures/*.py are runnable fixture generators; prints are the output.
