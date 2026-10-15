@@ -179,6 +179,11 @@ ignore = [
     "subprocess-run-without-check",   # returncode asserted explicitly
     "subprocess-without-shell-equals-true",   # no shell, fixed argv
 ]
+# tests/test_cli_config.py runs a fresh-interpreter init probe (#63).
+"tests/test_cli_config.py" = [
+    "suspicious-subprocess-import",    # [sys.executable, -c, <own constant>] fixed argv
+    "subprocess-without-shell-equals-true",    # no shell, fixed argv
+]
 # tests/test_cli_interrupt.py spawns the venv interpreter to send it SIGINT
 # mid-run, and pokes private state (_EPILOG, _turbo_precheck); no_unlink must
 # keep Path.unlink's boolean signature.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import errno
+import hashlib
 import importlib
 import io
 import json
@@ -23,12 +24,14 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import traceback
 import warnings
 from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, Self
@@ -297,6 +300,104 @@ DEFAULT_WORKERS: int = 4
 DEFAULT_SATURATION: float = 1.0
 DEFAULT_BLOCK: int = 2048
 CALIB_MAX_POINTS_DEFAULT: int = 2_000_000
+
+# --- config file (issue #63) ----------------------------------------------
+# `ppgrid.toml` holds pipeline options. Precedence: CLI flag > config >
+# built-in default. Argparse must tell "not passed" apart from "passed with
+# the default value", so every config-able option carries the UNSET sentinel
+# as its parser default; _apply_config fills it from the file and
+# _resolve_sentinels falls back to the built-in default, so downstream code
+# (preflight, _make_pipeline, summaries) only ever sees real values.
+
+
+class _Unset:
+    """Sentinel: a config-able CLI flag that was not passed (issue #63)."""
+
+    __slots__ = ()
+    _inst: Self | None = None
+
+    def __new__(cls) -> Self:
+        if cls._inst is None:
+            cls._inst = super().__new__(cls)
+        return cls._inst
+
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+UNSET = _Unset()
+
+# (config key, argparse dest, accepted TOML kind, example value for the
+# `init` template when the built-in default is None). Order is the --help
+# group order (input/columns, CRS/grid, interpolation, memory/turbo, output);
+# the template and the effective-params dict use this order.
+_CONFIG_OPTIONS: tuple[tuple[str, str, str, Any], ...] = (
+    ("value-col", "value_col", "str", "price"),
+    ("lng-col", "lng_col", "str", "longitude"),
+    ("lat-col", "lat_col", "str", "latitude"),
+    ("src-crs", "src_crs", "crs", 4326),
+    ("work-crs", "work_crs", "crs", 6933),
+    ("out-crs", "out_crs", "crs", 3857),
+    ("res", "res", "num", 10000),
+    ("cap-km", "cap_km", "str-or-num", 20),
+    ("block", "block", "int", 2048),
+    ("transform", "transform", "str", "log10"),
+    ("saturation", "saturation", "num", 1.0),
+    ("scale", "scale", "num", 10.0),
+    ("percentile-step", "percentile_step", "num", 5),
+    ("skip-calibration", "skip_calibration", "bool", True),
+    ("seed", "seed", "int", 1234),
+    ("calib-max-points", "calib_max_points", "int", 1_000_000),
+    ("calibration", "calibration", "str", "calibration.json"),
+    ("workers", "workers", "str-or-num", "auto"),
+    ("max-band-parallel", "max_band_parallel", "int", 8),
+    ("turbo", "turbo", "str-or-num", "auto"),
+    ("max-ram", "max_ram", "num", 32),
+    ("turbo-strict", "turbo_strict", "bool", True),
+    ("out", "out", "str", "out/"),
+    ("compress", "compress", "str", "ZSTD"),
+    ("force", "force", "bool", True),
+    ("json", "json", "bool", True),
+)
+_CONFIG_KEYS: frozenset[str] = frozenset(key for key, _, _, _ in _CONFIG_OPTIONS)
+_CONFIG_KEY_TO_DEST: dict[str, str] = {key: dest for key, dest, _, _ in _CONFIG_OPTIONS}
+_CONFIG_KIND: dict[str, str] = {key: kind for key, _, kind, _ in _CONFIG_OPTIONS}
+
+# Built-in defaults for the config-able options — the parser defaults
+# pre-#63. Single source for the sentinel fallback and the `ppgrid init`
+# template values. --ram-gb is CLI-only (its alias is canonicalised into
+# max-ram by preflight) but resolves here too.
+_CONFIG_DEFAULTS: dict[str, Any] = {
+    "value_col": "value",
+    "lng_col": "longitude",
+    "lat_col": "latitude",
+    "src_crs": SRC_CRS,
+    "work_crs": WORK_CRS,
+    "out_crs": OUT_CRS,
+    "res": DEFAULT_RES,
+    "cap_km": "auto",
+    "block": DEFAULT_BLOCK,
+    "transform": "auto",
+    "saturation": DEFAULT_SATURATION,
+    "scale": DEFAULT_SCALE,
+    "percentile_step": None,
+    "skip_calibration": False,
+    "seed": 0,
+    "calib_max_points": CALIB_MAX_POINTS_DEFAULT,
+    "calibration": None,
+    "workers": DEFAULT_WORKERS,
+    "max_band_parallel": None,
+    "turbo": None,
+    "max_ram": None,
+    "ram_gb": None,
+    "turbo_strict": False,
+    "out": "out/",
+    "compress": "ZSTD",
+    "force": False,
+    "json": False,
+}
+
+_CONFIG_FILE_NAME = "ppgrid.toml"
 
 # Point memmap bands (written by Pipeline.grid, read by _block_points):
 # band PTS_X = projected x (m), PTS_Y = projected y (m), PTS_TV = transformed value.
@@ -4691,6 +4792,87 @@ def _write_json_summary(p: Pipeline, args: argparse.Namespace, out: Path) -> Non
     log.info("run summary: %s", path)
 
 
+def _effective_params(args: argparse.Namespace) -> dict[str, Any]:
+    """All effective pipeline params post-precedence-merge (issue #64).
+
+    Config key -> final value for every config-able option, in template
+    order. Call after _apply_config, so no UNSET sentinel can leak in.
+
+    """
+    return {key: getattr(args, _CONFIG_KEY_TO_DEST[key]) for key, _, _, _ in _CONFIG_OPTIONS}
+
+
+def _params_fingerprint(params: dict[str, Any]) -> str:
+    """sha256 of the canonical parameter JSON (issue #64).
+
+    Canonical form: sorted keys, compact separators, finite values
+    (_sanitize_json), and no timestamp — two runs with identical effective
+    params share one fingerprint regardless of when they ran.
+
+    """
+    canonical = json.dumps(_sanitize_json(params), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _version_report() -> dict[str, str]:
+    """Tool versions for the run fingerprint sidecar (issue #64).
+
+    Called after a successful run, so the native stack is loaded and the
+    version reads are plain attribute lookups (the lazy contract is on
+    module scope, not on call-time imports).
+
+    """
+    import pyproj
+    import rasterio as _rasterio  # function-local: loaded at this point by the run itself
+
+    return {
+        "ppgrid": __version__,
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "rasterio": _rasterio.__version__,
+        "gdal": _rasterio.__gdal_version__,
+        "pyproj": pyproj.__version__,
+    }
+
+
+def _write_run_sidecar(args: argparse.Namespace, out: Path) -> None:
+    """Write <out>/ppgrid_run.json after a successful run (issue #64).
+
+    The run fingerprint sidecar: schema_version, all effective params
+    (post-precedence-merge), the config file used (or null), the input
+    file name, tool versions, an ISO-8601 UTC timestamp, and fingerprint
+    (sha256 of the canonical, timestamp-free parameter JSON). The file is
+    new metadata: it does not enter the overwrite guard's raster list.
+    Atomic like the --json summary (fresh 0600 tmp + os.replace); a write
+    failure is a named error — exit 1 — never a raw traceback.
+
+    Args:
+        args: Parsed namespace after _apply_config (real values only).
+        out: Output directory (already created, run already published).
+
+    """
+    params = _effective_params(args)
+    payload = {
+        "schema_version": 1,
+        "params": params,
+        "config": args.config_path,
+        "input": Path(args.input).name,
+        "versions": _version_report(),
+        "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+        "fingerprint": _params_fingerprint(params),
+    }
+    path = out / "ppgrid_run.json"
+    tmp = out / "ppgrid_run.json.tmp"
+    try:
+        with os.fdopen(_staging_fd(tmp), "wb") as f:
+            f.write((json.dumps(_sanitize_json(payload), indent=2, allow_nan=False) + "\n").encode("utf-8"))
+        tmp.replace(path)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        _die(f"cannot write run fingerprint: {e}")
+    log.info("run fingerprint: %s", path)
+
+
 def _resolve_log_level(*, verbose: bool, log_level: str | None, quiet: bool = False) -> str:
     """Resolve the ppgrid log level: explicit flag > quiet > verbose > env > info.
 
@@ -4775,10 +4957,199 @@ def _configure_logging(level_name: str, *, color: bool = False) -> None:
         # and that raises on a closed file (capsys test teardown).
         handler.stream = sys.stderr  # type: ignore[attr-defined]
     handler.setFormatter(_ui_mod.plain_log_formatter(color=color))
+    # The handler's own level always mirrors the resolved stderr level: a
+    # previous --log-file run may have lowered the logger below it (the file
+    # handler wants INFO on a -q run), and handler-level gating is what keeps
+    # each output independent.
+    handler.setLevel(levels[level_name])
     if _PENDING_LOG_WARN:
         for warn in _PENDING_LOG_WARN:
             _ui_note("warn", warn)
         _PENDING_LOG_WARN.clear()
+
+
+def _configure_log_file(path_str: str | None) -> None:
+    """Route a second copy of the run log to a file (issue #65).
+
+    Created/truncated per run, level INFO (independent of the stderr level,
+    so --quiet runs still get a full INFO copy), same unified format as the
+    stderr handler (plain, no SGR — a log file carries no color). stderr
+    output is unchanged. Idempotent across main() calls in one process
+    (tests): a previous file handler is closed and replaced, and a run
+    without --log-file drops the handler.
+
+    Args:
+        path_str: --log-file value (None = no file logging).
+
+    Raises:
+        SystemExit: 1 (cannot create or open the log file).
+
+    """
+    root = logging.getLogger("ppgrid")
+    for h in list(root.handlers):
+        if getattr(h, "ppgrid_log_file", False):
+            root.removeHandler(h)
+            h.close()
+    if path_str is None:
+        return
+    path = Path(path_str)
+    try:
+        f = path.open("w", encoding="utf-8")
+    except OSError as e:
+        _die(f"cannot open log file {path}: {e.strerror or str(e)}")
+    handler = logging.StreamHandler(stream=f)
+    handler.ppgrid_log_file = True  # type: ignore[attr-defined]
+    handler.setLevel(logging.INFO)
+    from . import ui as _ui_mod  # local: LOAD_GLOBAL does not consult the module __getattr__ (#109)
+
+    handler.setFormatter(_ui_mod.plain_log_formatter(color=False))
+    root.addHandler(handler)
+    # The logger level gates every record before the handlers: a -q run
+    # (WARNING) would drop the file's INFO records. Lower the logger to the
+    # file level and let the stderr handler's own level keep the terminal
+    # output unchanged.
+    if root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+
+
+def _config_kind_ok(kind: str, value: Any) -> bool:
+    """Gate a TOML value's Python type against the option's accepted kind (#63).
+
+    bool is checked first: it is an int subclass, and a ``res = true``-style
+    typo must not sneak past the numeric kinds.
+
+    """
+    if isinstance(value, bool):
+        return kind == "bool"
+    if isinstance(value, int):
+        return kind in ("int", "num", "str-or-num", "crs")
+    if isinstance(value, float):
+        return kind in ("num", "str-or-num")
+    if isinstance(value, str):
+        return kind in ("str", "str-or-num", "crs")
+    return False
+
+
+_CONFIG_KIND_ERROR: dict[str, str] = {
+    "str": "a string",
+    "int": "an integer",
+    "num": "a number",
+    "bool": "true or false",
+    "str-or-num": "a string or a number",
+    "crs": "an EPSG code (integer) or an 'EPSG:<code>' string",
+}
+
+
+def _set_config_value(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, cfg: Path, key: str, value: Any
+) -> None:
+    """Validate one config value against its flag's own checker and store it (#63).
+
+    The value runs through the same type callable and choices as the CLI
+    flag, so a config value and the flag spelling that maps to it are
+    accepted identically; a rejection is a usage error (exit 2) naming the
+    file and the key. A dest the CLI flag already set is left alone
+    (flag > config).
+
+    Args:
+        parser: The run parser (provides the flag's type callable).
+        args: Parsed namespace (mutated on success).
+        cfg: Config file path (for the error message).
+        key: Config key (a member of _CONFIG_KEYS).
+        value: TOML value (str/int/float/bool).
+
+    Raises:
+        SystemExit: 2 (wrong TOML kind, or the flag's checker rejects it).
+
+    """
+    dest = _CONFIG_KEY_TO_DEST[key]
+    if getattr(args, dest) is not UNSET:
+        return  # CLI flag already set it (flag > config)
+    kind = _CONFIG_KIND[key]
+    if not _config_kind_ok(kind, value):
+        parser.error(f"config: {key!r} must be {_CONFIG_KIND_ERROR[kind]}: {value!r} ({cfg})")
+    action = next(a for a in parser._actions if a.dest == dest)  # ruff: ignore[private-member-access]
+    resolved: Any
+    if isinstance(value, bool):
+        resolved = value
+    else:
+        text = value if isinstance(value, str) else str(value)
+        if action.type is not None:
+            try:
+                resolved = action.type(text)
+            except (ValueError, argparse.ArgumentTypeError) as e:
+                parser.error(f"config: {key!r}: {e} ({cfg})")
+        else:
+            resolved = text
+    if action.choices is not None and resolved not in action.choices:
+        parser.error(f"config: {key!r} must be one of {', '.join(action.choices)}: {value!r} ({cfg})")
+    if key == "turbo" and resolved not in ("auto", "16", "32", "64", "128"):
+        # --turbo carries no type checker (optional-arg const); the preset
+        # set is validated the same way _main_preflight does.
+        parser.error(f"config: 'turbo' must be auto|16|32|64|128: {value!r} ({cfg})")
+    setattr(args, dest, resolved)
+
+
+def _resolve_sentinels(args: argparse.Namespace) -> None:
+    """Fill every config-able UNSET dest with its built-in default (#63).
+
+    Runs at the end of _apply_config, so after it returns every config-able
+    option holds a real value even when no config file is present.
+
+    """
+    for dest, default in _CONFIG_DEFAULTS.items():
+        if getattr(args, dest) is UNSET:
+            setattr(args, dest, default)
+
+
+def _apply_config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Path | None:
+    """Merge the ppgrid.toml config into the parsed args (issue #63).
+
+    Precedence: CLI flag > config > built-in default — a config key only
+    fills an option whose dest is still the UNSET sentinel (the flag was
+    not passed). Discovery: --config PATH (explicit; a missing file is a
+    usage error), else ./ppgrid.toml, else $HOME/.config/ppgrid/ppgrid.toml;
+    an absent file is a silent no-op. Unknown keys (including TOML
+    table headers) warn and are ignored; invalid values are usage errors
+    (exit 2).
+
+    Args:
+        parser: The run parser (provides the flags' type checkers).
+        args: Parsed namespace (mutated: config values + sentinel
+            resolution; every config-able dest is real on return).
+
+    Returns:
+        The config file applied, or None (no file present).
+
+    Raises:
+        SystemExit: 2 (missing explicit --config file, invalid TOML, bad value).
+
+    """
+    cfg: Path | None
+    if args.config is not None:
+        cfg = Path(args.config)
+        if not cfg.is_file():
+            parser.error(f"config file not found: {args.config}")
+    else:
+        home_cfg = Path.home() / ".config" / "ppgrid" / _CONFIG_FILE_NAME
+        cfg = next((c for c in (Path(_CONFIG_FILE_NAME), home_cfg) if c.is_file()), None)
+    if cfg is None:
+        _resolve_sentinels(args)
+        return None
+    try:
+        with cfg.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        parser.error(f"invalid TOML in {cfg}: {e}")
+    except OSError as e:
+        parser.error(f"cannot read config file {cfg}: {e.strerror or str(e)}")
+    for key, value in data.items():
+        if key not in _CONFIG_KEYS:
+            _ui_note("warn", f"config: unknown key {key!r} ignored ({cfg})")
+            continue
+        _set_config_value(parser, args, cfg, key, value)
+    _resolve_sentinels(args)
+    return cfg
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -4786,8 +5157,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     Layout (issue #103): options live in six groups — input/columns, CRS/grid,
     interpolation, memory/turbo, output, logging — and `--help` is snapshot-
-    tested. Metavars carry units (METRES, KM, GB, CELLS). Every option with a
-    non-None default shows it in its help text as "(default: X)"; the
+    tested. Metavars carry units (METRES, KM, GB, CELLS). Every option whose
+    built-in default is non-None shows it in its help text as "(default: X)";
+    since issue #63 the config-able options carry the UNSET sentinel as their
+    parser default instead (so "not passed" stays distinguishable from
+    "passed"), and their built-in default comes from _CONFIG_DEFAULTS. The
     mechanical check is tests/test_cli_help.py.
     """
     parser = argparse.ArgumentParser(
@@ -4800,47 +5174,47 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("input", nargs="?", help="CSV or Parquet input path")
 
     g_input = parser.add_argument_group("input/columns")
-    g_input.add_argument("--value-col", default="value", help="Value column name (default: value)")
-    g_input.add_argument("--lng-col", default="longitude", help="Longitude column name (default: longitude)")
-    g_input.add_argument("--lat-col", default="latitude", help="Latitude column name (default: latitude)")
+    g_input.add_argument("--value-col", default=UNSET, help="Value column name (default: value)")
+    g_input.add_argument("--lng-col", default=UNSET, help="Longitude column name (default: longitude)")
+    g_input.add_argument("--lat-col", default=UNSET, help="Latitude column name (default: latitude)")
 
     g_crs = parser.add_argument_group("CRS/grid")
     g_crs.add_argument(
         "--src-crs",
         type=_crs_arg,
-        default=SRC_CRS,
+        default=UNSET,
         help=f"Input CRS as a bare int or 'EPSG:<code>' string (default: {SRC_CRS})",
     )
     g_crs.add_argument(
         "--work-crs",
         type=_crs_arg,
-        default=WORK_CRS,
+        default=UNSET,
         help=f"Working CRS for interpolation, bare int or 'EPSG:<code>' (default: {WORK_CRS})",
     )
     g_crs.add_argument(
         "--out-crs",
         type=_crs_arg,
-        default=OUT_CRS,
+        default=UNSET,
         help=f"Output CRS, bare int or 'EPSG:<code>' (default: {OUT_CRS})",
     )
     g_crs.add_argument(
         "--res",
         type=_pos_float,
-        default=DEFAULT_RES,
+        default=UNSET,
         metavar="METRES",
         help=f"Cell size in metres (default: {DEFAULT_RES:g})",
     )
     g_crs.add_argument(
         "--cap-km",
         type=_cap_km_arg,
-        default="auto",
+        default=UNSET,
         metavar="KM",
         help="Fill cap in km, or 'auto' (default: auto)",
     )
     g_crs.add_argument(
         "--block",
         type=int,
-        default=DEFAULT_BLOCK,
+        default=UNSET,
         metavar="CELLS",
         help=f"Block size in cells (default: {DEFAULT_BLOCK})",
     )
@@ -4848,7 +5222,7 @@ def _build_parser() -> argparse.ArgumentParser:
     g_interp = parser.add_argument_group("interpolation")
     g_interp.add_argument(
         "--transform",
-        default="auto",
+        default=UNSET,
         # Pinned to the calibrate.transforms() factory names (audit #83):
         # adding a transform there adds its name here, nothing else to update.
         choices=["auto", *(t.name for t in transforms())],
@@ -4857,52 +5231,57 @@ def _build_parser() -> argparse.ArgumentParser:
     g_interp.add_argument(
         "--saturation",
         type=_pos_float,
-        default=DEFAULT_SATURATION,
+        default=UNSET,
         help=f"Point counts for a cell to fully self-trust (default: {DEFAULT_SATURATION:g})",
     )
     g_interp.add_argument(
-        "--scale", type=_pos_float, default=DEFAULT_SCALE, help=f"DN = percentile * scale (default: {DEFAULT_SCALE:g})"
+        "--scale", type=_pos_float, default=UNSET, help=f"DN = percentile * scale (default: {DEFAULT_SCALE:g})"
     )
     g_interp.add_argument(
         "--percentile-step",
         type=_pos_float,
-        default=None,
+        default=UNSET,
         help="Round output percentiles to the nearest step (e.g. 5 -> 90/95/100) (default: off)",
     )
-    g_interp.add_argument("--skip-calibration", action="store_true", help="Skip calibration, use defaults")
+    g_interp.add_argument(
+        "--skip-calibration",
+        action="store_true",
+        default=UNSET,
+        help="Skip calibration, use defaults",
+    )
     g_interp.add_argument(
         "--seed",
         type=int,
-        default=0,
+        default=UNSET,
         help="RNG seed for the calibration subsampling and blocked-CV bootstrap (default: 0; "
         "same seed + same input -> reproducible outputs)",
     )
     g_interp.add_argument(
         "--calib-max-points",
         type=int,
-        default=CALIB_MAX_POINTS_DEFAULT,
+        default=UNSET,
         help=f"Max points used for the calibration subsampling (default: {CALIB_MAX_POINTS_DEFAULT})",
     )
-    g_interp.add_argument("--calibration", default=None, help="Calibration JSON path (default: none)")
+    g_interp.add_argument("--calibration", default=UNSET, help="Calibration JSON path (default: none)")
 
     g_mem = parser.add_argument_group("memory/turbo")
     g_mem.add_argument(
         "--workers",
         type=_workers_arg,
-        default=DEFAULT_WORKERS,
+        default=UNSET,
         help=f"Number of workers (positive integer, or 'auto' = os.cpu_count()) (default: {DEFAULT_WORKERS})",
     )
     g_mem.add_argument(
         "--max-band-parallel",
         type=int,
-        default=None,
+        default=UNSET,
         help="Cap parallel row-band workers for the low-RAM shared descent (default: --workers).",
     )
     g_mem.add_argument(
         "--turbo",
         nargs="?",
         const="auto",
-        default=None,
+        default=UNSET,
         metavar="GB",
         help="Turbo mode: parallel phases sized to a RAM budget. "
         "Optional RAM cap preset 16|32|64|128 (GB, decimal 1e9 bytes); bare --turbo = auto-detect. "
@@ -4911,29 +5290,32 @@ def _build_parser() -> argparse.ArgumentParser:
     g_mem.add_argument(
         "--max-ram",
         type=_pos_float,
-        default=None,
+        default=UNSET,
         metavar="GB",
         help="Explicit RAM cap in GB (decimal, 1e9 bytes; overrides the --turbo preset). Implies --turbo.",
     )
-    g_mem.add_argument("--ram-gb", type=_pos_float, default=None, metavar="GB", help="Alias of --max-ram.")
+    g_mem.add_argument("--ram-gb", type=_pos_float, default=UNSET, metavar="GB", help="Alias of --max-ram.")
     g_mem.add_argument(
         "--turbo-strict",
         action="store_true",
+        default=UNSET,
         help="Shared path infeasible under the budget: error + exit 3 instead of [warn] + per-box fallback (exit 0).",
     )
 
     g_out = parser.add_argument_group("output")
-    g_out.add_argument("-o", "--out", default="out/", help="Output directory (default: out/)")
-    g_out.add_argument("--compress", default="ZSTD", help="GeoTIFF tile compression codec (default: ZSTD)")
+    g_out.add_argument("-o", "--out", default=UNSET, help="Output directory (default: out/)")
+    g_out.add_argument("--compress", default=UNSET, help="GeoTIFF tile compression codec (default: ZSTD)")
     g_out.add_argument(
         "--force",
         action="store_true",
+        default=UNSET,
         help="Overwrite existing outputs in the out dir (default: exit 2 when value.tif / "
         "support_km.tif / calibration.json / run_summary.json are already present)",
     )
     g_out.add_argument(
         "--json",
         action="store_true",
+        default=UNSET,
         help="Write a machine-readable run summary to <out>/run_summary.json "
         "(phase timings, volumetrics, grid, calibration, CLI params; stdout stays clean)",
     )
@@ -4968,6 +5350,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Progress log level on stderr (default: info; env LOGGING; 'verbose' = debug)",
     )
+    g_log.add_argument(
+        "--log-file",
+        metavar="PATH",
+        default=None,
+        help="Also write the run log to this file: created fresh each run, level info, "
+        "same unified format as stderr (no color); stderr output is unchanged",
+    )
+
+    # --- config file (issue #63; single append block — keep new flags here) ---
+    g_cfg = parser.add_argument_group("config")
+    g_cfg.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help=f"Pipeline options file, TOML (default: discover ./{_CONFIG_FILE_NAME}, then "
+        "~/.config/ppgrid/ppgrid.toml; `ppgrid init` writes a commented template; "
+        "precedence: CLI flag > config > built-in default)",
+    )
+
     # Subcommand discoverability (#61 #62 #69): one-line append; the parsers
     # themselves live in _build_subcommand_parser (see the section note).
     parser.description += (
@@ -5001,6 +5402,7 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         _resolve_log_level(verbose=args.verbose, log_level=args.log_level, quiet=args.quiet),
         color=_CURRENT_UI["ui"].color if _CURRENT_UI["ui"] is not None else False,
     )
+    _configure_log_file(args.log_file)  # #65: second copy of the run log, level INFO
     if args.input is None:
         _ui_note("error", "missing input file (CSV or Parquet)")
         _ui_note(
@@ -5082,7 +5484,8 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
 
 
 # ---------------------------------------------------------------------------
-# Read-only subcommands (#61 #62 #69): doctor, probe, list-crs.
+# Subcommands: read-only diagnostics (doctor #61, probe #62, list-crs #69)
+# plus init (#63, writes the ppgrid.toml template).
 #
 # Dispatched in main() on argv[0] BEFORE the run parser is built. They are
 # a separate top-level parser, not subparsers of the run parser: the run
@@ -5090,13 +5493,14 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
 # positional in the same parser and would swallow the command token
 # ("ppgrid doctor" -> input="doctor", "invalid choice"). Keeping the run
 # parser itself untouched (it gains only the one-line description append)
-# leaves every run-path byte identical. Each subcommand is read-only: no
+# leaves every run-path byte identical. Diag subcommands are read-only: no
 # output files (doctor's oracle probe writes one throwaway tile under the
-# temp dir). Their reports go to stdout like --plan; unexpected errors are
-# one named line on stderr + exit 1, like the run CLI.
+# temp dir); init writes the template into the target dir. Their reports go
+# to stdout like --plan; unexpected errors are one named line on stderr +
+# exit 1, like the run CLI. Future subcommands append here.
 # ---------------------------------------------------------------------------
 
-_SUBCOMMANDS: tuple[str, ...] = ("doctor", "probe", "list-crs")
+_SUBCOMMANDS: tuple[str, ...] = ("doctor", "probe", "list-crs", "init")
 
 _DOCTOR_MARK: dict[str, str] = {"pass": "[ok]", "warn": "[warn]", "fail": "[fail]"}
 
@@ -5123,12 +5527,14 @@ _LAT_NAMES: frozenset[str] = frozenset({"lat", "latitude"})
 
 
 def _build_subcommand_parser() -> argparse.ArgumentParser:
-    """Build the subcommand parser (read-only diagnostics, #61 #62 #69).
+    """Build the subcommand parser (diagnostics #61 #62 #69 + init #63).
 
     A separate top-level parser, dispatched on argv[0] in main() before the
     run parser is built (see the section note above): the run CLI's
     optional `input` positional would otherwise swallow the command token
-    before a subparser could validate it.
+    before a subparser could validate it. The top parser is add_help=False
+    (the run CLI owns `ppgrid --help`); each subparser keeps its own -h.
+    Future subcommands append here.
 
     Returns:
         The parser; `parse_args(argv)` with argv[0] a subcommand name.
@@ -5136,9 +5542,10 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="ppgrid",
-        description="ppgrid subcommands (read-only; they write no output files)",
+        add_help=False,
+        description="ppgrid subcommands. The default form is the run CLI: ppgrid INPUT [flags].",
     )
-    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True, title="subcommands")
 
     sub.add_parser(
         "doctor",
@@ -5195,6 +5602,18 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
         help="List the full pyproj/EPSG CRS database (default: the curated ppgrid set)",
     )
 
+    p_init = sub.add_parser(
+        "init",
+        help="write a fully commented ppgrid.toml template",
+        description=(
+            "Write a fully commented ppgrid.toml template covering every "
+            "pipeline option, each set to its built-in default (the file as "
+            "written changes nothing about a run). Refuses to clobber an "
+            "existing file without --force."
+        ),
+    )
+    p_init.add_argument("dir", nargs="?", default=".", help="Directory to write the template into (default: .)")
+    p_init.add_argument("--force", action="store_true", help="Overwrite an existing ppgrid.toml (default: exit 2)")
     return parser
 
 
@@ -5202,19 +5621,28 @@ def _run_subcommand(argv: list[str]) -> None:
     """Dispatch argv[0] in _SUBCOMMANDS to its handler (see main()).
 
     Handler exit codes become the SystemExit code (0/1/2 per the
-    subcommand contract). argparse usage errors exit 2 on their own;
-    any other unexpected exception is one named error line + exit 1, not
-    a traceback (the run CLI's _run_cli contract).
+    subcommand contract); init is the exception — it returns on success
+    (a plain return from main()) and _cmd_init raises its own
+    SystemExit 1 (IO) / 2 (usage). argparse usage errors exit 2 on
+    their own; any other unexpected exception on the diag path is one
+    named error line + exit 1, not a traceback (the run CLI's _run_cli
+    contract).
 
     Args:
         argv: The full subcommand argv, argv[0] = the subcommand name.
 
     Raises:
-        SystemExit: the subcommand's exit code (0/1/2).
+        SystemExit: the subcommand's exit code (0/1/2); init success returns.
 
     """
     parser = _build_subcommand_parser()
     args = parser.parse_args(argv)
+    if args.command == "init":
+        # init (#63): the handler owns its exit contract — success is a
+        # plain return from main(); it raises SystemExit 1 (IO) /
+        # 2 (usage) itself. Its tests pin that success form.
+        _cmd_init(args)
+        return
     try:
         if args.command == "doctor":
             code = _cmd_doctor()
@@ -5869,6 +6297,99 @@ def _cmd_list_crs(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+# ---------------------------------------------------------------------------
+# init (issue #63): write the commented ppgrid.toml template.
+#
+# Stdlib-only: the subcommand path runs before _load_native(), so init
+# (like --help) pays no native-stack cost. The template is rendered from
+# _build_parser, so a new flag joins via _CONFIG_OPTIONS.
+# ---------------------------------------------------------------------------
+
+
+def _cmd_init(args: argparse.Namespace) -> None:
+    """`ppgrid init [DIR]`: write the commented ppgrid.toml template (#63).
+
+    Stdlib-only: the subcommand path runs before _load_native(), so init
+    (like --help) pays no native-stack cost. A missing DIR is created with
+    parents; the success line goes to stderr (stdout stays reserved for
+    the run CLI's machine output).
+
+    Args:
+        args: Parsed subcommand namespace (dir, force).
+
+    Raises:
+        SystemExit: 2 (existing file without --force), 1 (IO error).
+
+    """
+    target_dir = Path(args.dir)
+    toml = target_dir / _CONFIG_FILE_NAME
+    if toml.exists() and not args.force:
+        sys.stderr.write(f"error: {toml} already exists (use --force to overwrite)\n")
+        raise SystemExit(2)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        toml.write_text(_init_template(), encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"error: cannot write {toml}: {e.strerror or str(e)}\n")
+        raise SystemExit(1) from e
+    sys.stderr.write(f"ok: wrote {toml}\n")
+
+
+def _toml_scalar(value: Any) -> str:
+    """Render a Python scalar as a TOML literal (str/int/float/bool) (#63)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(value, float):
+        return repr(value)  # TOML floats need a dot/exponent: repr(500.0) = '500.0'
+    return str(value)
+
+
+def _init_template() -> str:
+    """Render the ppgrid.toml template (issue #63).
+
+    Every config-able option in --help group order, commented with the
+    flag's own help text and set to its built-in default; a None default
+    renders commented out with an example value (the option is off by
+    default). Deterministic: the same ppgrid version renders the same
+    file. A new flag joins by one line in _CONFIG_OPTIONS.
+
+    """
+    parser = _build_parser()
+    by_dest = {a.dest: a for a in parser._actions}  # ruff: ignore[private-member-access]
+    lines: list[str] = [
+        f"# {_CONFIG_FILE_NAME} — ppgrid run config (issue #63)",
+        "#",
+        f"# Generated by `ppgrid init` (ppgrid {__version__}).",
+        "# Precedence: CLI flag > this file > built-in default.",
+        "# Every value below equals the built-in default, so this file as",
+        "# written changes nothing about a run. Edit a value to override it.",
+        "# Unknown keys warn and are ignored; an invalid value is a usage",
+        "# error (exit 2).",
+        "",
+    ]
+    for group in parser._action_groups:  # ruff: ignore[private-member-access]
+        if group.title in ("positional arguments", "options"):
+            continue
+        dests_in_group = {a.dest for a in group._group_actions}  # ruff: ignore[private-member-access]
+        rows = [row for row in _CONFIG_OPTIONS if row[1] in dests_in_group]
+        if not rows:
+            continue
+        group_lines = [f"# --- {group.title} " + "-" * max(0, 66 - len(group.title)), ""]
+        for key, dest, _kind, example in rows:
+            action = by_dest[dest]
+            default = _CONFIG_DEFAULTS[dest]
+            group_lines.append(f"# {action.help}")
+            if default is None:
+                group_lines.append(f"# {key} = {_toml_scalar(example)}")
+            else:
+                group_lines.append(f"{key} = {_toml_scalar(default)}")
+            group_lines.append("")
+        lines.extend(group_lines)
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
 def main(argv: list[str] | None = None) -> None:
     """Command-line entry point (the ``ppgrid`` console script).
 
@@ -5881,31 +6402,42 @@ def main(argv: list[str] | None = None) -> None:
 
     Subcommands are dispatched on argv[0] before the run parser is built
     (separate parser, see the section note): ``ppgrid doctor``,
-    ``ppgrid probe INPUT``, ``ppgrid list-crs``.
+    ``ppgrid probe INPUT``, ``ppgrid list-crs``. ``ppgrid init [DIR]``
+    (issue #63) writes the config template and exits before any of the run
+    machinery runs.
 
-    Side effects: creates the output directory and writes ``value.tif``,
-    ``support_km.tif`` and ``calibration.json`` into it (plus
-    ``run_summary.json`` with ``--json``); configures the ``ppgrid``
-    logger for the rest of the process. Subcommands write no output files
-    (doctor's oracle probe uses a throwaway temp-dir tile).
+    Side effects: discovers and merges the ppgrid.toml config (issue #63,
+    CLI flag > config > built-in default), creates the output directory and
+    writes ``value.tif``, ``support_km.tif`` and ``calibration.json`` into
+    it (plus ``ppgrid_run.json`` run-fingerprint sidecar, issue #64, every
+    successful run, and ``run_summary.json`` with ``--json``); mirrors the
+    run log to ``--log-file`` when given (issue #65); configures the
+    ``ppgrid`` logger for the rest of the process. Diag subcommands write
+    no output files (doctor's oracle probe uses a throwaway temp-dir tile).
 
     Args:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
 
     Raises:
-        SystemExit: run path: 0 (ok, help, --plan), 1 (pipeline/IO error),
+        SystemExit: 0 (ok, help, --plan, init), 1 (pipeline/IO error),
             2 (validation error), 3 (--turbo-strict infeasible) — as
             documented on _run_cli (propagated unchanged). Subcommands:
-            doctor 0/1, probe 0/1/2, list-crs 0/1 (see _run_subcommand).
+            doctor 0/1, probe 0/1/2, list-crs 0/1, init 0/1/2 (see
+            _run_subcommand). SIGINT on either path is the run contract:
+            exit 130, one line, no traceback.
 
     """
-    raw = list(sys.argv[1:]) if argv is None else list(argv)
-    if raw and raw[0] in _SUBCOMMANDS:
-        # Read-only subcommands (#61 #62 #69): separate parser, dispatched
-        # before _build_parser so the run CLI's `input` positional never
-        # sees the command token. Interrupts keep the run contract (130).
+    if argv is None:
+        argv = sys.argv[1:]
+    # Subcommands (issue #63, first batch: init) dispatch before the run
+    # parser: the run CLI's positional/flag surface stays byte-identical
+    # (argparse cannot mix a bare positional with subparsers). Dispatch is
+    # on the literal first token (token-wins, same rule as the sibling
+    # diag/verify CLI branches): a data file named like the subcommand is
+    # run as `ppgrid ./init`. Interrupts keep the run contract (130).
+    if argv and argv[0] in _SUBCOMMANDS:
         try:
-            _run_subcommand(raw)
+            _run_subcommand(argv)
         except KeyboardInterrupt:
             _interrupted_exit(None, None)
         return
@@ -5919,14 +6451,20 @@ def main(argv: list[str] | None = None) -> None:
         _load_native()
         from . import ui as _ui
 
-        out = Path(args.out)
-
         # Presentation layer (issue #101): resolve live/color modes once for
         # this invocation. main() is the only builder; library callers pass
         # their own (or no) UI straight to Pipeline.
         ui = _ui.UI.from_cli(quiet=args.quiet, color=args.color)
         _CURRENT_UI["ui"] = ui
+        out: Path | None = None  # bound after the config merge (it may set out); None = interrupt during parse/merge
         try:
+            # #63: config file merge (CLI flag > config > built-in
+            # default). After the UI is up (unknown-key warnings use the
+            # unified line) and before the out path is read (the config may
+            # set it); on return every config-able option holds a real value.
+            cfg = _apply_config(parser, args)
+            args.config_path = str(cfg.resolve()) if cfg is not None else None
+            out = Path(args.out)
             _run_cli(parser, args, out, ui)
         finally:
             _CURRENT_UI["ui"] = None
@@ -6012,6 +6550,7 @@ def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Pat
             # contract).
             p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False, ui=ui), args.input)
             _map_pipeline_errors(p.run, args.input)
+            _write_run_sidecar(args, out)  # #64: run fingerprint sidecar
             if args.json:
                 _write_json_summary(p, args, out)
         except SystemExit as e:

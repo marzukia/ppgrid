@@ -10,7 +10,8 @@ usage: ppgrid [-h] [--version] [--value-col VALUE_COL] [--lng-col LNG_COL]
               [--max-ram GB] [--ram-gb GB] [--turbo-strict] [-o OUT]
               [--compress COMPRESS] [--force] [--json] [--plan] [--quiet]
               [--color {auto,always,never}] [--verbose]
-              [--log-level {error,warning,info,debug}]
+              [--log-level {error,warning,info,debug}] [--log-file PATH]
+              [--config PATH]
               [input]
 
 Pull-push scattered-data interpolation Read-only subcommands (they write no output files): `ppgrid doctor` (stack health), `ppgrid probe INPUT` (input diagnostic), `ppgrid list-crs` (CRS codes). `ppgrid doctor --help` etc. for detail.
@@ -99,6 +100,15 @@ logging:
   --log-level {error,warning,info,debug}
                         Progress log level on stderr (default: info; env
                         LOGGING; 'verbose' = debug)
+  --log-file PATH       Also write the run log to this file: created fresh
+                        each run, level info, same unified format as stderr
+                        (no color); stderr output is unchanged
+
+config:
+  --config PATH         Pipeline options file, TOML (default: discover
+                        ./ppgrid.toml, then ~/.config/ppgrid/ppgrid.toml;
+                        `ppgrid init` writes a commented template; precedence:
+                        CLI flag > config > built-in default)
 
 examples:
   # Basic run: 10 km cells, auto transform and fill cap, default 4 workers

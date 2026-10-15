@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from ppgrid import turbop
-from ppgrid.pipeline import _EPILOG, _build_parser, main
+from ppgrid.pipeline import _CONFIG_DEFAULTS, _EPILOG, UNSET, _build_parser, main
 from tests.test_turbop import _plan_full_au
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -277,7 +277,13 @@ def _render_default(value: object) -> str:
 
 
 def test_defaults_displayed_consistently() -> None:
-    """Every option with a real default shows '(default: X)' in its help (item 6)."""
+    """Every option with a real default shows '(default: X)' in its help (item 6).
+
+    Since #63 the config-able options carry the UNSET sentinel as their
+    parser default (so "not passed" stays distinguishable from "passed");
+    their built-in default comes from _CONFIG_DEFAULTS, the single source
+    for the sentinel fallback and the init template.
+    """
     parser = _build_parser()
     checked = 0
     for action in parser._actions:
@@ -285,12 +291,13 @@ def test_defaults_displayed_consistently() -> None:
             continue  # positional
         if action.dest in ("help", "version"):
             continue
-        if action.default is False:
+        default = _CONFIG_DEFAULTS[action.dest] if action.default is UNSET else action.default
+        if default is False:
             continue  # store_true flag: absence of the flag is the default
-        if action.default is None:
+        if default is None:
             continue  # optional: no default value to display
         assert action.help, f"{action.option_strings} has a default but no help text"
-        rendered = _render_default(action.default)
+        rendered = _render_default(default)
         assert f"default: {rendered}" in action.help, (
             f"{action.option_strings[0]} default {rendered!r} not displayed consistently in help: {action.help!r}"
         )

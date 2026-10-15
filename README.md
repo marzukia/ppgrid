@@ -133,6 +133,9 @@ ppgrid data.csv --value-col premium --calibration calibration.json
 # Round output percentiles to a step (e.g. 5 -> 90/95/100) for clean vectorisation
 ppgrid data.csv --value-col premium --res 100 --cap-km 25 --percentile-step 5
 
+# Write a commented config template (safe defaults; edit values to override)
+ppgrid init
+
 # Print help with examples (also: --help)
 ppgrid help
 ```
@@ -171,9 +174,54 @@ ppgrid help
 | `--json` | False | Write a machine-readable run summary to `<out>/run_summary.json` (phase timings, volumetrics, grid metadata, calibration, resolved CLI params, seed, git commit; stdout stays clean) |
 | `--verbose` | False | Debug logging: per-phase wall times + volumetric detail (shorthand for `--log-level debug`) |
 | `--log-level` | `info` | Progress log level on stderr: `error`, `warning`, `info`, `debug` (env `LOGGING`; `verbose` = debug) |
+| `--log-file` | (none) | Also write the run log to this file: created fresh each run, level `info`, same format as stderr (no color); stderr output is unchanged |
 | `--max-band-parallel` | (none) | Cap parallel row-band workers for the low-RAM shared descent (default: `--workers`) |
 | `-q, --quiet` | False | Suppress stderr below WARNING (beats `--verbose` / `LOGGING`; an explicit `--log-level` wins) |
 | `--color` | (none) = auto | Color output: `auto` (TTY, no NO_COLOR/TERM=dumb), `always`, `never` (live progress also needs a TTY stderr and no `--quiet`) |
+| `--config` | (none) = discover | Pipeline options file, TOML. Discover `./ppgrid.toml`, then `~/.config/ppgrid/ppgrid.toml`; `ppgrid init` writes a commented template; precedence: CLI flag > config > built-in default |
+
+### Config file (`ppgrid.toml`)
+
+Pipeline options can live in a TOML file instead of the command line.
+Precedence: **CLI flag > config > built-in default** — a config value only
+fills an option you did not pass on the command line.
+
+Discovery order:
+
+1. `--config PATH` (explicit; a missing file is a usage error, exit 2)
+2. `./ppgrid.toml` (current directory)
+3. `~/.config/ppgrid/ppgrid.toml` (user default)
+
+No file present is a silent no-op. `ppgrid init [DIR]` writes a fully
+commented template covering every pipeline option, each set to its built-in
+default — the file as written changes nothing about a run. It refuses to
+clobber an existing file without `--force`. Dispatch is on the literal first
+token: a data file named `init` in the current directory becomes the
+subcommand — run it as `ppgrid ./init` (any path form works).
+
+Unknown keys (including TOML table headers) warn and are ignored; a value
+the flag's own checker rejects (wrong type, out of range, unknown preset)
+is a usage error, exit 2. `--ram-gb` is CLI-only (the config key is
+`max-ram`); `--plan` and the logging/presentation flags are not config-able.
+
+```toml
+# ppgrid.toml — example overrides
+res = 10000
+transform = "log10"
+workers = 8
+```
+
+### Run fingerprint (`ppgrid_run.json`)
+
+Every successful run writes `<out>/ppgrid_run.json`: the effective
+parameters (after the flag > config > default merge), the config file used
+(or `null`), the input file name, tool versions (ppgrid, python, numpy,
+rasterio, gdal, pyproj), an ISO-8601 UTC timestamp, and a `fingerprint` —
+the sha256 of the canonical (sorted-keys) parameter JSON. The timestamp is
+never part of the fingerprint, so two runs with identical effective
+parameters share one fingerprint; change any parameter and it changes.
+The sidecar is metadata only: it does not block re-runs (the overwrite
+guard watches the rasters and `run_summary.json`).
 
 ### Subcommands
 
