@@ -49,6 +49,18 @@ jobs:
       - run: uv run --extra dev ruff check .
       - run: uv run --extra dev ruff format --check .
       - run: uv run pytest
+      - name: FMA contraction probe report (darwin arm64 mechanism evidence)
+        # The probe test writes /tmp/ppgrid-fma-probe.txt; always() so the
+        # report reaches the log even when pytest goes red (PR #128 FMA
+        # fix-round iteration 1: 15 bit-identity failures expected, probe
+        # itself passes — it documents the mechanism).
+        if: always()
+        run: |
+          if [ -f /tmp/ppgrid-fma-probe.txt ]; then
+            cat /tmp/ppgrid-fma-probe.txt
+          else
+            echo "(no FMA probe report: non-darwin platform, or probe skipped)"
+          fi
       - name: Anchor gate (byte-exact on canonical x86_64 Linux; functional-equivalence elsewhere)
         run: uv run python bench/check_anchors.py
 

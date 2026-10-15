@@ -3,9 +3,10 @@
 ``PercentileTransform.fwd``/``inv`` (ppgrid.calibrate) run one
 ``np.interp`` per block in the hot write path. ``ppgrid.cinterp.c`` clones
 the element arithmetic of numpy 2.5.x ``compiled_base.c`` (BSD-3) with the
-same IEEE op order (``slope * (x - xp[j]) + fp[j]``, no FMA at -O3 x86-64
-baseline), so the output floats are bit-identical to ``np.interp`` for any
-xp/fp/x. The search is where the win comes from: numpy's persistent
+same IEEE op order as numpy's wheel on the same platform: non-contracted
+mul+add on x86-64 (baseline ISA has no FMA) and a single FMA on darwin
+arm64 (matching numpy's macosx_14_0_arm64 wheels), so the output floats
+are bit-identical to ``np.interp`` for any xp/fp/x. The search is where the win comes from: numpy's persistent
 warm-start guess only hits when consecutive elements land in the same node
 bin; on real interpolated blocks the rank index moves several nodes per
 element, so most elements pay the ~10-step bisection (~50-60 ns/element
@@ -45,6 +46,7 @@ import importlib.machinery
 import importlib.util
 import os
 import subprocess
+import sys
 import sysconfig
 import tempfile
 from collections.abc import Callable
@@ -127,7 +129,27 @@ def _build(src: Path, dst: Path) -> bool:
     """Compile src into dst; True on success. Never raises."""
     global _build_err
     inc = sysconfig.get_paths().get("include", "")
-    cmd_base = ["-O3", "-ffp-contract=off", "-fPIC", "-shared", "-fvisibility=hidden"]
+    if sys.platform == "darwin":
+        # darwin arm64: numpy's wheel compiles the interp element loop
+        # `slope * (x - xp[j]) + fp[j]` into a single FMA (fmadd — verified
+        # by disassembling the macosx_14_0_arm64 wheels, numpy 2.4.6 + 2.5.1,
+        # symbol _arr_interp). The kernel must contract the same way or it
+        # diverges 1 ulp from np.interp (PR #128 fix-round probe). FMA is in
+        # the arm64 base ISA; on x86_64 Mac the baseline has no FMA, so the
+        # flag is a no-op there. Non-darwin keeps -ffp-contract=off byte-for-
+        # byte: GCC's C default is FP_CONTRACT=off, which is how numpy's
+        # manylinux/Windows wheels build (no FMA).
+        contract = "-ffp-contract=fast"
+    else:
+        contract = "-ffp-contract=off"
+    cmd_base = ["-O3", contract, "-fPIC", "-shared", "-fvisibility=hidden"]
+    if sys.platform == "darwin":
+        # macOS ld resolves the Python C-API symbols at LOAD time (the
+        # interpreter maps libpython into the extension), not at link time.
+        # Raw cc omits the -undefined dynamic_lookup that
+        # distutils/setuptools add, so the link dies with
+        # "symbol(s) not found for architecture arm64" (issue #123).
+        cmd_base += ["-undefined", "dynamic_lookup"]
     compilers = [os.environ.get("CC", "")] if os.environ.get("CC") else []
     compilers += ["cc", "gcc", "clang"]
     for compiler in compilers:

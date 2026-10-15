@@ -8,11 +8,16 @@ where the C module is required, skip cleanly when no compiler is present.
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import hashlib
 import os
+import platform
 import subprocess
 import sys
+import sysconfig
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +28,150 @@ import ppgrid._cinterp as ci
 from ppgrid.calibrate import PercentileTransform
 
 C = pytest.mark.skipif(not ci.available(), reason="C kernel unavailable (np.interp fallback active)")
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS-only: the CI macos leg must FAIL (not skip) if the JIT C build regresses",
+)
+def test_macos_c_kernel_required() -> None:
+    """Hard gate for the macOS CI leg (review minor-1, #123).
+
+    The C-requiring tests above skip when the kernel is unavailable, so a
+    regressed darwin link would otherwise leave every macos leg green via
+    skips + the bit-identical np.interp fallback. This assert makes the
+    leg red when the JIT build fails on macOS.
+    """
+    assert ci.available(), f"C kernel unavailable on macOS: {ci._reason}"
+
+
+# ---------------------------------------------------------------------------
+# FMA contraction probe (darwin arm64, PR #128 fix-round):
+#
+# numpy's macOS arm64 wheel compiles the interp element loop
+# `slope * (x - xp[j]) + fp[j]` into a single FMA (fmadd) — verified by
+# disassembling the macosx_14_0_arm64 wheels (numpy 2.4.6 and 2.5.1, exported
+# symbol _arr_interp: `fsub d0, d10, d0; fmadd d0, d1, d0, d2`). CPython float
+# ops never contract, so for some inputs a pure-Python `slope * (x - dx) + dy`
+# differs from np.interp by 1 ulp while the FMA-contracted value equals
+# np.interp bit-for-bit. This probe demonstrates exactly that split; evidence
+# goes to FMA_PROBE_REPORT, which the ci.yml test job cats into the log.
+# The C-kernel comparison is diagnostic only — the kernel's own bit-identity
+# contract is asserted by the test_bit_identity_* tests.
+# ---------------------------------------------------------------------------
+
+FMA_PROBE_REPORT = Path("/tmp/ppgrid-fma-probe.txt")
+
+
+def _fma_c_helper(tmp_path: pytest.TempPath) -> tuple[Callable[[float, float, float], float], str]:
+    """Compile a `a * b + c` helper with -ffp-contract=fast (py < 3.13 legs)."""
+    src = tmp_path / "fma_probe.c"
+    dst = tmp_path / "fma_probe.so"
+    src.write_text(
+        "double ppgrid_fma_probe(double a, double b, double c)\n{\n    return a * b + c;\n}\n", encoding="utf-8"
+    )
+    for compiler in ("cc", "gcc", "clang"):
+        try:
+            subprocess.run(
+                [compiler, "-O3", "-ffp-contract=fast", "-fPIC", "-shared", str(src), "-o", str(dst)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        lib = ctypes.CDLL(str(dst))
+        lib.ppgrid_fma_probe.restype = ctypes.c_double
+        lib.ppgrid_fma_probe.argtypes = [ctypes.c_double, ctypes.c_double, ctypes.c_double]
+        return functools.partial(lib.ppgrid_fma_probe), "C helper (cc -O3 -ffp-contract=fast)"
+    pytest.skip("no C compiler for the FMA probe")
+
+
+def _fma_fn(tmp_path: pytest.TempPath) -> tuple[Callable[[float, float, float], float], str]:
+    """Fused multiply-add: math.fma (py3.13+) or a -ffp-contract=fast C helper."""
+    import math
+
+    fma = getattr(math, "fma", None)  # py < 3.13 has no math.fma
+    if fma is not None:
+        return fma, "math.fma"
+    return _fma_c_helper(tmp_path)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or platform.machine() not in ("arm64", "aarch64"),
+    reason="FMA probe: darwin arm64 only (numpy's wheel contracts there)",
+)
+def test_fma_contraction_probe(tmp_path: pytest.TempPath) -> None:
+    """Prove the darwin arm64 divergence mechanism (PR #128 fix-round).
+
+    (a) find inputs where a pure-Python slope*(x-dx)+dy (CPython floats,
+        which never contract) disagrees with np.interp bits, and
+    (b) show the FMA-contracted value agrees with np.interp bits on those
+        same inputs.
+    """
+    if not ci.available():
+        pytest.skip(f"C kernel not active; probe needs it ({ci.reason()})")
+    fma, fma_name = _fma_fn(tmp_path)
+
+    rng = np.random.default_rng(SEED + 21)
+    xp = np.sort(rng.uniform(1.0e4, 1.0e5, 1001))
+    fp = np.linspace(0.0, 100.0, 1001)
+    x = rng.uniform(xp[0] + 1.0, xp[-1] - 1.0, 1_000_000)  # interior keys: j in [0, lenxp-2]
+    slopes = _slopes(xp, fp)
+
+    ref = np.interp(x, xp, fp)
+    kernel = ci.interp(x, xp, fp, slopes)
+    j = np.searchsorted(xp, x, side="right") - 1
+    assert (j >= 0).all()
+    assert (j <= len(xp) - 2).all()
+
+    xl, xpl, fpl, sl, jl = x.tolist(), xp.tolist(), fp.tolist(), slopes.tolist(), j.tolist()
+    py = np.empty(len(x))
+    fv = np.empty(len(x))
+    for i in range(len(x)):
+        s = sl[jl[i]]
+        d = xl[i] - xpl[jl[i]]
+        py[i] = s * d + fpl[jl[i]]
+        fv[i] = fma(s, d, fpl[jl[i]])
+
+    refb, pyb, fvb, kerb = _bits(ref), _bits(py), _bits(fv), _bits(kernel)
+    n = len(x)
+    mismatch = np.flatnonzero(pyb != refb)
+    fma_on_mm = int((fvb[mismatch] == refb[mismatch]).sum()) if mismatch.size else 0
+
+    lines = [
+        "ppgrid FMA contraction probe (PR #128 fix-round)",
+        (
+            f"platform: {sys.platform}/{platform.machine()}  python {platform.python_version()}  "
+            f"numpy {np.__version__}  fma: {fma_name}"
+        ),
+        f"data: n={n}, lenxp={len(xp)}, interior uniform keys (seed {SEED + 21})",
+        f"pure-python mul+add   == np.interp bits: {int((pyb == refb).sum())}/{n}",
+        f"FMA (a*b+c)           == np.interp bits: {int((fvb == refb).sum())}/{n}",
+        f"C kernel (this build) == np.interp bits: {int((kerb == refb).sum())}/{n}   [diagnostic]",
+        f"C kernel (this build) == pure-python bits: {int((kerb == pyb).sum())}/{n}   [diagnostic]",
+    ]
+    for idx in mismatch[:3]:
+        i = int(idx)
+        bits = (
+            f"  np.interp bits={refb[i]:016x}   pure-py bits={pyb[i]:016x}   "
+            f"fma bits={fvb[i]:016x}   kernel bits={kerb[i]:016x}"
+        )
+        lines.extend(
+            [
+                f"mismatch i={i}: x={xl[i]!r}  dx={xpl[jl[i]]!r}  dy={fpl[jl[i]]!r}  slope={sl[jl[i]]!r}",
+                bits,
+            ]
+        )
+    lines.append(f"FMA == np.interp on the {mismatch.size} mismatched elements: {fma_on_mm}")
+    report = "\n".join(lines)
+    FMA_PROBE_REPORT.write_text(report + "\n", encoding="utf-8")
+    print(report, flush=True)
+
+    assert mismatch.size > 0, "pure-python mul+add must diverge from np.interp somewhere on darwin arm64"
+    assert fma_on_mm == mismatch.size, "FMA value must equal np.interp on every mismatched element"
+
 
 SEED = 20261011
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -276,6 +425,73 @@ def test_tmpdir_owner_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.Te
     assert imports == []  # the other-user .so was never imported
     assert ci._mod is None
     assert ci._reason is not None
+
+
+# ---------------------------------------------------------------------------
+# _build flag list: darwin uses -ffp-contract=fast + -undefined
+# dynamic_lookup (issue #123 + PR #128 fix-round); every other platform
+# keeps the exact baseline list, byte for byte.
+# ---------------------------------------------------------------------------
+
+
+def _capture_build(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> tuple[list[list[str]], Path, Path]:
+    """Point _build at a fake compiler and capture the exact cmd it assembles."""
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setenv("CC", "")  # first fallback compiler is deterministically "cc"
+    monkeypatch.setattr(ci.subprocess, "run", fake_run)
+    src = tmp_path / "cinterp.c"
+    src.write_text("static int x(void) { return 0; }\n")
+    dst = tmp_path / "built" / f"_cinterp_c-000000000000{ci._SO_SUFFIX}"
+    return cmds, src, dst
+
+
+def _expected_cmd(flags: list[str], src: Path, dst: Path) -> list[str]:
+    """Build the exact cmd _build emits for a flag list under the fake-cc capture."""
+    inc = sysconfig.get_paths().get("include", "")
+    cmd = ["cc", *flags]
+    if inc:
+        cmd.append(f"-I{inc}")
+    cmd += [str(src), "-o", str(dst)]
+    return cmd
+
+
+_BASELINE = ["-O3", "-ffp-contract=off", "-fPIC", "-shared", "-fvisibility=hidden"]
+# darwin (PR #128 fix-round): -ffp-contract=fast instead of =off — numpy's
+# darwin arm64 wheel contracts the interp element loop into a single FMA
+# (fmadd); the kernel must match. Plus -undefined dynamic_lookup (#123).
+_DARWIN = [
+    "-O3",
+    "-ffp-contract=fast",
+    "-fPIC",
+    "-shared",
+    "-fvisibility=hidden",
+    "-undefined",
+    "dynamic_lookup",
+]
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32", "freebsd14"])
+def test_build_cmd_baseline_other_platforms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath, platform: str
+) -> None:
+    """Non-darwin platforms keep the exact baseline flag list (issue #123)."""
+    monkeypatch.setattr(ci.sys, "platform", platform)
+    cmds, src, dst = _capture_build(monkeypatch, tmp_path)
+    assert ci._build(src, dst)
+    assert cmds == [_expected_cmd(_BASELINE, src, dst)]
+
+
+def test_build_cmd_darwin_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> None:
+    """Darwin flags: -ffp-contract=fast (numpy arm64 wheel contracts, PR #128) + dynamic_lookup (#123)."""
+    monkeypatch.setattr(ci.sys, "platform", "darwin")
+    cmds, src, dst = _capture_build(monkeypatch, tmp_path)
+    assert ci._build(src, dst)
+    assert cmds == [_expected_cmd(_DARWIN, src, dst)]
 
 
 def _pct() -> PercentileTransform:

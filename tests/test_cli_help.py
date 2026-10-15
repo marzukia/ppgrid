@@ -15,7 +15,6 @@ Covers the six acceptance items:
 import io
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -219,33 +218,31 @@ def _epilog_examples() -> list[list[str]]:
     return examples
 
 
-def test_epilog_examples_run_verbatim() -> None:
+def test_epilog_examples_run_verbatim(tmp_path: Path) -> None:
     """Every epilog example executes (exit 0) with in-repo inputs (item 4).
 
-    Slow: example 2 is a global 500 m run (minutes on a small box). The
-    out dirs the examples name are cleaned first so the runs stay verbatim
-    (no --force needed; re-runs are idempotent).
+    Slow: example 2 is a global 500 m run (minutes on a small box). Runs in a
+    scratch dir with a data/ symlink into the repo, so the argv stays verbatim
+    while the checkout root needs no write access (ownerless pi-bg wrapper
+    runs execute as another user, review info-1).
     """
     examples = _epilog_examples()
     assert len(examples) == 3
-    out_dirs: list[Path] = []
     for argv in examples:
         assert argv[0] == "ppgrid"
         assert (REPO_ROOT / argv[1]).is_file(), f"epilog example input missing from repo: {argv[1]}"
-        if "-o" in argv:
-            out_dirs.append(REPO_ROOT / argv[argv.index("-o") + 1])
-    for d in out_dirs:
-        shutil.rmtree(d, ignore_errors=True)
+    (tmp_path / "data").symlink_to(REPO_ROOT / "data")
     for argv in examples:
         cmd = [sys.executable, "-m", "ppgrid", *argv[1:]]
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800)
+        proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, timeout=1800)
         assert proc.returncode == 0, (
             f"epilog example failed (exit {proc.returncode}): {' '.join(cmd)}\n"
             f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
         )
-    for d in out_dirs:
-        assert (d / "value.tif").is_file(), f"missing value.tif in {d}"
-        assert (d / "support_km.tif").is_file(), f"missing support_km.tif in {d}"
+        if "-o" in argv:
+            d = tmp_path / argv[argv.index("-o") + 1]
+            assert (d / "value.tif").is_file(), f"missing value.tif in {d}"
+            assert (d / "support_km.tif").is_file(), f"missing support_km.tif in {d}"
 
 
 # ---------------------------------------------------------------------------
