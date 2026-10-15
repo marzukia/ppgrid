@@ -1,10 +1,11 @@
-"""Verify rasterio/pyproj/rich are lazy-loaded (not imported by `import ppgrid`).
+"""Verify rasterio/pyproj/pandas/rich are lazy-loaded (not imported by `import ppgrid`).
 
-The CLI and library only need the native stack (rasterio+pyproj+GDAL) and
-the terminal-render stack (ui -> rich) at first use (ingest/warp/write/
-CLI), so importing ppgrid must not pay those costs. Regression guard for
-the PEP 562 lazy-import layer in pipeline.py / zstdmt.py (rich + ui since
-issue #109).
+The CLI and library only need the native stack (rasterio+pyproj+GDAL),
+pandas, and the terminal-render stack (ui -> rich) at first use
+(ingest/warp/write/CLI), so importing ppgrid must not pay those costs.
+Regression guard for the PEP 562 lazy-import layer in pipeline.py /
+zstdmt.py (rich + ui since issue #109; pandas since the lazy-`pd` change,
+which kept module-level `import pandas` out of the CLI import path).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ _NOT_LOADED = (
     "import sys, ppgrid, ppgrid.pipeline, ppgrid.zstdmt\n"
     "assert 'rasterio' not in sys.modules, 'rasterio loaded at import time'\n"
     "assert 'pyproj' not in sys.modules, 'pyproj loaded at import time'\n"
+    "assert 'pandas' not in sys.modules, 'pandas loaded at import time'\n"
     "assert 'rich' not in sys.modules, 'rich loaded at import time'\n"
     "assert 'ppgrid.ui' not in sys.modules, 'ppgrid.ui loaded at import time'\n"
 )
@@ -50,6 +52,9 @@ _HELP_CHECK = (
     "    assert e.code in (0, None), f'--help exited {e.code}'\n"
     "assert 'rasterio' not in sys.modules, 'rasterio loaded by --help'\n"
     "assert 'pyproj' not in sys.modules, 'pyproj loaded by --help'\n"
+    "assert 'pandas' not in sys.modules, 'pandas loaded by --help'\n"
+    "assert 'rich' not in sys.modules, 'rich loaded by --help'\n"
+    "assert 'ppgrid.ui' not in sys.modules, 'ppgrid.ui loaded by --help'\n"
 )
 
 
@@ -77,7 +82,7 @@ def test_package_import_is_lazy() -> None:
 
 
 def test_cli_help_defers_native_modules() -> None:
-    """Running `ppgrid --help` exits 0 without loading rasterio or pyproj."""
+    """Running `ppgrid --help` exits 0 without loading rasterio, pyproj, pandas or rich."""
     result = _fresh_python(_HELP_CHECK)
     assert result.returncode == 0, result.stderr
 
@@ -105,6 +110,13 @@ def test_lazy_names_resolve_and_cache() -> None:
     assert memory_dataset.__module__.startswith("rasterio")
     # resolution is cached in the module dict (second access is a plain lookup)
     assert pgrid.__dict__["reproject"] is reproject
+
+    # pandas-side name resolves to the real module (lazy `pd`): re-adding a
+    # module-level `import pandas as pd` to pipeline.py fails this and the
+    # import-time asserts above
+    import pandas as pd
+
+    assert pgrid.pd is pd
 
     # pyproj-side name
     tr = pgrid.Transformer.from_crs("EPSG:4326", "EPSG:6933", always_xy=True)
