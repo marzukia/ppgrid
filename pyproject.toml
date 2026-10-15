@@ -126,6 +126,8 @@ ignore = [
     "suspicious-subprocess-import",   # S404: own interpreter, fixed argv
     "subprocess-run-without-check",   # returncode asserted explicitly
     "subprocess-without-shell-equals-true",   # no shell, fixed argv
+    "hardcoded-temp-file",    # S108: FMA_PROBE_REPORT is the fixed CI contract (ci.yml cats it)
+    "print",   # T201: probe report echo (also surfaced by the ci.yml cat step)
 ]
 # tests/test_os_portability.py simulates other OSes: it pokes private state
 # (_MADVISE, _STATE, _read_physical_gb) and runs the venv interpreter directly.
