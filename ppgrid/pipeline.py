@@ -6423,17 +6423,23 @@ def main(argv: list[str] | None = None) -> None:
             2 (validation error), 3 (--turbo-strict infeasible) — as
             documented on _run_cli (propagated unchanged). Subcommands:
             doctor 0/1, probe 0/1/2, list-crs 0/1, init 0/1/2 (see
-            _run_subcommand).
+            _run_subcommand). SIGINT on either path is the run contract:
+            exit 130, one line, no traceback.
 
     """
     if argv is None:
         argv = sys.argv[1:]
     # Subcommands (issue #63, first batch: init) dispatch before the run
     # parser: the run CLI's positional/flag surface stays byte-identical
-    # (argparse cannot mix a bare positional with subparsers). A literal
-    # file named after the subcommand wins (same rule as `help`).
-    if argv and argv[0] in _SUBCOMMANDS and not Path(argv[0]).exists():
-        _run_subcommand(argv)
+    # (argparse cannot mix a bare positional with subparsers). Dispatch is
+    # on the literal first token (token-wins, same rule as the sibling
+    # diag/verify CLI branches): a data file named like the subcommand is
+    # run as `ppgrid ./init`. Interrupts keep the run contract (130).
+    if argv and argv[0] in _SUBCOMMANDS:
+        try:
+            _run_subcommand(argv)
+        except KeyboardInterrupt:
+            _interrupted_exit(None, None)
         return
     parser = _build_parser()
     out: Path | None = None

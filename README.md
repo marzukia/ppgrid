@@ -195,7 +195,9 @@ Discovery order:
 No file present is a silent no-op. `ppgrid init [DIR]` writes a fully
 commented template covering every pipeline option, each set to its built-in
 default — the file as written changes nothing about a run. It refuses to
-clobber an existing file without `--force`.
+clobber an existing file without `--force`. Dispatch is on the literal first
+token: a data file named `init` in the current directory becomes the
+subcommand — run it as `ppgrid ./init` (any path form works).
 
 Unknown keys (including TOML table headers) warn and are ignored; a value
 the flag's own checker rejects (wrong type, out of range, unknown preset)

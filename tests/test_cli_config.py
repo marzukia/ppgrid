@@ -473,12 +473,21 @@ def test_sidecar_not_written_on_plan_or_failure(isolated: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_file_named_like_subcommand_wins(isolated: Path) -> None:
-    """A literal file named 'init' is an input, not a subcommand (same rule as 'help')."""
+def test_subcommand_token_wins_over_same_named_file(isolated: Path) -> None:
+    """A file named `init` in the cwd: the bare token dispatches to the subcommand.
+
+    The bare `init` writes the ppgrid.toml template (subcommand, exit 0);
+    any path form (`./init`) runs the pipeline on that file. Dispatch is on
+    the literal first token (token-wins, same rule as the sibling branches);
+    README Config file documents it.
+    """
     (isolated / "init").write_text("value,longitude,latitude\n1.0,149.0,-35.0\n2.0,149.1,-35.1\n")
-    main(["init", "-o", str(isolated / "out"), "--res", "100", "--block", "2048", "--workers", "2"])
-    assert (isolated / "out" / "value.tif").is_file()
-    assert not (isolated / "ppgrid.toml").exists()
+    main(["init"])
+    assert (isolated / "ppgrid.toml").is_file()
+    out = isolated / "out"
+    main(["./init", "-o", str(out), "--res", "5000", "--block", "2048", "--workers", "2"])
+    assert (out / "value.tif").is_file()
+    assert (out / "support_km.tif").is_file()
 
 
 # ---------------------------------------------------------------------------
