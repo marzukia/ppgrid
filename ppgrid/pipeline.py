@@ -1161,6 +1161,7 @@ def _warp_dst_tile(
             dst_crs=dst_crs,
             resampling=Resampling.nearest,
             nodata=NODATA,
+            init_dest=NODATA,
         )
     return i0, buf
 
@@ -1226,6 +1227,7 @@ def _warp_dst_tile_arr(
         dst_crs=dst_crs,
         resampling=Resampling.nearest,
         nodata=NODATA,
+        init_dest=NODATA,
     )
     return i0, buf
 
