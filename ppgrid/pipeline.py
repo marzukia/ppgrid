@@ -5645,6 +5645,29 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     lon, lat, coord_problems = _probe_coordinate_cols(columns)
     problems += coord_problems
 
+    # Preflight parity with the run (#57): the run matches column names
+    # case-sensitively (_check_columns) against the exact defaults
+    # "longitude"/"latitude" (g_input) unless overridden with
+    # --lng-col/--lat-col. Alias names — and a single missing coordinate
+    # column — exit 2 there, so they are problems here too.
+    needed_flags: list[str] = []
+    if lon is not None and lon != "longitude":
+        needed_flags.append(f"--lng-col {lon!r}")
+    if lat is not None and lat != "latitude":
+        needed_flags.append(f"--lat-col {lat!r}")
+    if needed_flags:
+        problems.append(
+            f"a real run needs {' / '.join(needed_flags)} — the column names do not match the run "
+            "defaults 'longitude'/'latitude' (case-sensitive); it would exit 2 at preflight",
+        )
+    if (lon is None) != (lat is None):
+        missing = "longitude" if lon is None else "latitude"
+        flag = "--lng-col" if lon is None else "--lat-col"
+        problems.append(
+            f"only one coordinate column present — no {missing!r} column; a real run needs "
+            f"{flag} {missing!r} (the default) and would exit 2 at preflight",
+        )
+
     # Candidate sample (csv) + value-column check.
     sample: pd.DataFrame | None = None
     if label != "parquet" and columns:
@@ -5715,7 +5738,13 @@ def _cmd_probe(args: argparse.Namespace) -> int:
             import pyarrow as pa
 
             schema = pq_file.schema_arrow
-            cands = [name for name, t in zip(schema.names, schema.types, strict=True) if pa.types.is_numeric(t)]
+            # is_integer/is_floating cover every numeric pyarrow type the run
+            # pins to float64 (pa.types.is_numeric does not exist; pyarrow 25).
+            cands = [
+                name
+                for name, t in zip(schema.names, schema.types, strict=True)
+                if pa.types.is_integer(t) or pa.types.is_floating(t)
+            ]
         except Exception:  # ruff: ignore[blind-except]
             cands = []
         cand_line = ", ".join(cands) if cands else "none"

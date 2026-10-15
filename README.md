@@ -179,7 +179,9 @@ ppgrid help
 
 Read-only diagnostics — they write no output files (doctor's oracle probe
 uses one throwaway tile under the temp dir). Run `ppgrid <subcommand> --help`
-for detail.
+for detail. Dispatch is on the literal first token: a data file named
+`doctor`, `probe`, or `list-crs` in the current directory becomes the
+subcommand — run it as `ppgrid ./doctor` (any path form works).
 
 ```bash
 # Stack health: python/ppgrid/numpy/rasterio/GDAL/pyproj versions, the zstd

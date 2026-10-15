@@ -108,6 +108,36 @@ def test_unknown_first_token_is_run_input(tmp_path: Path) -> None:
     assert "nosuchfile_xyz.csv" in proc.stderr
 
 
+def test_subcommand_name_collision(tmp_path: Path) -> None:
+    """A file named `doctor` in the cwd: the bare token dispatches to the subcommand.
+
+    The data file is swallowed (`ppgrid doctor`); any path form
+    (`ppgrid ./doctor`) runs the pipeline. Dispatch is on the literal argv[0];
+    README Subcommands documents it.
+    """
+    (tmp_path / "doctor").write_text(GOOD_CSV, encoding="utf-8")
+    bare = subprocess.run(
+        [sys.executable, "-m", "ppgrid", "doctor"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert bare.returncode == 0, bare.stderr
+    assert re.search(r"^python\s", bare.stdout, re.MULTILINE), bare.stdout
+    out = tmp_path / "out"
+    pathed = subprocess.run(
+        [sys.executable, "-m", "ppgrid", "./doctor", "-o", str(out)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert pathed.returncode == 0, pathed.stderr
+    assert (out / "value.tif").is_file()
+    assert (out / "support_km.tif").is_file()
+
+
 def test_subcommand_helps() -> None:
     """Each subcommand has --help; the run --help mentions them."""
     for name in ("doctor", "probe", "list-crs"):
@@ -295,6 +325,54 @@ def test_probe_value_col_override(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert "value col:  'price'" in proc.stdout
     assert "points kept:             2" in proc.stdout
+
+
+def test_probe_alias_coordinate_names_exit1(tmp_path: Path) -> None:
+    """Alias lon/lat names: exit 1 naming the flags a real run needs.
+
+    The run matches the exact defaults 'longitude'/'latitude'
+    case-sensitively (_check_columns) and exits 2 at preflight otherwise.
+    """
+    csv = _write_csv(tmp_path / "in.csv", "value,lon,lat\n1.5,144.96,-37.81\n2.5,145.0,-37.82\n")
+    proc = _cli("probe", csv)
+    assert proc.returncode == 1
+    out = proc.stdout
+    assert "--lng-col 'lon'" in out
+    assert "--lat-col 'lat'" in out
+    assert "verdict:    ok" not in out
+
+
+def test_probe_lon_only_exit1(tmp_path: Path) -> None:
+    """A single missing coordinate column: exit 1, no 'verdict: ok'.
+
+    The run exits 2 at preflight for a missing --lat-col column too.
+    """
+    csv = _write_csv(tmp_path / "in.csv", "value,longitude\n1.5,144.96\n2.5,145.0\n")
+    proc = _cli("probe", csv)
+    assert proc.returncode == 1
+    assert "no 'latitude' column" in proc.stdout
+    assert "verdict:    ok" not in proc.stdout
+
+
+def test_probe_parquet_numeric_candidates(tmp_path: Path) -> None:
+    """Parquet numeric candidates name the real numeric columns, not 'none'."""
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    table = pa.table(
+        {
+            "value": [1.5, 2.5],
+            "longitude": [144.96, 145.0],
+            "latitude": [-37.81, -37.82],
+            "tag": ["a", "b"],
+        }
+    )
+    path = tmp_path / "in.parquet"
+    pq.write_table(table, path)
+    proc = _cli("probe", path)
+    assert proc.returncode == 0, proc.stderr
+    assert "numeric candidates: value, longitude, latitude" in proc.stdout
+    assert "(run default 'value' present)" in proc.stdout
 
 
 def test_probe_unknown_work_crs_exit2(tmp_path: Path) -> None:
