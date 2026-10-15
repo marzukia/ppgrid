@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from ppgrid import turbop
-from ppgrid.pipeline import _build_parser, _resolve_log_level, main
+from ppgrid.pipeline import _build_parser, _parse_args_cli, _resolve_log_level, main
 
 
 def _tiny_csv(tmp_path: Path) -> str:
@@ -297,17 +297,17 @@ def test_missing_column_in_plan_mode(tmp_path: Path, capsys: pytest.CaptureFixtu
 def test_epsg_string_parsing(tmp_path: Path) -> None:
     """--src-crs / --work-crs / --out-crs accept 'EPSG:<code>' and bare ints."""
     p = _build_parser()
-    a = p.parse_args(["in.csv", "--src-crs", "EPSG:4326", "--work-crs", "epsg:6933", "--out-crs", "3857"])
+    a = _parse_args_cli(p, ["in.csv", "--src-crs", "EPSG:4326", "--work-crs", "epsg:6933", "--out-crs", "3857"])
     assert (a.src_crs, a.work_crs, a.out_crs) == (4326, 6933, 3857)
-    a = p.parse_args(["in.csv", "--src-crs", "4326"])  # bare int still valid
+    a = _parse_args_cli(p, ["in.csv", "--src-crs", "4326"])  # bare int still valid
     assert a.src_crs == 4326
     for bad in ("EPSG:abc", "nope", "EPSG:", ""):
         with pytest.raises(SystemExit) as exc:
-            p.parse_args(["in.csv", "--out-crs", bad])
+            _parse_args_cli(p, ["in.csv", "--out-crs", bad])
         assert exc.value.code == 2
     # The parser accepts any int (incl. negative); main()'s validation rejects
     # non-positive codes with parser.error (exit 2).
-    assert p.parse_args(["in.csv", "--src-crs", "EPSG:-1"]).src_crs == -1
+    assert _parse_args_cli(p, ["in.csv", "--src-crs", "EPSG:-1"]).src_crs == -1
     csv = _tiny_csv(tmp_path)
     with pytest.raises(SystemExit) as exc:
         main([str(csv), "-o", str(tmp_path / "out"), "--src-crs", "EPSG:-1"])
@@ -322,11 +322,11 @@ def test_epsg_string_parsing(tmp_path: Path) -> None:
 def test_workers_auto() -> None:
     """--workers auto resolves to os.cpu_count(); ints stay valid; junk exits 2."""
     p = _build_parser()
-    assert p.parse_args(["in.csv", "--workers", "auto"]).workers == os.cpu_count()
-    assert p.parse_args(["in.csv", "--workers", "Auto"]).workers == os.cpu_count()  # case-insensitive
-    assert p.parse_args(["in.csv", "--workers", "7"]).workers == 7
+    assert _parse_args_cli(p, ["in.csv", "--workers", "auto"]).workers == os.cpu_count()
+    assert _parse_args_cli(p, ["in.csv", "--workers", "Auto"]).workers == os.cpu_count()  # case-insensitive
+    assert _parse_args_cli(p, ["in.csv", "--workers", "7"]).workers == 7
     with pytest.raises(SystemExit) as exc:
-        p.parse_args(["in.csv", "--workers", "x"])
+        _parse_args_cli(p, ["in.csv", "--workers", "x"])
     assert exc.value.code == 2
     # --workers 0 still fails the >= 1 validation in main (exit 2).
     with pytest.raises(SystemExit) as exc:
