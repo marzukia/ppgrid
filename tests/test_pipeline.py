@@ -1351,14 +1351,14 @@ def _small_df(n: int = 40, seed: int = 0) -> pd.DataFrame:
 def test_transform_choices_pinned(tmp_path: Path) -> None:
     """--transform choices must equal auto + the calibrate.transforms() factory names."""
     from ppgrid.calibrate import transforms
-    from ppgrid.pipeline import _build_parser
+    from ppgrid.pipeline import _build_parser, _parse_args_cli
 
     parser = _build_parser()
     for name in ["auto"] + [t.name for t in transforms()]:
-        args = parser.parse_args(["x", "-o", str(tmp_path / "o"), "--transform", name])
+        args = _parse_args_cli(parser, ["x", "-o", str(tmp_path / "o"), "--transform", name])
         assert args.transform == name
     with pytest.raises(SystemExit):
-        parser.parse_args(["x", "-o", str(tmp_path / "o"), "--transform", "not_a_transform"])
+        _parse_args_cli(parser, ["x", "-o", str(tmp_path / "o"), "--transform", "not_a_transform"])
 
 
 def test_map_pipeline_errors_widened() -> None:

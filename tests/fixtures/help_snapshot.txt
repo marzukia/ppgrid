@@ -8,16 +8,26 @@ usage: ppgrid [-h] [--version] [--value-col VALUE_COL] [--lng-col LNG_COL]
               [--calibration CALIBRATION] [--workers WORKERS]
               [--max-band-parallel MAX_BAND_PARALLEL] [--turbo [GB]]
               [--max-ram GB] [--ram-gb GB] [--turbo-strict] [-o OUT]
-              [--compress COMPRESS] [--force] [--json] [--plan] [--quiet]
-              [--color {auto,always,never}] [--verbose]
+              [--compress COMPRESS] [--force] [--json] [--plan] [--check]
+              [--quiet] [--color {auto,always,never}] [--verbose]
               [--log-level {error,warning,info,debug}] [--log-file PATH]
               [--config PATH]
-              [input]
+              [input] {doctor,probe,list-crs,init,compare,completions} ...
 
-Pull-push scattered-data interpolation Read-only subcommands (they write no output files): `ppgrid doctor` (stack health), `ppgrid probe INPUT` (input diagnostic), `ppgrid list-crs` (CRS codes). `ppgrid doctor --help` etc. for detail.
+Pull-push scattered-data interpolation Read-only subcommands (they write no output files): `ppgrid doctor` (stack health), `ppgrid probe INPUT` (input diagnostic), `ppgrid list-crs` (CRS codes), `ppgrid compare OUT1 OUT2` (diff two run outputs), `ppgrid completions bash|zsh` (shell completions). `ppgrid doctor --help` etc. for detail.
 
 positional arguments:
   input                 CSV or Parquet input path
+  {doctor,probe,list-crs,init,compare,completions}
+    doctor              runtime stack health report
+    probe               input diagnostic (format, columns, rows, CRS,
+                        projection)
+    list-crs            list the supported and known CRS codes
+    init                write a fully commented ppgrid.toml template
+    compare             Compare two ppgrid outputs (out dirs or GeoTIFFs);
+                        exit 0 identical / 1 different / 2 usage
+    completions         Print shell completions (bash or zsh), generated from
+                        the live parser
 
 options:
   -h, --help            show this help message and exit
@@ -87,6 +97,11 @@ output:
                         grid, calibration, CLI params; stdout stays clean)
   --plan                Resolve the full run plan, print it, and exit 0 before
                         running; creates no files or directories
+  --check               After writing, reopen the outputs and verify them
+                        against the run plan (files, band readability, shape,
+                        transform, CRS, nodata tag, tiles, out-of-coverage
+                        corners); on mismatch log the exact field, keep the
+                        outputs, and exit 1 (default: off)
 
 logging:
   --quiet, -q           Suppress stderr below WARNING (beats --verbose and
@@ -119,6 +134,10 @@ examples:
 
   # Turbo: 32 GB RAM budget, strict (exit 3 if infeasible), 8 workers.
   ppgrid data/melb_houses.csv -o out/melb_turbo --turbo 32 --turbo-strict --workers 8 --value-col price
+
+  # Verify: compare two run outputs (out dirs or GeoTIFFs); exit 0 identical,
+  # 1 different, 2 usage error
+  ppgrid compare out/melb_10km out/melb_10km
 
 progress logging:
   Progress goes to stderr (stdout stays clean). Default level is info (one line
