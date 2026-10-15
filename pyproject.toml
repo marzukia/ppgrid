@@ -171,6 +171,14 @@ ignore = [
     "subprocess-run-without-check",    # returncode asserted explicitly
     "subprocess-without-shell-equals-true",    # fixed argv, no shell
 ]
+# tests/test_cli_subcommands.py drives the subcommand CLI in fresh
+# interpreters ([sys.executable, -m ppgrid, ...] fixed argv, returncode
+# asserted explicitly) and pins the run-path dispatch.
+"tests/test_cli_subcommands.py" = [
+    "suspicious-subprocess-import",   # S404: own interpreter, fixed argv
+    "subprocess-run-without-check",   # returncode asserted explicitly
+    "subprocess-without-shell-equals-true",   # no shell, fixed argv
+]
 # tests/test_cli_interrupt.py spawns the venv interpreter to send it SIGINT
 # mid-run, and pokes private state (_EPILOG, _turbo_precheck); no_unlink must
 # keep Path.unlink's boolean signature.

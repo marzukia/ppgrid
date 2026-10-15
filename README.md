@@ -175,9 +175,38 @@ ppgrid help
 | `-q, --quiet` | False | Suppress stderr below WARNING (beats `--verbose` / `LOGGING`; an explicit `--log-level` wins) |
 | `--color` | (none) = auto | Color output: `auto` (TTY, no NO_COLOR/TERM=dumb), `always`, `never` (live progress also needs a TTY stderr and no `--quiet`) |
 
+### Subcommands
+
+Read-only diagnostics — they write no output files (doctor's oracle probe
+uses one throwaway tile under the temp dir). Run `ppgrid <subcommand> --help`
+for detail. Dispatch is on the literal first token: a data file named
+`doctor`, `probe`, or `list-crs` in the current directory becomes the
+subcommand — run it as `ppgrid ./doctor` (any path form works).
+
+```bash
+# Stack health: python/ppgrid/numpy/rasterio/GDAL/pyproj versions, the zstd
+turbo oracle status (which turbo write path this stack takes), the C interp
+kernel, RAM (physical + cgroup ceiling), temp dir. Exit 0 all pass, 1 with
+failing checks named (a warn — e.g. the zstd oracle mismatch or the
+np.interp fallback — is a byte-identical path and does not fail).
+ppgrid doctor
+
+# Input diagnostic: format (incl. compressed-CSV magic), columns, streamed
+row count, numeric --value-col candidates, a CRS guess, then the SAME
+projection validation a real run does (non-finite / out-of-domain /
+non-finite-projection drops, kept-point domain) for --work-crs.
+# Exit 0 clean, 1 problem(s) found, 2 unknown --work-crs code.
+ppgrid probe data/in.csv --work-crs 6933 --value-col price
+
+# CRS codes: the curated ppgrid set by default (4326/3577/6933/3857 + UTM
+# examples), the full pyproj/EPSG database with --all.
+ppgrid list-crs
+ppgrid list-crs --all
+```
+
 ### Exit codes
 
-- `0` — success (also `ppgrid help` and `--plan`)
+- `0` — success (also `ppgrid help`, `--plan`, and the subcommands' clean runs)
 - `1` — pipeline / I/O error (bad output path, missing input file, disk full)
 - `2` — validation error (bad flag value, missing input column, out dir not empty without `--force`)
 - `3` — `--turbo-strict`: shared path infeasible under the RAM budget

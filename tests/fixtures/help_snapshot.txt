@@ -13,7 +13,7 @@ usage: ppgrid [-h] [--version] [--value-col VALUE_COL] [--lng-col LNG_COL]
               [--log-level {error,warning,info,debug}]
               [input]
 
-Pull-push scattered-data interpolation
+Pull-push scattered-data interpolation Read-only subcommands (they write no output files): `ppgrid doctor` (stack health), `ppgrid probe INPUT` (input diagnostic), `ppgrid list-crs` (CRS codes). `ppgrid doctor --help` etc. for detail.
 
 positional arguments:
   input                 CSV or Parquet input path

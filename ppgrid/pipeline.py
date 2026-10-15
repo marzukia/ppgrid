@@ -20,6 +20,7 @@ import shutil
 import struct
 import subprocess  # ruff: ignore[suspicious-subprocess-import] — git rev-parse for the --json summary
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -2112,6 +2113,31 @@ def _read_csv_chunk(
     return {c: df[c].to_numpy(dtype=np.float64) for c in wanted}
 
 
+def _sniff_compression(data: bytes) -> str | None:
+    """Compression magic from a file's leading bytes (None = uncompressed).
+
+    The magics the parallel CSV split sniffs (issue #80): gzip, bzip2, zip,
+    xz. `ppgrid probe` (issue #62) reuses this to report the input format,
+    so the two surfaces can never drift.
+
+    Args:
+        data: Leading bytes of the file (5+ recommended; shorter is fine).
+
+    Returns:
+        'gzip' / 'bzip2' / 'zip' / 'xz', or None when uncompressed.
+
+    """
+    if data[:2] == b"\x1f\x8b":
+        return "gzip"
+    if data[:3] == b"BZh":
+        return "bzip2"
+    if data[:4] == b"PK\x03\x04":
+        return "zip"
+    if data[:5] == b"\xfd7zXZ":
+        return "xz"
+    return None
+
+
 def _csv_chunk_tasks(
     path: str,
     wanted: list[str],
@@ -2139,13 +2165,7 @@ def _csv_chunk_tasks(
         # Empty or compressed input cannot be split by raw byte offsets: pandas
         # cannot sniff compression from a byte buffer, so the serial parse
         # (which reads via the path) is the only correct read (issue #80).
-        if (
-            not data
-            or data[:2] == b"\x1f\x8b"  # gzip
-            or data[:3] == b"BZh"  # bzip2
-            or data[:4] == b"PK\x03\x04"  # zip
-            or data[:5] == b"\xfd7zXZ"  # xz (5-byte magic; review M-1)
-        ):
+        if not data or _sniff_compression(data) is not None:
             return None
         nl = np.flatnonzero(np.frombuffer(data, dtype=np.uint8) == 10)
         n_nl = int(nl.size)
@@ -4948,6 +4968,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Progress log level on stderr (default: info; env LOGGING; 'verbose' = debug)",
     )
+    # Subcommand discoverability (#61 #62 #69): one-line append; the parsers
+    # themselves live in _build_subcommand_parser (see the section note).
+    parser.description += (
+        " Read-only subcommands (they write no output files): `ppgrid doctor` (stack health), "
+        "`ppgrid probe INPUT` (input diagnostic), `ppgrid list-crs` (CRS codes). "
+        "`ppgrid doctor --help` etc. for detail."
+    )
     return parser
 
 
@@ -5054,28 +5081,834 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         raise SystemExit(0)
 
 
+# ---------------------------------------------------------------------------
+# Read-only subcommands (#61 #62 #69): doctor, probe, list-crs.
+#
+# Dispatched in main() on argv[0] BEFORE the run parser is built. They are
+# a separate top-level parser, not subparsers of the run parser: the run
+# CLI's optional `input` positional (nargs="?") sits before any subparser
+# positional in the same parser and would swallow the command token
+# ("ppgrid doctor" -> input="doctor", "invalid choice"). Keeping the run
+# parser itself untouched (it gains only the one-line description append)
+# leaves every run-path byte identical. Each subcommand is read-only: no
+# output files (doctor's oracle probe writes one throwaway tile under the
+# temp dir). Their reports go to stdout like --plan; unexpected errors are
+# one named line on stderr + exit 1, like the run CLI.
+# ---------------------------------------------------------------------------
+
+_SUBCOMMANDS: tuple[str, ...] = ("doctor", "probe", "list-crs")
+
+_DOCTOR_MARK: dict[str, str] = {"pass": "[ok]", "warn": "[warn]", "fail": "[fail]"}
+
+# Curated ppgrid CRS set for `ppgrid list-crs` (issue #69):
+# (code, role, one-line note). Names are resolved at runtime from the
+# pyproj database (they vary by PROJ version); the notes are the ppgrid
+# guidance. UTM examples: 326xx = northern hemisphere, 327xx = southern.
+_CURATED_CRS: tuple[tuple[int, str, str], ...] = (
+    (4326, "input default (--src-crs)", "WGS 84 lon/lat in degrees; probe assumes this for lon/lat-looking columns"),
+    (3577, "example --work-crs (Australia)", "GDA94 / Australian Albers; national equal-area work CRS (AU scale)"),
+    (6933, "working CRS default (--work-crs)", "WGS 84 / NSIDC EASE-Grid 2.0 Global (Wagner VII); global equal-area"),
+    (3857, "output CRS default (--out-crs)", "WGS 84 / Pseudo-Mercator (Web Mercator); the final GeoTIFF CRS"),
+    (32633, "UTM example (US West)", "WGS 84 / UTM zone 33N; 120-114 W (California)"),
+    (32755, "UTM example (Melbourne)", "WGS 84 / UTM zone 55S; 150-144 E (Victoria)"),
+    (32756, "UTM example (Sydney)", "WGS 84 / UTM zone 56S; 156-150 E (New South Wales)"),
+)
+
+# probe limits: the candidate sample (first N rows, all columns) and the
+# streaming row-count / validation chunk size (one chunk held in memory).
+_PROBE_SAMPLE: int = 100_000
+_PROBE_CHUNK: int = 1_000_000
+_LON_NAMES: frozenset[str] = frozenset({"lon", "lng", "long", "longitude"})
+_LAT_NAMES: frozenset[str] = frozenset({"lat", "latitude"})
+
+
+def _build_subcommand_parser() -> argparse.ArgumentParser:
+    """Build the subcommand parser (read-only diagnostics, #61 #62 #69).
+
+    A separate top-level parser, dispatched on argv[0] in main() before the
+    run parser is built (see the section note above): the run CLI's
+    optional `input` positional would otherwise swallow the command token
+    before a subparser could validate it.
+
+    Returns:
+        The parser; `parse_args(argv)` with argv[0] a subcommand name.
+
+    """
+    parser = argparse.ArgumentParser(
+        prog="ppgrid",
+        description="ppgrid subcommands (read-only; they write no output files)",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+
+    sub.add_parser(
+        "doctor",
+        help="runtime stack health report",
+        description=(
+            "Runtime stack health report (issue #61): python/ppgrid/numpy/"
+            "rasterio/GDAL/pyproj versions, the zstd turbo oracle status, the C "
+            "interp kernel state, RAM, temp dir. Exit 0 = all pass, 1 = failing "
+            "checks named on stderr. Writes one throwaway oracle tile under the "
+            "temp dir; no output files."
+        ),
+    )
+
+    probe = sub.add_parser(
+        "probe",
+        help="input diagnostic (format, columns, rows, CRS, projection)",
+        description=(
+            "Input diagnostic (issue #62): detects the format (incl. compressed "
+            "CSV magic), reports columns, the streamed row count, numeric "
+            "--value-col candidates and a CRS guess, then runs the SAME "
+            "projection validation the pipeline runs (non-finite / out-of-"
+            "domain / non-finite-projection drops, kept-point domain) for the "
+            "given work CRS, reporting what a real run would do. Writes no "
+            "output files. Exit 0 = clean, 1 = problem(s) found, 2 = usage "
+            "error (unknown EPSG code)."
+        ),
+    )
+    probe.add_argument("input", help="CSV or Parquet input path")
+    probe.add_argument(
+        "--work-crs",
+        type=_crs_arg,
+        default=WORK_CRS,
+        help=f"Work CRS to validate the projection against, bare int or 'EPSG:<code>' (default: {WORK_CRS})",
+    )
+    probe.add_argument(
+        "--value-col",
+        default=None,
+        help="Value column to validate (default: the run default 'value'; numeric candidates are reported)",
+    )
+
+    list_crs = sub.add_parser(
+        "list-crs",
+        help="list the supported and known CRS codes",
+        description=(
+            "List CRS codes (issue #69): the curated ppgrid set by default "
+            "(input/working/output defaults plus UTM examples), the full "
+            "pyproj/EPSG CRS database with --all. pyproj loads after argument "
+            "parsing, so `list-crs --help` stays fast."
+        ),
+    )
+    list_crs.add_argument(
+        "--all",
+        action="store_true",
+        help="List the full pyproj/EPSG CRS database (default: the curated ppgrid set)",
+    )
+
+    return parser
+
+
+def _run_subcommand(argv: list[str]) -> None:
+    """Dispatch argv[0] in _SUBCOMMANDS to its handler (see main()).
+
+    Handler exit codes become the SystemExit code (0/1/2 per the
+    subcommand contract). argparse usage errors exit 2 on their own;
+    any other unexpected exception is one named error line + exit 1, not
+    a traceback (the run CLI's _run_cli contract).
+
+    Args:
+        argv: The full subcommand argv, argv[0] = the subcommand name.
+
+    Raises:
+        SystemExit: the subcommand's exit code (0/1/2).
+
+    """
+    parser = _build_subcommand_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "doctor":
+            code = _cmd_doctor()
+        elif args.command == "probe":
+            code = _cmd_probe(args)
+        else:  # list-crs
+            code = _cmd_list_crs(args)
+    except Exception as e:  # ruff: ignore[blind-except] — named error, no traceback
+        print(f"error: {args.command}: {type(e).__name__}: {e}", file=sys.stderr)  # ruff: ignore[print]
+        code = 1
+    raise SystemExit(code)
+
+
+# ---------------------------------------------------------------------------
+# doctor (issue #61): runtime stack health report.
+# Each check is a small named function returning (label, status, detail);
+# tests monkeypatch one to force a failure. status: pass / warn / fail —
+# only 'fail' flips the exit code (warn = degraded but correct behaviour,
+# e.g. the np.interp fallback and the zstd oracle mismatch are byte-identical
+# paths, so they warn, not fail).
+# ---------------------------------------------------------------------------
+
+
+def _doc_python() -> tuple[str, str, str]:
+    """Check: python version (fail below 3.11, the requires-python floor)."""
+    version = platform.python_version()
+    ok = sys.version_info >= (3, 11)
+    return ("python", "pass" if ok else "fail", version if ok else f"{version} (3.11+ required)")
+
+
+def _doc_ppgrid() -> tuple[str, str, str]:
+    """Check: installed ppgrid version (module-level; cheap, always present)."""
+    return ("ppgrid", "pass", __version__)
+
+
+def _doc_numpy() -> tuple[str, str, str]:
+    """Check: numpy version (module-level import; reaching here means it loaded)."""
+    return ("numpy", "pass", np.__version__)
+
+
+def _doc_rasterio() -> tuple[str, str, str]:
+    """Check: rasterio import (local import; doctor is a diagnostic, not hot)."""
+    try:
+        import rasterio
+    except Exception as e:  # ruff: ignore[blind-except] — any import failure is the report
+        return ("rasterio", "fail", f"import failed: {type(e).__name__}: {e}")
+    return ("rasterio", "pass", rasterio.__version__)
+
+
+def _doc_gdal() -> tuple[str, str, str]:
+    """Check: GDAL version via rasterio.gdal_version (warn if unreadable)."""
+    try:
+        import rasterio
+
+        version = rasterio.gdal_version()
+    except Exception as e:  # ruff: ignore[blind-except]
+        return ("gdal", "warn", f"version unreadable: {type(e).__name__}: {e}")
+    return ("gdal", "pass", version)
+
+
+def _doc_pyproj() -> tuple[str, str, str]:
+    """Check: pyproj import + PROJ version string."""
+    try:
+        import pyproj
+    except Exception as e:  # ruff: ignore[blind-except]
+        return ("pyproj", "fail", f"import failed: {type(e).__name__}: {e}")
+    proj = getattr(pyproj, "proj_version_str", None)
+    detail = pyproj.__version__ + (f" (PROJ {proj})" if proj else "")
+    return ("pyproj", "pass", detail)
+
+
+def _doc_zstdmt() -> tuple[str, str, str]:
+    """Check: CPL zstd availability + the pipeline's A.7 byte-exact oracle.
+
+    Writes one throwaway 500x512 ZSTD tile under the temp dir — the same
+    shape the pipeline's turbo precheck probe (Pipeline._turbo_zstd_ok)
+    uses — and runs zstdmt.oracle_check on it: ok -> the turbo parallel
+    ZSTD write path is live on this stack; unavailable / mismatch -> the
+    stock-codec parallel path (warn, not fail: bytes are identical).
+    """
+    if not zstdmt.available():
+        return ("zstdmt", "warn", "CPL zstd unavailable; turbo writes use the stock-codec parallel path")
+    tmp = Path(tempfile.mkdtemp(prefix="ppgrid-doctor-"))
+    try:
+        import rasterio
+        from rasterio.transform import from_origin
+
+        probe = tmp / "_zstd_oracle.tif"
+        gx = np.arange(500, dtype=np.int16) * 13
+        gy = np.arange(TILE_PX, dtype=np.int16) * 7
+        tile = (gx[None, :] + gy[:, None]).astype(np.int16)
+        with rasterio.open(
+            probe,
+            "w",
+            driver="GTiff",
+            dtype="int16",
+            width=500,
+            height=TILE_PX,
+            count=1,
+            nodata=NODATA,
+            crs=f"EPSG:{WORK_CRS}",
+            transform=from_origin(0, TILE_PX * DEFAULT_RES, DEFAULT_RES, DEFAULT_RES),
+            compress="ZSTD",
+            tiled=True,
+            blockxsize=TILE_PX,
+            blockysize=TILE_PX,
+            predictor=2,
+            BIGTIFF="IF_SAFER",
+        ) as dst:
+            dst.write(tile, 1)
+        verdict = zstdmt.oracle_check(probe, tile=0)
+    except Exception as e:  # ruff: ignore[blind-except]
+        return (
+            "zstdmt",
+            "warn",
+            f"oracle probe failed: {type(e).__name__}: {e}; turbo falls back to the stock-codec parallel path",
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if verdict.ok:
+        return ("zstdmt", "pass", "CPL zstd available; oracle byte-exact; turbo parallel ZSTD write is live")
+    return (
+        "zstdmt",
+        "warn",
+        (
+            f"oracle mismatch on this stack ({verdict.detail}); turbo uses the stock-codec parallel path; "
+            "output bytes identical"
+        ),
+    )
+
+
+def _doc_cinterp() -> tuple[str, str, str]:
+    """Check: C interp kernel state (warn on the bit-identical np.interp fallback)."""
+    if _cinterp.available():
+        return ("cinterp", "pass", "C kernel active (bit-identical to np.interp)")
+    return ("cinterp", "warn", f"np.interp fallback ({_cinterp.reason() or 'unknown'}); output bytes unchanged")
+
+
+def _doc_ram() -> tuple[str, str, str]:
+    """Check: physical RAM + cgroup ceiling (the pipeline's own helpers)."""
+    try:
+        physical: float | None = turbop._read_physical_gb()  # ruff: ignore[private-member-access]
+    except (ValueError, OSError):
+        physical = None
+    try:
+        cgroup: float = turbop._read_cgroup_max_gb()  # ruff: ignore[private-member-access]
+    except (ValueError, OSError):
+        cgroup = float("inf")
+    parts: list[str] = []
+    if physical is None:
+        parts.append("physical unknown")
+    else:
+        parts.append(f"physical {physical:.2f} GB")
+    if math.isinf(cgroup):
+        parts.append("cgroup unlimited")
+    else:
+        parts.append(f"cgroup {cgroup:.2f} GB")
+    finite = [p for p in (physical, cgroup) if p is not None and math.isfinite(p)]
+    if finite:
+        parts.append(f"effective cap {min(finite):.2f} GB")
+    return ("ram", "pass" if finite else "warn", "; ".join(parts))
+
+
+def _doc_tempdir() -> tuple[str, str, str]:
+    """Check: the process temp dir is writable (staging, memmaps, scratch live there)."""
+    d = tempfile.gettempdir()
+    try:
+        fd, name = tempfile.mkstemp(prefix="ppgrid-doctor-", dir=d)
+        os.close(fd)
+        Path(name).unlink()
+    except OSError as e:
+        return ("tempdir", "fail", f"{d} not writable: {e.strerror or e}")
+    return ("tempdir", "pass", d)
+
+
+def _doctor_checks() -> list[tuple[str, str, str]]:
+    """Run every doctor check; a crashing check reports (label, 'fail', why).
+
+    The check callables are looked up from the module globals per call, so
+    tests can monkeypatch a single _doc_* function to force a failure.
+
+    Returns:
+        (label, status, detail) rows in report order.
+
+    """
+    checks = (
+        _doc_python,
+        _doc_ppgrid,
+        _doc_numpy,
+        _doc_rasterio,
+        _doc_gdal,
+        _doc_pyproj,
+        _doc_zstdmt,
+        _doc_cinterp,
+        _doc_ram,
+        _doc_tempdir,
+    )
+    rows: list[tuple[str, str, str]] = []
+    for check in checks:
+        try:
+            rows.append(check())
+        except Exception as e:  # ruff: ignore[blind-except]
+            rows.append((check.__name__.removeprefix("_doc_"), "fail", f"check crashed: {type(e).__name__}: {e}"))
+    return rows
+
+
+def _cmd_doctor() -> int:
+    """`ppgrid doctor` (issue #61). Report to stdout; returns the exit code."""
+    rows = _doctor_checks()
+    width = max(len(label) for label, _, _ in rows)
+    failing: list[str] = []
+    for label, status, detail in rows:
+        if status == "fail":
+            failing.append(label)
+        print(f"{label:<{width}}  {detail}  {_DOCTOR_MARK[status]}")  # ruff: ignore[print]
+    if failing:
+        print(f"doctor: {len(failing)} check(s) failing: {', '.join(failing)}", file=sys.stderr)  # ruff: ignore[print]
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# probe (issue #62): input diagnostic. Writes no output files; the
+# projection validation mirrors the pipeline ingest (float64 pin, the same
+# non-finite / out-of-domain / non-finite-projection drops, the same
+# Transformer) so its numbers are what a real run would do.
+# ---------------------------------------------------------------------------
+
+
+def _probe_size(n: float) -> str:
+    """Human file size (probe report line)."""
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.2f} MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.1f} KB"
+    return f"{int(n)} B"
+
+
+def _probe_format(path: Path, head: bytes) -> tuple[str, list[str]]:
+    """Classify the input (issue #62): format label + magic/extension problems.
+
+    Reuses _sniff_compression (the issue-#80 planner magic) for the CSV
+    family; parquet is extension-driven (pyarrow sniffs internally).
+    pandas infers CSV compression from the file NAME, so a magic that
+    disagrees with the extension is reported as a problem a real run would
+    choke on.
+
+    Args:
+        path: The input path (suffix drives the parquet vs csv split).
+        head: Leading bytes (>= 5; the magic length).
+
+    Returns:
+        (label, problems): 'csv' / 'csv (gzip)' / 'parquet' + mismatch list.
+
+    """
+    suffix = path.suffix.lower()
+    if suffix in {".parquet", ".pq"}:
+        return ("parquet", [])
+    compression = _sniff_compression(head)
+    label = "csv" if compression is None else f"csv ({compression})"
+    problems: list[str] = []
+    expected = {".gz": "gzip", ".gzip": "gzip", ".bz2": "bzip2", ".zip": "zip", ".xz": "xz", ".lzma": "xz"}
+    if suffix in expected and expected[suffix] != compression:
+        problems.append(
+            f"extension {suffix} implies {expected[suffix]} but the file starts with "
+            f"{compression or 'uncompressed'} magic: pandas infers compression from the name; "
+            "a real run would fail to parse",
+        )
+    elif suffix not in expected and compression is not None:
+        problems.append(
+            f"file starts with {compression} magic under a plain {suffix or '(no)'} extension: pandas infers "
+            "compression from the name; a real run would fail to parse (rename to e.g. .csv.gz)",
+        )
+    return (label, problems)
+
+
+def _probe_coordinate_cols(columns: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Guess the lon/lat columns from names (issue #62).
+
+    Args:
+        columns: Input column names, file order.
+
+    Returns:
+        (lon, lat, problems): the first exact-name match per role
+        (case-insensitive); a missing set is a problem (a real run would
+        need --lng-col/--lat-col), multiple matches report which one the
+        probe uses.
+
+    """
+    lowered = {c.lower(): c for c in columns}
+    lon_hits = [lowered[k] for k in lowered if k in _LON_NAMES]
+    lat_hits = [lowered[k] for k in lowered if k in _LAT_NAMES]
+    problems: list[str] = []
+    if not lon_hits and not lat_hits:
+        problems.append(
+            f"no column named like lon/lat (tried {sorted(_LON_NAMES | _LAT_NAMES)}); "
+            "a real run needs --lng-col/--lat-col",
+        )
+    if len(lon_hits) > 1:
+        problems.append(
+            f"multiple longitude-like columns {lon_hits}; probe uses {lon_hits[0]!r}, a real run needs --lng-col",
+        )
+    if len(lat_hits) > 1:
+        problems.append(
+            f"multiple latitude-like columns {lat_hits}; probe uses {lat_hits[0]!r}, a real run needs --lat-col",
+        )
+    return (lon_hits[0] if lon_hits else None, lat_hits[0] if lat_hits else None, problems)
+
+
+def _degree_verdict(vals: list[np.ndarray]) -> str:
+    """One-line degree-likeness verdict from coordinate arrays (issue #62)."""
+    pooled = np.concatenate(vals) if vals else np.array([], dtype=np.float64)
+    finite = pooled[np.isfinite(pooled)]
+    if finite.size == 0:
+        return "coordinate values are all empty or non-finite in the sample; cannot guess the CRS"
+    mx = float(np.abs(finite).max())
+    if mx <= 180.0 and mx > 0.0:
+        return f"sampled values look like degrees (max |x| = {mx:.6g}); src CRS guess EPSG:{SRC_CRS}"
+    return f"sampled values exceed +/-180 (max |x| = {mx:.6g}); not degrees — a real run needs a matching --src-crs"
+
+
+def _probe_degree_sample(sample: pd.DataFrame, lon: str | None, lat: str | None) -> str:
+    """Degree-likeness verdict on the sampled coordinate columns (csv path)."""
+    vals: list[np.ndarray] = []
+    for col in (lon, lat):
+        if col is None:
+            continue
+        vals.append(pd.to_numeric(sample[col], errors="coerce").to_numpy(dtype=np.float64))
+    return _degree_verdict(vals)
+
+
+def _probe_value_candidates(sample: pd.DataFrame) -> list[str]:
+    """Numeric --value-col candidates (issue #62): >= 50% numeric sample.
+
+    The pipeline pins wanted columns to float64 (issue #80); a column whose
+    sampled values mostly survive pd.to_numeric(errors='coerce') would
+    parse under that pin.
+
+    Args:
+        sample: First _PROBE_SAMPLE rows, all columns, inferred dtypes.
+
+    Returns:
+        Candidate column names in file order.
+
+    """
+    out: list[str] = []
+    for col in sample.columns:
+        non_null = sample[col].dropna()
+        if non_null.empty:
+            continue
+        if pd.to_numeric(non_null, errors="coerce").notna().mean() >= 0.5:
+            out.append(col)
+    return out
+
+
+def _cmd_probe(args: argparse.Namespace) -> int:
+    """`ppgrid probe` (issue #62). Diagnostic to stdout; returns the exit code.
+
+    Exit codes: 0 clean, 1 problem(s) found (named), 2 usage error
+    (unknown work-CRS code — the run CLI's bad-flag-value convention).
+    """
+    _load_native()
+    # Usage check first: an unknown work-CRS code is a bad flag value
+    # (exit 2) regardless of the file state, like the run CLI — both CRS
+    # error types, like _map_pipeline_errors (rasterio's global CRS here,
+    # pyproj's from the Transformer below).
+    try:
+        CRS.from_epsg(args.work_crs)
+    except (CRSError, RasterioCRSError):
+        print(f"error: unknown work CRS 'EPSG:{args.work_crs}' (bad flag value)", file=sys.stderr)  # ruff: ignore[print]
+        return 2
+    path = Path(args.input)
+    problems: list[str] = []
+    print(f"input:      {args.input}")  # ruff: ignore[print]
+    if not path.exists():
+        problems.append("input file not found; a real run would exit 1 (pipeline error)")
+        print(f"verdict:    {len(problems)} problem(s) found — a real run would fail")  # ruff: ignore[print]
+        for p in problems:
+            print(f"  - {p}")  # ruff: ignore[print]
+        return 1
+    if not path.is_file():
+        problems.append("input is not a regular file; a real run would exit 1 (pipeline error)")
+        print(f"verdict:    {len(problems)} problem(s) found — a real run would fail")  # ruff: ignore[print]
+        for p in problems:
+            print(f"  - {p}")  # ruff: ignore[print]
+        return 1
+
+    with path.open("rb") as f:
+        head = f.read(8)
+    label, fmt_problems = _probe_format(path, head)
+    problems += fmt_problems
+    print(f"format:     {label} ({_probe_size(path.stat().st_size)})")  # ruff: ignore[print]
+
+    # Columns (+ exact row count for parquet; the csv row count comes from
+    # the streaming pass below).
+    columns: list[str] = []
+    rows = 0
+    pq_file = None
+    if label == "parquet":
+        try:
+            import pyarrow.parquet as pq
+
+            pq_file = pq.ParquetFile(path)
+            columns = list(pq_file.schema_arrow.names)
+            rows = int(pq_file.metadata.num_rows)
+        except ImportError:
+            problems.append(
+                "parquet input needs pyarrow (install the [parquet] extra); a real run would fail the same way"
+            )
+        except Exception as e:  # ruff: ignore[blind-except]
+            problems.append(f"cannot read parquet metadata: {type(e).__name__}: {e}")
+    else:
+        try:
+            header = pd.read_csv(path, nrows=0)
+            columns = [str(c) for c in header.columns]
+        except Exception as e:  # ruff: ignore[blind-except]
+            problems.append(
+                f"cannot read header: {type(e).__name__}: {e} (empty file?); a real run would fail to parse"
+            )
+
+    shown = ", ".join(columns[:12]) + (f", ... ({len(columns)} total)" if len(columns) > 12 else "")
+    if columns:
+        print(f"columns:    ({len(columns)}) {shown}")  # ruff: ignore[print]
+
+    value_col = args.value_col or "value"  # the run default
+    lon, lat, coord_problems = _probe_coordinate_cols(columns)
+    problems += coord_problems
+
+    # Preflight parity with the run (#57): the run matches column names
+    # case-sensitively (_check_columns) against the exact defaults
+    # "longitude"/"latitude" (g_input) unless overridden with
+    # --lng-col/--lat-col. Alias names — and a single missing coordinate
+    # column — exit 2 there, so they are problems here too.
+    needed_flags: list[str] = []
+    if lon is not None and lon != "longitude":
+        needed_flags.append(f"--lng-col {lon!r}")
+    if lat is not None and lat != "latitude":
+        needed_flags.append(f"--lat-col {lat!r}")
+    if needed_flags:
+        problems.append(
+            f"a real run needs {' / '.join(needed_flags)} — the column names do not match the run "
+            "defaults 'longitude'/'latitude' (case-sensitive); it would exit 2 at preflight",
+        )
+    if (lon is None) != (lat is None):
+        missing = "longitude" if lon is None else "latitude"
+        flag = "--lng-col" if lon is None else "--lat-col"
+        problems.append(
+            f"only one coordinate column present — no {missing!r} column; a real run needs "
+            f"{flag} {missing!r} (the default) and would exit 2 at preflight",
+        )
+
+    # Candidate sample (csv) + value-column check.
+    sample: pd.DataFrame | None = None
+    if label != "parquet" and columns:
+        try:
+            sample = pd.read_csv(path, nrows=_PROBE_SAMPLE)
+        except Exception as e:  # ruff: ignore[blind-except]
+            problems.append(f"sample read failed: {type(e).__name__}: {e}")
+    if columns and value_col not in columns:
+        close = difflib.get_close_matches(value_col, columns, n=3)
+        hint = f"; did you mean: {', '.join(close)}" if close else ""
+        problems.append(
+            f"value column {value_col!r} not found{hint}; a real run would exit 2 before ingesting (issue #57)",
+        )
+
+    # Row count + the wanted-column arrays (the same float64 pin the run uses).
+    # The pipeline reads all wanted columns in one call: if the read fails,
+    # a real run fails before projection, so the validation below is skipped
+    # for that reason (not for missing coordinate columns).
+    wanted: list[str] = []
+    for c in (value_col, lon, lat):
+        if c and c in columns and c not in wanted:
+            wanted.append(c)
+    arrays: dict[str, np.ndarray] = {}
+    read_failed = False
+    if label != "parquet":
+        if columns:
+            pin = dict.fromkeys(wanted, np.float64) if wanted else None
+            try:
+                if wanted:
+                    pieces: dict[str, list[np.ndarray]] = {c: [] for c in wanted}
+                    with pd.read_csv(path, usecols=wanted, dtype=pin, chunksize=_PROBE_CHUNK) as r:
+                        for chunk in r:
+                            rows += len(chunk)
+                            for c in wanted:
+                                pieces[c].append(chunk[c].to_numpy())
+                    for c in wanted:
+                        arrays[c] = np.concatenate(pieces[c]) if pieces[c] else np.array([], dtype=np.float64)
+                else:
+                    with pd.read_csv(path, chunksize=_PROBE_CHUNK) as r:
+                        for chunk in r:
+                            rows += len(chunk)
+            except Exception as e:  # ruff: ignore[blind-except]
+                read_failed = True
+                problems.append(
+                    f"row read failed: {type(e).__name__}: {e}; a real run would fail to parse "
+                    "the wanted columns as float64",
+                )
+    elif pq_file is not None and wanted:
+        try:
+            df = pd.read_parquet(path, columns=wanted)
+            for c in wanted:
+                arrays[c] = df[c].to_numpy()
+        except Exception as e:  # ruff: ignore[blind-except]
+            read_failed = True
+            problems.append(f"parquet read failed: {type(e).__name__}: {e}")
+
+    if read_failed:
+        print("rows:       unknown (row read failed)")  # ruff: ignore[print]
+    elif rows == 0:
+        problems.append("no data rows; a real run would fail with 'no valid points'")
+        print("rows:       0")  # ruff: ignore[print]
+    else:
+        print(f"rows:       {rows}")  # ruff: ignore[print]
+
+    # Value candidates + degree guess (the report lines, not problems).
+    if label == "parquet" and pq_file is not None and columns:
+        try:
+            import pyarrow as pa
+
+            schema = pq_file.schema_arrow
+            # is_integer/is_floating cover every numeric pyarrow type the run
+            # pins to float64 (pa.types.is_numeric does not exist; pyarrow 25).
+            cands = [
+                name
+                for name, t in zip(schema.names, schema.types, strict=True)
+                if pa.types.is_integer(t) or pa.types.is_floating(t)
+            ]
+        except Exception:  # ruff: ignore[blind-except]
+            cands = []
+        cand_line = ", ".join(cands) if cands else "none"
+        if "value" in cands:
+            cand_line += " (run default 'value' present)"
+    elif sample is not None:
+        cands = _probe_value_candidates(sample)
+        cand_line = ", ".join(cands) if cands else "none"
+        if "value" in cands:
+            cand_line += " (run default 'value' present)"
+    else:
+        cand_line = "n/a (no sample)"
+    print(f"value col:  {value_col!r} | numeric candidates: {cand_line}")  # ruff: ignore[print]
+    if lon or lat:
+        if label == "parquet" and lon in arrays and lat in arrays:
+            verdict = _degree_verdict([arrays[lon], arrays[lat]])
+        elif sample is not None:
+            verdict = _probe_degree_sample(sample, lon, lat)
+        else:
+            verdict = "n/a (no data read)"
+        print(f"coordinates: {lon or 'n/a'} / {lat or 'n/a'} — {verdict}")  # ruff: ignore[print]
+    elif not coord_problems:
+        print("coordinates: n/a")  # ruff: ignore[print]
+
+    # Projection validation: the same drops the pipeline ingest makes.
+    # The pipeline reads all wanted columns in one call: if the read fails
+    # or a problem would stop the run first (a missing value column exits
+    # 2 at preflight), the real run never reaches projection — validate
+    # only on the clean path, and say why otherwise.
+    kept = 0
+    n_total = 0
+    if lon is None or lat is None:
+        print(f"projection: skipped (no coordinate columns; --work-crs {args.work_crs})")  # ruff: ignore[print]
+    elif read_failed:
+        print("projection: skipped (row read failed — a real run would fail before projecting)")  # ruff: ignore[print]
+    elif problems:
+        print("projection: skipped (the problems above stop a real run before projecting)")  # ruff: ignore[print]
+    else:
+        print(f"projection: EPSG:{SRC_CRS} -> EPSG:{args.work_crs} (work CRS; src assumed EPSG:{SRC_CRS})")  # ruff: ignore[print]
+        lon_a, lat_a = arrays[lon], arrays[lat]
+        v_a = arrays.get(value_col)
+        n_total = int(lon_a.size)
+        good = np.isfinite(lon_a) & np.isfinite(lat_a)
+        if v_a is not None:
+            good &= np.isfinite(v_a)
+        n_nan_inf = int(np.count_nonzero(~good))
+        ood = good & ((lat_a < -90.0) | (lat_a > 90.0) | (lon_a < -180.0) | (lon_a > 180.0))
+        n_ood = int(ood.sum())
+        domain = good & ~ood
+        first_ood = int(np.argmax(ood)) if n_ood else -1
+        tr = Transformer.from_crs(SRC_CRS, args.work_crs, always_xy=True)
+        x, y = tr.transform(lon_a[domain], lat_a[domain], radians=False)
+        fin = np.isfinite(x) & np.isfinite(y)
+        n_np = int(np.count_nonzero(~fin))
+        first_np = int(np.nonzero(~fin)[0][0]) if n_np else -1
+        kept = int(fin.sum())
+        print(f"  rows read:               {n_total}")  # ruff: ignore[print]
+        print(f"  dropped nan/inf:         {n_nan_inf}")  # ruff: ignore[print]
+        print(f"  dropped out-of-domain:   {n_ood}" + (f" (first at row {first_ood})" if n_ood else ""))  # ruff: ignore[print]
+        suffix = f" (first from lon/lat {lon_a[domain][first_np]:.6f}, {lat_a[domain][first_np]:.6f})" if n_np else ""
+        print(f"  dropped non-finite proj: {n_np}{suffix}")  # ruff: ignore[print]
+        if kept:
+            print(f"  x domain:                {float(x[fin].min()):.3f} .. {float(x[fin].max()):.3f} m")  # ruff: ignore[print]
+            print(f"  y domain:                {float(y[fin].min()):.3f} .. {float(y[fin].max()):.3f} m")  # ruff: ignore[print]
+        print(f"  points kept:             {kept}")  # ruff: ignore[print]
+        if kept == 0:
+            problems.append(
+                "no valid points remain after the same drops a real run would make; a real run would fail "
+                "with 'No valid points found in input'",
+            )
+
+    if problems:
+        print(f"verdict:    {len(problems)} problem(s) found — a real run would fail or drop points")  # ruff: ignore[print]
+        for p in problems:
+            print(f"  - {p}")  # ruff: ignore[print]
+        return 1
+    if n_total:
+        print(f"verdict:    ok — a real run would keep {kept}/{n_total} points")  # ruff: ignore[print]
+    else:
+        print("verdict:    ok")  # ruff: ignore[print]
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# list-crs (issue #69): the curated ppgrid set by default, the full
+# pyproj/EPSG database with --all. pyproj loads inside the handler, after
+# parse_args, so `list-crs --help` stays fast.
+# ---------------------------------------------------------------------------
+
+
+def _cmd_list_crs(args: argparse.Namespace) -> int:
+    """`ppgrid list-crs` (issue #69). List to stdout; returns the exit code."""
+    import pyproj  # ruff: ignore[unused-import] — the local import IS the lazy load (post-parse_args)
+    from pyproj import CRS
+
+    if args.all:
+        import pyproj.database as pdb
+
+        rows = pdb.query_crs_info(
+            auth_name="EPSG",
+            pj_types=[
+                pdb.PJType.GEOGRAPHIC_2D_CRS,
+                pdb.PJType.GEOGRAPHIC_3D_CRS,
+                pdb.PJType.PROJECTED_CRS,
+                pdb.PJType.COMPOUND_CRS,
+            ],
+            allow_deprecated=True,
+        )
+        for r in sorted(rows, key=lambda x: int(x.code)):
+            dep = " (deprecated)" if r.deprecated else ""
+            print(f"{r.code}  {r.name}{dep}")  # ruff: ignore[print]
+        return 0
+    failures: list[int] = []
+    for code, role, note in _CURATED_CRS:
+        try:
+            name = CRS.from_epsg(code).name
+        except Exception:  # ruff: ignore[blind-except]
+            failures.append(code)
+            print(f"{code}  <failed to load>  ({role})")  # ruff: ignore[print]
+            continue
+        print(f"{code}  {name}  ({role}) — {note}")  # ruff: ignore[print]
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> None:
     """Command-line entry point (the ``ppgrid`` console script).
 
     Parses ``argv`` (defaults to ``sys.argv[1:]``), runs the pipeline
     end-to-end, and reports through the CLI presentation layer. stdout is
-    reserved for ``--plan``, ``help`` and ``--version``; every other line
-    (progress, warnings, errors, the run summary) goes to stderr.
+    reserved for ``--plan``, ``help``, ``--version`` and the read-only
+    subcommand reports (doctor / probe / list-crs, #61 #62 #69); every
+    other line (progress, warnings, errors, the run summary) goes to
+    stderr.
+
+    Subcommands are dispatched on argv[0] before the run parser is built
+    (separate parser, see the section note): ``ppgrid doctor``,
+    ``ppgrid probe INPUT``, ``ppgrid list-crs``.
 
     Side effects: creates the output directory and writes ``value.tif``,
     ``support_km.tif`` and ``calibration.json`` into it (plus
     ``run_summary.json`` with ``--json``); configures the ``ppgrid``
-    logger for the rest of the process.
+    logger for the rest of the process. Subcommands write no output files
+    (doctor's oracle probe uses a throwaway temp-dir tile).
 
     Args:
         argv: Argument list (defaults to sys.argv[1:]; tests pass their own).
 
     Raises:
-        SystemExit: 0 (ok, help, --plan), 1 (pipeline/IO error),
+        SystemExit: run path: 0 (ok, help, --plan), 1 (pipeline/IO error),
             2 (validation error), 3 (--turbo-strict infeasible) — as
-            documented on _run_cli (propagated unchanged).
+            documented on _run_cli (propagated unchanged). Subcommands:
+            doctor 0/1, probe 0/1/2, list-crs 0/1 (see _run_subcommand).
 
     """
+    raw = list(sys.argv[1:]) if argv is None else list(argv)
+    if raw and raw[0] in _SUBCOMMANDS:
+        # Read-only subcommands (#61 #62 #69): separate parser, dispatched
+        # before _build_parser so the run CLI's `input` positional never
+        # sees the command token. Interrupts keep the run contract (130).
+        try:
+            _run_subcommand(raw)
+        except KeyboardInterrupt:
+            _interrupted_exit(None, None)
+        return
     parser = _build_parser()
     out: Path | None = None
     try:
