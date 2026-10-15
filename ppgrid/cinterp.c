@@ -27,9 +27,17 @@
  *   and only needs the CPython headers.
  * - The GIL is released around the whole call so block worker threads
  *   interpolate in parallel (numpy's arr_interp releases it too).
- * - Build with -O3 -ffp-contract=off and NO -march: x86-64 baseline has
- *   no FMA, so slope*(x-dx)+dy compiles to mulsd+addsd, the same two IEEE
- *   ops numpy performs. No reassociation (plain -O3, no -ffast-math).
+ * - Build with -O3, NO -march, and per-platform contraction matching
+ *   numpy's wheels: non-darwin keeps -ffp-contract=off (GCC's C default,
+ *   FP_CONTRACT=off; x86-64 baseline has no FMA, so slope*(x-dx)+dy is
+ *   mulsd+addsd, the same two IEEE ops numpy performs); darwin switches
+ *   to -ffp-contract=fast because numpy's macOS arm64 wheel compiles the
+ *   same expression into a single FMA (fmadd — verified in the
+ *   macosx_14_0_arm64 wheels, numpy 2.4.6 + 2.5.1, symbol _arr_interp).
+ *   FMA is in the arm64 base ISA; on x86_64 Mac the baseline has no FMA
+ *   and the flag is a no-op. No reassociation either way (plain -O3, no
+ *   -ffast-math). The only float expressions in this file are the four
+ *   slope*(x-dx)+dy variants, so contraction changes nothing else.
  * - Slopes are precomputed by the caller (ppgrid._cinterp) with numpy
  *   ufuncs; the per-element formula (dy[j+1]-dy[j])/(dx[j+1]-dx[j]) is the
  *   same IEEE ops numpy uses, so precompute vs per-element is bit-identical

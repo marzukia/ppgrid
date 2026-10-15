@@ -428,8 +428,9 @@ def test_tmpdir_owner_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.Te
 
 
 # ---------------------------------------------------------------------------
-# _build flag list (issue #123): darwin appends -undefined dynamic_lookup;
-# every other platform keeps the exact baseline list, byte for byte.
+# _build flag list: darwin uses -ffp-contract=fast + -undefined
+# dynamic_lookup (issue #123 + PR #128 fix-round); every other platform
+# keeps the exact baseline list, byte for byte.
 # ---------------------------------------------------------------------------
 
 
@@ -460,6 +461,18 @@ def _expected_cmd(flags: list[str], src: Path, dst: Path) -> list[str]:
 
 
 _BASELINE = ["-O3", "-ffp-contract=off", "-fPIC", "-shared", "-fvisibility=hidden"]
+# darwin (PR #128 fix-round): -ffp-contract=fast instead of =off — numpy's
+# darwin arm64 wheel contracts the interp element loop into a single FMA
+# (fmadd); the kernel must match. Plus -undefined dynamic_lookup (#123).
+_DARWIN = [
+    "-O3",
+    "-ffp-contract=fast",
+    "-fPIC",
+    "-shared",
+    "-fvisibility=hidden",
+    "-undefined",
+    "dynamic_lookup",
+]
 
 
 @pytest.mark.parametrize("platform", ["linux", "win32", "freebsd14"])
@@ -473,12 +486,12 @@ def test_build_cmd_baseline_other_platforms(
     assert cmds == [_expected_cmd(_BASELINE, src, dst)]
 
 
-def test_build_cmd_darwin_dynamic_lookup(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> None:
-    """Darwin appends -undefined dynamic_lookup and changes nothing else (issue #123)."""
+def test_build_cmd_darwin_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> None:
+    """Darwin flags: -ffp-contract=fast (numpy arm64 wheel contracts, PR #128) + dynamic_lookup (#123)."""
     monkeypatch.setattr(ci.sys, "platform", "darwin")
     cmds, src, dst = _capture_build(monkeypatch, tmp_path)
     assert ci._build(src, dst)
-    assert cmds == [_expected_cmd([*_BASELINE, "-undefined", "dynamic_lookup"], src, dst)]
+    assert cmds == [_expected_cmd(_DARWIN, src, dst)]
 
 
 def _pct() -> PercentileTransform:
