@@ -45,6 +45,7 @@ import importlib.machinery
 import importlib.util
 import os
 import subprocess
+import sys
 import sysconfig
 import tempfile
 from collections.abc import Callable
@@ -128,6 +129,13 @@ def _build(src: Path, dst: Path) -> bool:
     global _build_err
     inc = sysconfig.get_paths().get("include", "")
     cmd_base = ["-O3", "-ffp-contract=off", "-fPIC", "-shared", "-fvisibility=hidden"]
+    if sys.platform == "darwin":
+        # macOS ld resolves the Python C-API symbols at LOAD time (the
+        # interpreter maps libpython into the extension), not at link time.
+        # Raw cc omits the -undefined dynamic_lookup that
+        # distutils/setuptools add, so the link dies with
+        # "symbol(s) not found for architecture arm64" (issue #123).
+        cmd_base += ["-undefined", "dynamic_lookup"]
     compilers = [os.environ.get("CC", "")] if os.environ.get("CC") else []
     compilers += ["cc", "gcc", "clang"]
     for compiler in compilers:

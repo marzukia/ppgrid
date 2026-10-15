@@ -12,6 +12,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import sysconfig
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -276,6 +277,60 @@ def test_tmpdir_owner_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.Te
     assert imports == []  # the other-user .so was never imported
     assert ci._mod is None
     assert ci._reason is not None
+
+
+# ---------------------------------------------------------------------------
+# _build flag list (issue #123): darwin appends -undefined dynamic_lookup;
+# every other platform keeps the exact baseline list, byte for byte.
+# ---------------------------------------------------------------------------
+
+
+def _capture_build(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> tuple[list[list[str]], Path, Path]:
+    """Point _build at a fake compiler and capture the exact cmd it assembles."""
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setenv("CC", "")  # first fallback compiler is deterministically "cc"
+    monkeypatch.setattr(ci.subprocess, "run", fake_run)
+    src = tmp_path / "cinterp.c"
+    src.write_text("static int x(void) { return 0; }\n")
+    dst = tmp_path / "built" / f"_cinterp_c-000000000000{ci._SO_SUFFIX}"
+    return cmds, src, dst
+
+
+def _expected_cmd(flags: list[str], src: Path, dst: Path) -> list[str]:
+    """Build the exact cmd _build emits for a flag list under the fake-cc capture."""
+    inc = sysconfig.get_paths().get("include", "")
+    cmd = ["cc", *flags]
+    if inc:
+        cmd.append(f"-I{inc}")
+    cmd += [str(src), "-o", str(dst)]
+    return cmd
+
+
+_BASELINE = ["-O3", "-ffp-contract=off", "-fPIC", "-shared", "-fvisibility=hidden"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32", "freebsd14"])
+def test_build_cmd_baseline_other_platforms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath, platform: str
+) -> None:
+    """Non-darwin platforms keep the exact baseline flag list (issue #123)."""
+    monkeypatch.setattr(ci.sys, "platform", platform)
+    cmds, src, dst = _capture_build(monkeypatch, tmp_path)
+    assert ci._build(src, dst)
+    assert cmds == [_expected_cmd(_BASELINE, src, dst)]
+
+
+def test_build_cmd_darwin_dynamic_lookup(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPath) -> None:
+    """Darwin appends -undefined dynamic_lookup and changes nothing else (issue #123)."""
+    monkeypatch.setattr(ci.sys, "platform", "darwin")
+    cmds, src, dst = _capture_build(monkeypatch, tmp_path)
+    assert ci._build(src, dst)
+    assert cmds == [_expected_cmd([*_BASELINE, "-undefined", "dynamic_lookup"], src, dst)]
 
 
 def _pct() -> PercentileTransform:
