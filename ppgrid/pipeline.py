@@ -33,7 +33,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 import numpy as np
-import pandas as pd
 
 from . import __version__, _cinterp, _prof, turbop, zstdmt
 from ._tempfiles import _open_fresh_memmap
@@ -61,15 +60,14 @@ from .pullpush import (
 )
 
 # --- lazy native imports (PEP 562) ------------------------------------------
-# rasterio (GDAL C extension) and pyproj (PROJ) cost tens of ms of import
-# time together and are only needed once the pipeline does geospatial work
-# (point projection, warping, raster I/O). `import ppgrid` and `ppgrid
-# --help` must not pay for them, so the names below resolve on first
-# attribute access and are then cached in the module namespace. The public
-# surface is unchanged: `from ppgrid.pipeline import reproject` and
-# `monkeypatch.setattr(ppgrid.pipeline, "reproject", ...)` keep working, a
-# patched attribute lives in the module dict, which shadows __getattr__ (it
-# only fires on a lookup miss).
+# pandas (~160 ms to import), rasterio (GDAL C extension) and pyproj (PROJ)
+# are only needed once a run actually parses input, projects points, or does
+# raster I/O. `import ppgrid` and `ppgrid --help` must not pay for them, so
+# the names below resolve on first attribute access and are then cached in
+# the module namespace. The public surface is unchanged: `from ppgrid.pipeline
+# import reproject` and `monkeypatch.setattr(ppgrid.pipeline, "reproject",
+# ...)` keep working; a patched attribute lives in the module dict, which
+# shadows __getattr__ (it only fires on a lookup miss).
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "Affine": ("rasterio.transform", "Affine"),
     "CRS": ("rasterio.crs", "CRS"),
@@ -83,11 +81,13 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "Window": ("rasterio.windows", "Window"),
     "from_bounds": ("rasterio.transform", "from_bounds"),
     "from_origin": ("rasterio.transform", "from_origin"),
+    "pd": ("pandas", ""),
     "reproject": ("rasterio.warp", "reproject"),
     "rasterio": ("rasterio", ""),
 }
 
 if TYPE_CHECKING:  # static bindings only; _load_native() provides the runtime values
+    import pandas as pd
     import rasterio
     from pyproj import Transformer
     from pyproj.exceptions import CRSError
@@ -103,7 +103,7 @@ if TYPE_CHECKING:  # static bindings only; _load_native() provides the runtime v
 
 
 def _load_native() -> None:
-    """Import rasterio + pyproj and publish all lazy names in the module dict.
+    """Import pandas, rasterio and pyproj, and publish all lazy names in the module dict.
 
     CPython's LOAD_GLOBAL does not consult a module __getattr__, so function
     bodies can only see these names once they are in the module dict. This
@@ -2093,6 +2093,7 @@ def _read_csv_chunk(
         RuntimeError: If a wanted column does not parse as float64 (schema pin).
 
     """
+    _load_native()  # pd is lazy; forkserver workers run this function directly
     path, start, end, has_header, wanted, all_names = task
     with Path(path).open("rb") as f:
         f.seek(start)
@@ -2130,6 +2131,7 @@ def _csv_chunk_tasks(
         terminator.
 
     """
+    _load_native()  # pd below is lazy (PEP 562); idempotent once the stack is up
     try:
         data = Path(path).read_bytes()
         # Empty or compressed input cannot be split by raw byte offsets: pandas
@@ -5072,12 +5074,16 @@ def main(argv: list[str] | None = None) -> None:
             documented on _run_cli (propagated unchanged).
 
     """
-    from . import ui as _ui
-
     parser = _build_parser()
     out: Path | None = None
     try:
         args = parser.parse_args(argv)
+        # -h/--help/--version exit inside parse_args, so the lazy stack
+        # (pandas, rasterio, pyproj) and the presentation layer (rich) are
+        # paid for only by real runs, not by help/version (fast CLI).
+        _load_native()
+        from . import ui as _ui
+
         out = Path(args.out)
 
         # Presentation layer (issue #101): resolve live/color modes once for

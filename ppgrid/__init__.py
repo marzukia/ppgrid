@@ -56,9 +56,9 @@ def version() -> str:
 def __getattr__(name: str) -> object:
     """Lazily expose Pipeline / main / TurboInfeasibleError (PEP 562).
 
-    They live in ppgrid.pipeline, whose import pulls in pandas (and, on
-    first pipeline use, rasterio + pyproj); deferring it keeps
-    ``import ppgrid`` cheap (issue #109).
+    They live in ppgrid.pipeline, whose import stays light (stdlib + numpy
+    only; pandas, rasterio + pyproj load on first pipeline use); deferring it
+    keeps ``import ppgrid`` cheap (issue #109).
 
     Raises:
         AttributeError: If name is not a lazily exposed attribute.
