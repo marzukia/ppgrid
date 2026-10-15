@@ -224,12 +224,15 @@ def test_epilog_examples_run_verbatim(tmp_path: Path) -> None:
     Slow: example 2 is a global 500 m run (minutes on a small box). Runs in a
     scratch dir with a data/ symlink into the repo, so the argv stays verbatim
     while the checkout root needs no write access (ownerless pi-bg wrapper
-    runs execute as another user, review info-1).
+    runs execute as another user, review info-1). The compare example reuses
+    the dir example 1 wrote, so it runs after the run examples.
     """
     examples = _epilog_examples()
-    assert len(examples) == 3
+    assert len(examples) == 4
     for argv in examples:
         assert argv[0] == "ppgrid"
+        if argv[1] in ("compare", "completions"):
+            continue  # subcommand example: argv[1] is not an input file
         assert (REPO_ROOT / argv[1]).is_file(), f"epilog example input missing from repo: {argv[1]}"
     (tmp_path / "data").symlink_to(REPO_ROOT / "data")
     for argv in examples:

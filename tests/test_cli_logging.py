@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from ppgrid.pipeline import _build_parser, _resolve_log_level, main
+from ppgrid.pipeline import _build_parser, _parse_args_cli, _resolve_log_level, main
 
 
 def _tiny_csv(tmp_path: Path) -> str:
@@ -62,20 +62,20 @@ def _sha(path: Path) -> str:
 def test_parser_log_flags() -> None:
     """The --verbose and --log-level flags parse; verbose is not a --log-level value."""
     p = _build_parser()
-    args = p.parse_args(["in.csv", "--verbose"])
+    args = _parse_args_cli(p, ["in.csv", "--verbose"])
     assert args.verbose is True
     assert args.log_level is None
-    args = p.parse_args(["in.csv", "--log-level", "debug"])
+    args = _parse_args_cli(p, ["in.csv", "--log-level", "debug"])
     assert args.verbose is False
     assert args.log_level == "debug"
-    args = p.parse_args(["in.csv", "--log-level", "warning"])
+    args = _parse_args_cli(p, ["in.csv", "--log-level", "warning"])
     assert args.log_level == "warning"
-    args = p.parse_args(["in.csv"])
+    args = _parse_args_cli(p, ["in.csv"])
     assert args.verbose is False
     assert args.log_level is None
     # The 'verbose' alias is accepted by the env vars only, not by the flag.
     with pytest.raises(SystemExit):
-        p.parse_args(["in.csv", "--log-level", "verbose"])
+        _parse_args_cli(p, ["in.csv", "--log-level", "verbose"])
 
 
 @pytest.mark.parametrize(

@@ -170,6 +170,7 @@ ppgrid help
 | `--ram-gb` | (none) | Alias of `--max-ram` |
 | `--turbo-strict` | False | Shared path infeasible under the budget: error + exit 3 instead of `[warn]` + per-box fallback (exit 0) |
 | `--plan` | False | Resolve the full run plan (grid, levels, transform, turbo decision, budget), print it, exit 0 — creates no files or directories |
+| `--check` | False | After writing, reopen the outputs and verify them against the run plan (files, band readability, shape, transform, CRS, nodata tag, tiles, out-of-coverage corners); on mismatch log the exact field, keep the outputs, and exit 1 |
 | `--force` | False | Overwrite existing outputs in the out dir (default: exit 2 when `value.tif` / `support_km.tif` / `calibration.json` / `run_summary.json` are present) |
 | `--json` | False | Write a machine-readable run summary to `<out>/run_summary.json` (phase timings, volumetrics, grid metadata, calibration, resolved CLI params, seed, git commit; stdout stays clean) |
 | `--verbose` | False | Debug logging: per-phase wall times + volumetric detail (shorthand for `--log-level debug`) |
@@ -225,32 +226,23 @@ guard watches the rasters and `run_summary.json`).
 
 ### Subcommands
 
-Read-only diagnostics — they write no output files (doctor's oracle probe
-uses one throwaway tile under the temp dir). Run `ppgrid <subcommand> --help`
-for detail. Dispatch is on the literal first token: a data file named
-`doctor`, `probe`, or `list-crs` in the current directory becomes the
-subcommand — run it as `ppgrid ./doctor` (any path form works).
+Subcommands share the CLI. All but `init` are read-only — they write no
+output files (doctor's oracle probe uses one throwaway tile under the temp
+dir; `init` writes the ppgrid.toml template) — and `completions` runs
+without loading the native stack (as cheap as `--help`). Dispatch is on the
+literal first token: a data file named `compare`, `completions`, `doctor`,
+`init`, `list-crs`, or `probe` in the current directory becomes the
+subcommand — run it as `ppgrid ./compare` (any path form works). Run
+`ppgrid <subcommand> --help` for detail.
 
-```bash
-# Stack health: python/ppgrid/numpy/rasterio/GDAL/pyproj versions, the zstd
-turbo oracle status (which turbo write path this stack takes), the C interp
-kernel, RAM (physical + cgroup ceiling), temp dir. Exit 0 all pass, 1 with
-failing checks named (a warn — e.g. the zstd oracle mismatch or the
-np.interp fallback — is a byte-identical path and does not fail).
-ppgrid doctor
-
-# Input diagnostic: format (incl. compressed-CSV magic), columns, streamed
-row count, numeric --value-col candidates, a CRS guess, then the SAME
-projection validation a real run does (non-finite / out-of-domain /
-non-finite-projection drops, kept-point domain) for --work-crs.
-# Exit 0 clean, 1 problem(s) found, 2 unknown --work-crs code.
-ppgrid probe data/in.csv --work-crs 6933 --value-col price
-
-# CRS codes: the curated ppgrid set by default (4326/3577/6933/3857 + UTM
-# examples), the full pyproj/EPSG database with --all.
-ppgrid list-crs
-ppgrid list-crs --all
-```
+| Command | Exit codes | Description |
+|---------|-----------|-------------|
+| `compare OUT1 OUT2` | `0` identical / `1` different / `2` usage | Compare two ppgrid outputs — two output dirs (value + support bands) or two GeoTIFFs. Reports per-band shape, transform, CRS, exact-match count, max absolute DN difference, and a mismatch bbox. `--max-diff N` tolerates max absolute DN differences up to N (exit 0 within it). The report goes to stdout; usage errors (missing path, mixed dir/file, negative `--max-diff`) go to stderr with exit 2 |
+| `completions bash\|zsh` | `0` ok / `2` usage | Print shell completions generated from the live parser (flags, positionals, subcommands, sorted and deterministic). Install: `eval "$(ppgrid completions bash)"` (bash) or source the zsh script from a `$(...)` capture. No dependencies |
+| `doctor` | `0` all pass / `1` failing checks named | Stack health: python/ppgrid/numpy/rasterio/GDAL/pyproj versions, the zstd turbo oracle status (which turbo write path this stack takes), the C interp kernel, RAM (physical + cgroup ceiling), temp dir. A warn — e.g. the zstd oracle mismatch or the np.interp fallback — is a byte-identical path and does not fail |
+| `init [DIR]` | `0` written / `1` IO / `2` existing file without `--force` | Write a fully commented ppgrid.toml template covering every pipeline option, each set to its built-in default (the file as written changes nothing about a run). Stdlib-only (no native stack, like `--help`); creates `DIR` with parents. Refuses to clobber an existing file without `--force` |
+| `list-crs` | `0` ok / `1` error | CRS codes: the curated ppgrid set by default (4326/3577/6933/3857 + UTM examples), the full pyproj/EPSG database with `--all` |
+| `probe INPUT` | `0` clean / `1` problem(s) found / `2` unknown `--work-crs` code | Input diagnostic: format (incl. compressed-CSV magic), columns, streamed row count, numeric `--value-col` candidates, a CRS guess, then the SAME projection validation a real run does (non-finite / out-of-domain / non-finite-projection drops, kept-point domain) for `--work-crs` (e.g. `ppgrid probe data/in.csv --work-crs 6933 --value-col price`) |
 
 ### Exit codes
 
