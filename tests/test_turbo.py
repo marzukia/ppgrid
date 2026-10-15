@@ -49,6 +49,7 @@ from ppgrid.pipeline import (
     Pipeline,
     _build_parser,
     _csv_chunk_tasks,
+    _parse_args_cli,
     _reproject_band,
     _reproject_band_array,
     _tif_parse_ifd,
@@ -1462,11 +1463,11 @@ def test_cli_turbo_flags() -> None:
     """--turbo [preset], --max-ram, --ram-gb, --turbo-strict parse and validate."""
     base = ["x.csv", "--value-col", "v", "--lng-col", "l", "--lat-col", "la"]
     parser = _build_parser()
-    a = parser.parse_args([*base, "--turbo", "16"])
+    a = _parse_args_cli(parser, [*base, "--turbo", "16"])
     assert a.turbo == "16"
-    a = parser.parse_args([*base, "--turbo"])
+    a = _parse_args_cli(parser, [*base, "--turbo"])
     assert a.turbo == "auto"
-    a = parser.parse_args([*base, "--max-ram", "20"])
+    a = _parse_args_cli(parser, [*base, "--max-ram", "20"])
     assert a.max_ram == 20.0
     for extra in (
         ["--turbo", "24"],

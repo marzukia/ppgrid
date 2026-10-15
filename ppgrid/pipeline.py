@@ -220,6 +220,10 @@ examples:
   # Turbo: 32 GB RAM budget, strict (exit 3 if infeasible), 8 workers.
   ppgrid data/melb_houses.csv -o out/melb_turbo --turbo 32 --turbo-strict --workers 8 --value-col price
 
+  # Verify: compare two run outputs (out dirs or GeoTIFFs); exit 0 identical,
+  # 1 different, 2 usage error
+  ppgrid compare out/melb_10km out/melb_10km
+
 progress logging:
   Progress goes to stderr (stdout stays clean). Default level is info (one line
   per phase + a final summary). --verbose (or --log-level debug, or
@@ -985,6 +989,30 @@ def _workers_arg(text: str) -> int:
     except ValueError as exc:
         msg = f"invalid worker count: {text!r} (use a positive integer or 'auto')"
         raise argparse.ArgumentTypeError(msg) from exc
+
+
+def _nonneg_int(text: str) -> int:
+    """Argparse type: a non-negative integer (`compare --max-diff`, #67).
+
+    Args:
+        text: Raw CLI argument string.
+
+    Returns:
+        The parsed integer.
+
+    Raises:
+        argparse.ArgumentTypeError: If text is not a non-negative int.
+
+    """
+    try:
+        val = int(text)
+    except ValueError as exc:
+        msg = f"invalid non-negative int: {text!r}"
+        raise argparse.ArgumentTypeError(msg) from exc
+    if val < 0:
+        msg = f"must be >= 0: {text!r}"
+        raise argparse.ArgumentTypeError(msg)
+    return val
 
 
 def _neighbour_block_ids(bx: int, by: int, nbx: int, nby: int) -> list[int]:
@@ -5324,6 +5352,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resolve the full run plan, print it, and exit 0 before running; creates no files or directories",
     )
+    g_out.add_argument(
+        "--check",
+        action="store_true",
+        help="After writing, reopen the outputs and verify them against the run plan "
+        "(files, band readability, shape, transform, CRS, nodata tag, tiles, out-of-coverage "
+        "corners); on mismatch log the exact field, keep the outputs, and exit 1 (default: off)",
+    )
 
     g_log = parser.add_argument_group("logging")
     g_log.add_argument(
@@ -5369,14 +5404,65 @@ def _build_parser() -> argparse.ArgumentParser:
         "precedence: CLI flag > config > built-in default)",
     )
 
-    # Subcommand discoverability (#61 #62 #69): one-line append; the parsers
-    # themselves live in _build_subcommand_parser (see the section note).
+    # Subcommand discoverability (#61 #62 #66 #69): one-line append; the
+    # subcommand parsers live in _build_subcommand_parser (dispatch) and the
+    # display-only subparsers action at the end of this parser (see the
+    # section note above _SUBCOMMANDS).
     parser.description += (
         " Read-only subcommands (they write no output files): `ppgrid doctor` (stack health), "
-        "`ppgrid probe INPUT` (input diagnostic), `ppgrid list-crs` (CRS codes). "
+        "`ppgrid probe INPUT` (input diagnostic), `ppgrid list-crs` (CRS codes), "
+        "`ppgrid compare OUT1 OUT2` (diff two run outputs), "
+        "`ppgrid completions bash|zsh` (shell completions). "
         "`ppgrid doctor --help` etc. for detail."
     )
+
+    # Display-only subcommand append (#61 #62 #66 #69): the run parser shows
+    # the six subcommands in --help (identical to `ppgrid help`). The
+    # parsers that actually dispatch live in _build_subcommand_parser; the
+    # run form parses with this action stripped (_parse_args_cli), so a bare
+    # input path stays a path and every run-path stays byte identical.
+    # prog="ppgrid" pins the subcommand usage lines to `ppgrid <command>`.
+    sub = parser.add_subparsers(
+        dest="command", metavar="{doctor,probe,list-crs,init,compare,completions}", required=False, prog="ppgrid"
+    )
+    _add_subcommand_parsers(sub)
     return parser
+
+
+def _parse_args_cli(parser: argparse.ArgumentParser, argv: list[str]) -> argparse.Namespace:
+    """Parse the run CLI argv against the run parser with subcommand awareness.
+
+    The run parser carries a display-only subparsers action (so `ppgrid
+    --help` shows the subcommand section); the run form itself parses with
+    that action STRIPPED, so a bare input path stays a path — `ppgrid x.csv`
+    and `ppgrid --cap-km 5 x.csv` parse byte identical to the pre-subcommand
+    CLI, and `ppgrid help` is the run CLI's own pseudo-command (the
+    subcommand parsers live in _build_subcommand_parser, dispatched by
+    main() before this parser is built). `-h`/`--help` parse on the full
+    parser (the action is what renders the help section; its required=False
+    never rejects argv). main() token-wins subcommand tokens before this
+    runs, so this parses run-form argv only.
+
+    Args:
+        parser: The run CLI parser (the `_build_parser()` return).
+        argv: The run CLI argv (no leading `ppgrid`; not a subcommand form).
+
+    Returns:
+        The parsed run-CLI namespace.
+
+    Raises:
+        SystemExit: 0 on `-h`/`--help` (help printed); 2 on parse error.
+
+    """
+    if not any(a in ("-h", "--help") for a in argv):
+        sub = next((a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"), None)  # ruff: ignore[private-member-access]
+        if sub is not None and argv and argv[0] not in sub.choices:
+            parser._actions.remove(sub)  # ruff: ignore[private-member-access]
+            try:
+                return parser.parse_args(argv)
+            finally:
+                parser._actions.append(sub)  # ruff: ignore[private-member-access]
+    return parser.parse_args(argv)
 
 
 def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Path) -> None:
@@ -5485,22 +5571,27 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
 
 # ---------------------------------------------------------------------------
 # Subcommands: read-only diagnostics (doctor #61, probe #62, list-crs #69)
-# plus init (#63, writes the ppgrid.toml template).
+# plus the verify surface (compare #67, completions #66) and init (#63,
+# writes the ppgrid.toml template).
 #
-# Dispatched in main() on argv[0] BEFORE the run parser is built. They are
-# a separate top-level parser, not subparsers of the run parser: the run
-# CLI's optional `input` positional (nargs="?") sits before any subparser
-# positional in the same parser and would swallow the command token
-# ("ppgrid doctor" -> input="doctor", "invalid choice"). Keeping the run
-# parser itself untouched (it gains only the one-line description append)
-# leaves every run-path byte identical. Diag subcommands are read-only: no
-# output files (doctor's oracle probe writes one throwaway tile under the
-# temp dir); init writes the template into the target dir. Their reports go
-# to stdout like --plan; unexpected errors are one named line on stderr +
-# exit 1, like the run CLI. Future subcommands append here.
+# Dispatched in main() on the literal first token (token-wins) BEFORE the
+# run parser is built: a data file named like a subcommand runs as
+# `ppgrid ./<name>`. They are a separate top-level parser, not subparsers
+# of the run parser: the run CLI's optional `input` positional (nargs="?")
+# sits before any subparser positional in the same parser and would swallow
+# the command token ("ppgrid doctor" -> input="doctor", "invalid choice").
+# The run parser keeps a display-only subparsers action so `ppgrid --help`
+# shows the subcommand section (identical to `ppgrid help`); the run form
+# parses with it stripped (_parse_args_cli), leaving every run-path byte
+# identical. Read-only subcommands write no output files (doctor's oracle
+# probe writes one throwaway tile under the temp dir; init writes the
+# template). Their reports go to stdout like --plan; unexpected handler
+# errors are one named line on stderr + exit 1, like the run CLI. Future
+# subcommands append here.
 # ---------------------------------------------------------------------------
 
-_SUBCOMMANDS: tuple[str, ...] = ("doctor", "probe", "list-crs", "init")
+_SUBCOMMANDS: tuple[str, ...] = ("doctor", "probe", "list-crs", "init", "compare", "completions")
+
 
 _DOCTOR_MARK: dict[str, str] = {"pass": "[ok]", "warn": "[warn]", "fail": "[fail]"}
 
@@ -5526,27 +5617,17 @@ _LON_NAMES: frozenset[str] = frozenset({"lon", "lng", "long", "longitude"})
 _LAT_NAMES: frozenset[str] = frozenset({"lat", "latitude"})
 
 
-def _build_subcommand_parser() -> argparse.ArgumentParser:
-    """Build the subcommand parser (diagnostics #61 #62 #69 + init #63).
+def _add_subcommand_parsers(sub: argparse._SubParsersAction) -> None:
+    """Add the six subcommand parsers to a subparsers action (#61 #62 #63 #66 #67 #69).
 
-    A separate top-level parser, dispatched on argv[0] in main() before the
-    run parser is built (see the section note above): the run CLI's
-    optional `input` positional would otherwise swallow the command token
-    before a subparser could validate it. The top parser is add_help=False
-    (the run CLI owns `ppgrid --help`); each subparser keeps its own -h.
-    Future subcommands append here.
+    Single definition of the subcommand surface: the dispatch parser
+    (_build_subcommand_parser) and the run parser's display-only append
+    (_build_parser) both call this, so the two cannot drift.
 
-    Returns:
-        The parser; `parse_args(argv)` with argv[0] a subcommand name.
+    Args:
+        sub: The subparsers action to add the subcommand parsers to.
 
     """
-    parser = argparse.ArgumentParser(
-        prog="ppgrid",
-        add_help=False,
-        description="ppgrid subcommands. The default form is the run CLI: ppgrid INPUT [flags].",
-    )
-    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True, title="subcommands")
-
     sub.add_parser(
         "doctor",
         help="runtime stack health report",
@@ -5614,6 +5695,67 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     )
     p_init.add_argument("dir", nargs="?", default=".", help="Directory to write the template into (default: .)")
     p_init.add_argument("--force", action="store_true", help="Overwrite an existing ppgrid.toml (default: exit 2)")
+
+    c = sub.add_parser(
+        "compare",
+        help="Compare two ppgrid outputs (out dirs or GeoTIFFs); exit 0 identical / 1 different / 2 usage",
+        description=(
+            "Compare two ppgrid outputs, band by band.\n\n"
+            "Two output dirs are compared as the (value, support_km) band pair; two "
+            "GeoTIFFs as the given pair. The report covers structure (shape, "
+            "transform, CRS), per-cell exact-match counts, the max abs DN difference, "
+            "and the mismatch bounding box. The report goes to stdout (progress stays "
+            "on stderr).\n\n"
+            "Exit codes: 0 identical (or within --max-diff), 1 different, "
+            "2 usage error (missing files, mixed dir/file, unreadable raster)."
+        ),
+    )
+    c.add_argument("OUT1", help="First ppgrid output dir (value.tif + support_km.tif) or value GeoTIFF")
+    c.add_argument("OUT2", help="Second ppgrid output dir or value GeoTIFF (same form as OUT1)")
+    c.add_argument(
+        "--max-diff",
+        type=_nonneg_int,
+        default=0,
+        metavar="N",
+        help="Tolerated max abs DN difference (a band counts as identical up to this) (default: 0)",
+    )
+    z = sub.add_parser(
+        "completions",
+        help="Print shell completions (bash or zsh), generated from the live parser",
+        description=(
+            "Print shell completions to stdout, generated from the live argparse "
+            "parser of this ppgrid version (no external completion framework, no "
+            "timestamps: the output is deterministic for a given version). Install "
+            'with eval "$(ppgrid completions bash)" or eval "$(ppgrid completions zsh)" '
+            "(or append to your shell rc file)."
+        ),
+    )
+    z.add_argument("shell", choices=["bash", "zsh"], help="Target shell")
+
+
+def _build_subcommand_parser() -> argparse.ArgumentParser:
+    """Build the subcommand parser (diagnostics #61 #62 #69 + init #63 + verify #66 #67).
+
+    A separate top-level parser, dispatched on the literal first token
+    in main() (token-wins) before the run parser is built (see the
+    section note above): the run CLI's optional `input` positional would
+    otherwise swallow the command token before a subparser could
+    validate it. The top parser is add_help=False (the run CLI owns
+    `ppgrid --help`); each subparser keeps its own -h. The run parser
+    mirrors this surface display-only for --help (see _build_parser).
+    Future subcommands append to _add_subcommand_parsers.
+
+    Returns:
+        The parser; `parse_args(argv)` with argv[0] a subcommand name.
+
+    """
+    parser = argparse.ArgumentParser(
+        prog="ppgrid",
+        add_help=False,
+        description="ppgrid subcommands. The default form is the run CLI: ppgrid INPUT [flags].",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True, title="subcommands")
+    _add_subcommand_parsers(sub)
     return parser
 
 
@@ -5624,9 +5766,9 @@ def _run_subcommand(argv: list[str]) -> None:
     subcommand contract); init is the exception — it returns on success
     (a plain return from main()) and _cmd_init raises its own
     SystemExit 1 (IO) / 2 (usage). argparse usage errors exit 2 on
-    their own; any other unexpected exception on the diag path is one
-    named error line + exit 1, not a traceback (the run CLI's _run_cli
-    contract).
+    their own; any other unexpected handler exception — diag, compare
+    or completions — is one named error line + exit 1, not a traceback
+    (the run CLI's _run_cli contract).
 
     Args:
         argv: The full subcommand argv, argv[0] = the subcommand name.
@@ -5648,12 +5790,513 @@ def _run_subcommand(argv: list[str]) -> None:
             code = _cmd_doctor()
         elif args.command == "probe":
             code = _cmd_probe(args)
-        else:  # list-crs
+        elif args.command == "list-crs":
             code = _cmd_list_crs(args)
+        elif args.command == "compare":
+            code = _compare_outputs(args.OUT1, args.OUT2, args.max_diff)
+        else:  # completions
+            # Generated from the live RUN parser (display subparsers
+            # included) so the scripts cover the full CLI surface, not
+            # just the subcommands.
+            code = _completions_print(args.shell, _build_parser())
     except Exception as e:  # ruff: ignore[blind-except] — named error, no traceback
         print(f"error: {args.command}: {type(e).__name__}: {e}", file=sys.stderr)  # ruff: ignore[print]
         code = 1
     raise SystemExit(code)
+
+
+# ---------------------------------------------------------------------------
+# compare (#67)
+# ---------------------------------------------------------------------------
+
+
+def _compare_resolve(out1: str, out2: str) -> list[tuple[str, Path, Path]]:
+    """Map two compare arguments to (label, path_a, path_b) band pairs (#67).
+
+    Both dirs -> the (value, support_km) band pair; both files -> the given
+    pair (label = the filenames). Mixed dir/file, or a dir missing either
+    final raster, is a usage error (exit 2).
+
+    Args:
+        out1: First argument (output dir or GeoTIFF).
+        out2: Second argument (same form as out1).
+
+    Returns:
+        The band pair list (two entries for dirs, one for files).
+
+    Raises:
+        ValueError: Usage error (message is printed, exit 2).
+
+    """
+    a, b = Path(out1), Path(out2)
+    if not a.exists():
+        msg = f"not found: {out1}"
+        raise ValueError(msg)
+    if not b.exists():
+        msg = f"not found: {out2}"
+        raise ValueError(msg)
+    if a.is_dir() != b.is_dir():
+        msg = "cannot mix directory and file arguments (pass two output dirs or two GeoTIFFs)"
+        raise ValueError(msg)
+    if a.is_dir():
+        pairs = [
+            ("value", a / "value.tif", b / "value.tif"),
+            ("support_km", a / "support_km.tif", b / "support_km.tif"),
+        ]
+        missing = [f.name for _, pa, pb in pairs for f in (pa, pb) if not f.is_file()]
+        if missing:
+            msg = f"not a ppgrid output dir (missing: {', '.join(missing)})"
+            raise ValueError(msg)
+        return pairs
+    return [(a.name, a, b)]
+
+
+def _compare_band(label: str, pa: Path, pb: Path, max_diff: int) -> tuple[list[str], bool, int]:
+    """Compare one band pair: structure + per-cell diff report (#67).
+
+    Identical = same shape, same transform, same CRS, and max abs DN diff
+    <= max_diff. The pixel sweep is row-chunked (1024 rows) so the temp
+    arrays stay small even for global rasters.
+
+    Args:
+        label: Band label for the report (value / support_km / filename).
+        pa: First GeoTIFF.
+        pb: Second GeoTIFF.
+        max_diff: Tolerated max abs DN difference.
+
+    Returns:
+        (report lines, identical, mismatch cell count).
+
+    Raises:
+        OSError: Unreadable raster (mapped to exit 2 by the caller).
+
+    """
+    with rasterio.open(pa) as da, rasterio.open(pb) as db:
+        lines = [f"compare: {label} ({pa} vs {pb})"]
+        shape_ok = da.width == db.width and da.height == db.height
+        transform_ok = da.transform == db.transform
+        crs_a = da.crs.to_string() if da.crs is not None else "None"
+        crs_b = db.crs.to_string() if db.crs is not None else "None"
+        crs_ok = crs_a == crs_b
+        lines.extend(
+            [
+                f"  shape:     {da.height}x{da.width} {'=' if shape_ok else '!='} {db.height}x{db.width}",
+                f"  transform: {'equal' if transform_ok else 'differ'}",
+                f"  crs:       {crs_a} {'=' if crs_ok else '!='} {crs_b}",
+            ]
+        )
+        if not shape_ok:
+            lines.extend(["  cells:     n/a (shape mismatch)", "  max diff:  n/a (shape mismatch)"])
+            return lines, False, -1
+        exact = 0
+        mismatch = 0
+        max_d = 0
+        min_row = min_col = -1
+        max_row = max_col = -1
+        h, w = da.height, da.width
+        for r0 in range(0, h, 1024):
+            r1 = min(r0 + 1024, h)
+            win = Window(0, r0, w, r1 - r0)
+            d = da.read(1, window=win).astype(np.int32) - db.read(1, window=win).astype(np.int32)
+            n_neq = int((d != 0).sum())
+            exact += d.size - n_neq
+            mismatch += n_neq
+            if n_neq:
+                max_d = max(max_d, int(np.abs(d).max()))
+                rr, cc = np.nonzero(d)
+                rmin, rmax = int(rr.min()) + r0, int(rr.max()) + r0
+                cmin, cmax = int(cc.min()), int(cc.max())
+                min_row = rmin if min_row < 0 else min(min_row, rmin)
+                max_row = rmax if max_row < 0 else max(max_row, rmax)
+                min_col = cmin if min_col < 0 else min(min_col, cmin)
+                max_col = cmax if max_col < 0 else max(max_col, cmax)
+        lines.extend([f"  cells:     {h * w} total, {exact} exact, {mismatch} mismatch", f"  max diff:  {max_d}"])
+        if mismatch:
+            bbox = f"rows {min_row}..{max_row}, cols {min_col}..{max_col}"
+            if transform_ok:
+                mwin = Window(min_col, min_row, max_col - min_col + 1, max_row - min_row + 1)
+                left, bottom, right, top = rasterio.windows.bounds(mwin, da.transform)
+                bbox += f"; georef ({crs_a}): left={left:.3f} bottom={bottom:.3f} right={right:.3f} top={top:.3f}"
+            lines.append(f"  mismatch bbox: {bbox}")
+        return lines, shape_ok and transform_ok and crs_ok and max_d <= max_diff, mismatch
+
+
+def _compare_outputs(out1: str, out2: str, max_diff: int) -> int:
+    """Run `ppgrid compare OUT1 OUT2` (#67); returns the exit code.
+
+    0 = identical (or within --max-diff), 1 = different, 2 = usage error.
+    The report goes to stdout (like --plan); usage errors go to stderr.
+
+    Args:
+        out1: First output dir or GeoTIFF.
+        out2: Second output dir or GeoTIFF (same form as out1).
+        max_diff: Tolerated max abs DN difference.
+
+    Returns:
+        The exit code (0/1/2).
+
+    """
+    _load_native()
+    try:
+        pairs = _compare_resolve(out1, out2)
+    except ValueError as e:
+        print(f"compare: {e}", file=sys.stderr)  # ruff: ignore[print]
+        return 2
+    lines: list[str] = []
+    n_bad = 0
+    total_mismatch = 0
+    for label, pa, pb in pairs:
+        try:
+            band_lines, ok, mismatch = _compare_band(label, pa, pb, max_diff)
+        except OSError as e:
+            print(f"compare: read error ({pa} vs {pb}): {e}", file=sys.stderr)  # ruff: ignore[print]
+            return 2
+        lines.extend(band_lines)
+        n_bad += 0 if ok else 1
+        total_mismatch += max(mismatch, 0)
+    for line in lines:
+        print(line)  # ruff: ignore[print]
+    if n_bad:
+        print(f"compare: different ({n_bad} of {len(pairs)} bands)")  # ruff: ignore[print]
+        return 1
+    if total_mismatch:
+        print(f"compare: within --max-diff ({total_mismatch} cell(s) differ, all <= {max_diff})")  # ruff: ignore[print]
+    else:
+        print("compare: identical")  # ruff: ignore[print]
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# completions (#66)
+# ---------------------------------------------------------------------------
+
+
+def _completions_collect(parser: argparse.ArgumentParser) -> dict[str, Any]:
+    """Collect completion data from a live argparse parser, recursively (#66).
+
+    Deterministic: options sorted by alias, subcommands sorted by name,
+    choice words sorted. Positionals keep definition order.
+
+    Args:
+        parser: A parser from _build_parser (or one of its subparsers).
+
+    Returns:
+        {"options": [(alias, help), ...],
+         "positionals": [word, ...],
+         "subcommands": [(name, help, sub-data), ...]}
+
+    """
+    options: list[tuple[str, str]] = []
+    positionals: list[str] = []
+    subcommands: list[tuple[str, str, dict[str, Any]]] = []
+    actions = parser._actions  # ruff: ignore[private-member-access]
+    for action in actions:
+        if action.option_strings:
+            help_text = " ".join((action.help or "").split())
+            options.extend((alias, help_text) for alias in sorted(action.option_strings))
+        elif isinstance(action, argparse._SubParsersAction):  # ruff: ignore[private-member-access]
+            for name in sorted(action.choices):
+                sub = action.choices[name]
+                desc = " ".join((sub.description or "").split())
+                subcommands.append((name, desc, _completions_collect(sub)))
+        elif action.choices:
+            positionals.extend(sorted(action.choices))
+        else:
+            positionals.append(action.metavar or action.dest)
+    return {"options": options, "positionals": positionals, "subcommands": subcommands}
+
+
+def _completions_bash(items: dict[str, Any]) -> str:
+    """Render the bash completion script from a collect() tree (#66)."""
+
+    def menu(it: dict[str, Any]) -> str:
+        words = [alias for alias, _ in it["options"]]
+        words.extend(it["positionals"])
+        words.extend(name for name, _, _ in it["subcommands"])
+        return " ".join(sorted(words))
+
+    cases: list[tuple[str, str]] = [(name, menu(sub)) for name, _, sub in items["subcommands"]]
+    cases.append(("*", menu(items)))
+    parts = [
+        "# ppgrid bash completions (generated: `ppgrid completions bash`)",
+        '# Install: eval "$(ppgrid completions bash)"  (or append to ~/.bashrc)',
+        "#",
+        "# Deterministic: sorted words, no timestamps; regenerate after a ppgrid upgrade.",
+        "",
+        "_ppgrid_completions() {",
+        "    local cur cmd",
+        '    cur="${COMP_WORDS[COMP_CWORD]}"',
+        '    cmd="${COMP_WORDS[1]:-}"',
+        '    case "$cmd" in',
+    ]
+    for name, words in cases:
+        parts.extend(
+            [
+                f"        {name})",
+                f'            COMPREPLY=( $(compgen -W "{words}" -- "$cur") )',
+                "            return 0",
+                "            ;;",
+            ]
+        )
+    parts.extend(
+        [
+            "    esac",
+            "    return 0",
+            "}",
+            "complete -o default -F _ppgrid_completions ppgrid",
+            "",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def _zsh_word(text: str) -> str:
+    """Quote a word for a zsh single-quoted string (escape embedded quotes)."""
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def _completions_zsh(items: dict[str, Any]) -> str:
+    """Render the zsh completion script from a collect() tree (#66)."""
+
+    def menu(it: dict[str, Any]) -> list[str]:
+        words: list[str] = []
+        for alias, help_text in it["options"]:
+            desc = f":{help_text}" if help_text else ""
+            words.append(_zsh_word(alias + desc))
+        words.extend(_zsh_word(w) for w in it["positionals"])
+        for name, desc, _ in it["subcommands"]:
+            d = f":{desc}" if desc else ""
+            words.append(_zsh_word(name + d))
+        return words
+
+    cases: list[tuple[str, list[str]]] = [(name, menu(sub)) for name, _, sub in items["subcommands"]]
+    cases.append(("*", menu(items)))
+    parts = [
+        "#compdef ppgrid",
+        "# ppgrid zsh completions (generated: `ppgrid completions zsh`)",
+        '# Install: eval "$(ppgrid completions zsh)"  (or save and source from .zshrc)',
+        "#",
+        "# Deterministic: sorted words, no timestamps; regenerate after a ppgrid upgrade.",
+        "",
+        "_ppgrid() {",
+        "    local -a opts",
+        '    case "${words[2]:-}" in',
+    ]
+    for name, words in cases:
+        parts.extend([f"        {name})", "            opts=("])
+        parts.extend(f"                {w}" for w in words)
+        parts.extend(["            )", "            ;;"])
+    parts.extend(
+        [
+            "    esac",
+            "    _describe 'ppgrid' opts",
+            "}",
+            "",
+            '_ppgrid "$@"',
+            "",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def _completions_print(shell: str, parser: argparse.ArgumentParser) -> int:
+    """Print `ppgrid completions <shell>` to stdout; returns the exit code (#66).
+
+    Generated from the live parser of this ppgrid version (no external
+    completion framework); deterministic for a given version.
+    """
+    items = _completions_collect(parser)
+    text = _completions_bash(items) if shell == "bash" else _completions_zsh(items)
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# post-write verify (--check, #68)
+# ---------------------------------------------------------------------------
+
+_CHECK_WIN_PX = 16  # --check corner-window side
+_CHECK_PT_CHUNK = 50_000  # point-chunk size for the coverage sweep
+
+
+def _corner_windows(w: int, h: int, size: int = _CHECK_WIN_PX) -> tuple[tuple[str, Window], ...]:
+    """Return the four corner windows of a raster, clamped to its size (#68)."""
+    s = min(size, w, h)
+    return (
+        ("top-left", Window(0, 0, s, s)),
+        ("top-right", Window(w - s, 0, s, s)),
+        ("bottom-left", Window(0, h - s, s, s)),
+        ("bottom-right", Window(w - s, h - s, s, s)),
+    )
+
+
+def _window_out_of_coverage(
+    win: Window,
+    ds: rasterio.DatasetBase,
+    out_crs: str,
+    work_crs: str,
+    p: Pipeline,
+    cap_cells: int,
+) -> np.ndarray:
+    """Per-pixel out-of-coverage mask for one window, window-shaped (#68).
+
+    Coverage = the fill's own definition: a cell is covered when at least one
+    input point falls in its (2*cap_cells+1)^2 cell window. The near mask the
+    quantizer applies is exactly this box count (pullpush.box_count: "the
+    exact answer to 'is there data within cap of this cell?'"), so an
+    uncovered cell never receives a fill value and can only hold NODATA: a 0
+    there is a zero-filled buffer, not a decoded value.
+
+    Pixel centers in the raster CRS are transformed to the work CRS (true
+    metres, equal-area) and mapped to cell indices with the same
+    (x - x0) // res truncation the point binning uses, so the mask
+    reproduces the fill's per-cell decision. The sweep is point-chunked
+    (temp arrays at ~n_px x 50k int32; a pixel drops out as soon as a chunk
+    proves it covered).
+
+    Args:
+        win: The window (raster pixel coords).
+        ds: Open raster (transform + CRS).
+        out_crs: The raster CRS (EPSG string).
+        work_crs: The point CRS (EPSG string).
+        p: The Pipeline (work-CRS points + grid origin/res).
+        cap_cells: The fill cap in cells (same round() as the pipeline).
+
+    Returns:
+        bool array (win.height, win.width): True = out of coverage.
+
+    """
+    tf = ds.transform
+    cols = win.col_off + np.arange(win.width) + 0.5
+    rows = win.row_off + np.arange(win.height) + 0.5
+    xx, yy = np.meshgrid(cols, rows)
+    tx = tf.a * xx + tf.b * yy + tf.c
+    ty = tf.d * xx + tf.e * yy + tf.f
+    if out_crs != work_crs:
+        inv = Transformer.from_crs(out_crs, work_crs, always_xy=True)
+        tx, ty = inv.transform(tx.ravel(), ty.ravel())
+    else:
+        tx, ty = tx.ravel(), ty.ravel()
+    tx = np.asarray(tx, dtype=np.float64)
+    ty = np.asarray(ty, dtype=np.float64)
+    n = tx.size
+    px = ((tx - p.x0) // p.res).astype(np.int32)
+    py = ((ty - p.y0) // p.res).astype(np.int32)
+    sx_all = ((p.x - p.x0) // p.res).astype(np.int32)
+    sy_all = ((p.y - p.y0) // p.res).astype(np.int32)
+    best = np.full(n, np.iinfo(np.int32).max, dtype=np.int32)
+    for s in range(0, sx_all.size, _CHECK_PT_CHUNK):
+        sx = sx_all[s : s + _CHECK_PT_CHUNK]
+        sy = sy_all[s : s + _CHECK_PT_CHUNK]
+        d = np.maximum(np.abs(px[:, None] - sx[None, :]), np.abs(py[:, None] - sy[None, :]))
+        best = np.minimum(best, d.min(axis=1))
+        if (best <= cap_cells).all():
+            break
+    return (best > cap_cells).reshape(win.height, win.width)
+
+
+def _post_write_check(p: Pipeline, out: Path) -> None:
+    """Reopen the published outputs and verify them against the run plan (#68).
+
+    Per final raster (value.tif, support_km.tif):
+      - the file exists;
+      - band 1 is readable (center window reads back; count 1, int16,
+        512x512 tiled);
+      - shape, transform and CRS match the plan (the exact geometry the
+        write phase used: the work grid, or calculate_default_transform
+        for a reprojected output);
+      - the nodata tag is NODATA;
+      - every pixel of the four 16x16 corner windows that has no input
+        point within its fill-cap window (the fill's own box-count near
+        mask) holds NODATA, not 0 (a zero-filled buffer instead of a
+        NoData init shows up there first).
+
+    Args:
+        p: The Pipeline that just ran (plan geometry + work-CRS points).
+        out: The run's output directory.
+
+    Raises:
+        SystemExit: 1 when any check fails — the exact field is logged and
+            the outputs are kept (verify, don't repair).
+
+    """
+    _load_native()
+    problems: list[str] = []
+    work_crs = f"EPSG:{p.work_crs}"
+    out_crs = f"EPSG:{p.out_crs}"
+    if p.out_crs != p.work_crs:
+        # Same call the write phase made (single source of truth).
+        exp_tf, exp_w, exp_h = rasterio.warp.calculate_default_transform(
+            work_crs,
+            out_crs,
+            p.nx,
+            p.ny,
+            p.x0,
+            p.y0,
+            p.x0 + p.nx * p.res,
+            p.y0 + p.ny * p.res,
+        )
+    else:
+        exp_w, exp_h, exp_tf = p.nx, p.ny, from_origin(p.x0, p.y0 + p.ny * p.res, p.res, p.res)
+    exp_crs = CRS.from_user_input(out_crs)
+    cap_cells = round(p.cap_km_val * M_PER_KM / p.res)
+    for name in ("value.tif", "support_km.tif"):
+        path = out / name
+        if not path.is_file():
+            problems.append(f"{name}: file missing (expected {path})")
+            continue
+        try:
+            with rasterio.open(path) as ds:
+                if (ds.height, ds.width) != (exp_h, exp_w):
+                    problems.append(f"{name}: shape {ds.height}x{ds.width} != planned {exp_h}x{exp_w}")
+                if ds.transform != exp_tf:
+                    problems.append(f"{name}: transform {tuple(ds.transform)} != planned {tuple(exp_tf)}")
+                got_crs = ds.crs.to_string() if ds.crs is not None else "None"
+                if ds.crs is None or ds.crs != exp_crs:
+                    problems.append(f"{name}: crs {got_crs} != planned {out_crs}")
+                if ds.count != 1:
+                    problems.append(f"{name}: band count {ds.count} != 1")
+                    continue
+                if ds.dtypes[0] != "int16":
+                    problems.append(f"{name}: dtype {ds.dtypes[0]} != int16")
+                bsize = (ds.profile.get("blockxsize", 1), ds.profile.get("blockysize", 1))
+                tiled = bool(ds.profile.get("tiled", False)) and all(b > 1 for b in bsize)
+                if not tiled or bsize != (TILE_PX, TILE_PX):
+                    problems.append(f"{name}: tiles {bsize} (tiled={tiled}) != planned {TILE_PX}x{TILE_PX} tiled")
+                nd = ds.nodata
+                if nd is None or int(nd) != NODATA:
+                    problems.append(f"{name}: nodata tag {nd!r} != {NODATA}")
+                s = min(_CHECK_WIN_PX, ds.width, ds.height)
+                cwin = Window(ds.width // 2 - s // 2, ds.height // 2 - s // 2, s, s)
+                try:
+                    ds.read(1, window=cwin)
+                except OSError as e:
+                    problems.append(f"{name}: center window unreadable: {e}")
+                    continue
+                for corner, win in _corner_windows(ds.width, ds.height):
+                    arr = ds.read(1, window=win)
+                    ooc = _window_out_of_coverage(win, ds, out_crs, work_crs, p, cap_cells)
+                    zeros = int(np.count_nonzero((arr == 0) & ooc))
+                    if zeros:
+                        problems.append(
+                            f"{name}: {corner} corner (rows {win.row_off}..{win.row_off + win.height - 1}, "
+                            f"cols {win.col_off}..{win.col_off + win.width - 1}): {zeros} zero pixel(s) "
+                            f"with no input point within the {p.cap_km_val:g} km fill-cap window "
+                            f"(expected NODATA {NODATA})"
+                        )
+        except OSError as e:
+            problems.append(f"{name}: cannot open: {e}")
+    if problems:
+        for line in problems:
+            _ui_note("error", f"check: {line}")
+        _ui_note("error", f"check failed: {len(problems)} mismatch(es); outputs kept in {out}")
+        raise SystemExit(1)
+    _ui_note(
+        "ok",
+        "check: value.tif + support_km.tif verified against the run plan "
+        "(shape, transform, CRS, nodata tag, tiles, corners)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6395,14 +7038,15 @@ def main(argv: list[str] | None = None) -> None:
 
     Parses ``argv`` (defaults to ``sys.argv[1:]``), runs the pipeline
     end-to-end, and reports through the CLI presentation layer. stdout is
-    reserved for ``--plan``, ``help``, ``--version`` and the read-only
-    subcommand reports (doctor / probe / list-crs, #61 #62 #69); every
-    other line (progress, warnings, errors, the run summary) goes to
-    stderr.
+    reserved for ``--plan``, ``help``, ``--version``, the subcommand
+    reports (compare / doctor / probe / list-crs, #61 #62 #66 #69) and the
+    completion scripts (completions, #66); every other line (progress,
+    warnings, errors, the run summary) goes to stderr.
 
     Subcommands are dispatched on argv[0] before the run parser is built
     (separate parser, see the section note): ``ppgrid doctor``,
-    ``ppgrid probe INPUT``, ``ppgrid list-crs``. ``ppgrid init [DIR]``
+    ``ppgrid probe INPUT``, ``ppgrid list-crs``, ``ppgrid compare OUT1
+    OUT2`` and ``ppgrid completions bash|zsh``. ``ppgrid init [DIR]``
     (issue #63) writes the config template and exits before any of the run
     machinery runs.
 
@@ -6422,19 +7066,19 @@ def main(argv: list[str] | None = None) -> None:
         SystemExit: 0 (ok, help, --plan, init), 1 (pipeline/IO error),
             2 (validation error), 3 (--turbo-strict infeasible) — as
             documented on _run_cli (propagated unchanged). Subcommands:
-            doctor 0/1, probe 0/1/2, list-crs 0/1, init 0/1/2 (see
-            _run_subcommand). SIGINT on either path is the run contract:
-            exit 130, one line, no traceback.
+            doctor 0/1, probe 0/1/2, list-crs 0/1, init 0/1/2,
+            compare 0/1/2, completions 0/2 (see _run_subcommand). SIGINT
+            on either path is the run contract: exit 130, one line, no
+            traceback.
 
     """
     if argv is None:
         argv = sys.argv[1:]
-    # Subcommands (issue #63, first batch: init) dispatch before the run
-    # parser: the run CLI's positional/flag surface stays byte-identical
-    # (argparse cannot mix a bare positional with subparsers). Dispatch is
-    # on the literal first token (token-wins, same rule as the sibling
-    # diag/verify CLI branches): a data file named like the subcommand is
-    # run as `ppgrid ./init`. Interrupts keep the run contract (130).
+    # Subcommands dispatch on the literal first token (token-wins) before
+    # the run parser is built: the run CLI's positional/flag surface stays
+    # byte-identical (argparse cannot mix a bare positional with
+    # subparsers). A data file named like a subcommand runs as
+    # `ppgrid ./<name>`. Interrupts keep the run contract (130).
     if argv and argv[0] in _SUBCOMMANDS:
         try:
             _run_subcommand(argv)
@@ -6444,7 +7088,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     out: Path | None = None
     try:
-        args = parser.parse_args(argv)
+        args = _parse_args_cli(parser, argv)
         # -h/--help/--version exit inside parse_args, so the lazy stack
         # (pandas, rasterio, pyproj) and the presentation layer (rich) are
         # paid for only by real runs, not by help/version (fast CLI).
@@ -6550,6 +7194,8 @@ def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Pat
             # contract).
             p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False, ui=ui), args.input)
             _map_pipeline_errors(p.run, args.input)
+            if args.check:
+                _post_write_check(p, out)
             _write_run_sidecar(args, out)  # #64: run fingerprint sidecar
             if args.json:
                 _write_json_summary(p, args, out)

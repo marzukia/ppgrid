@@ -153,6 +153,13 @@ ignore = [
     "S404",   # suspicious subprocess import
     "S603",   # subprocess.run([sys.executable, -c, <own constant>])
 ]
+# tests/test_cli_verify.py runs fresh-interpreter lazy-import probes (#69) and
+# drives the CLI in-process; the subprocess calls are own-argv, no shell.
+"tests/test_cli_verify.py" = [
+    "S404",   # suspicious subprocess import
+    "S602",   # subprocess.run([sys.executable, -c, <own constant>]), no shell
+    "S603",   # returncode asserted explicitly
+]
 # tests/test_public_api.py runs fresh-interpreter guards (issue #109).
 "tests/test_public_api.py" = [
     "S404",   # suspicious subprocess import

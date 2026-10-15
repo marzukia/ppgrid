@@ -41,6 +41,7 @@ from ppgrid.pipeline import (
     UNSET,
     _apply_config,
     _build_parser,
+    _parse_args_cli,
     main,
 )
 
@@ -115,7 +116,7 @@ cap-km = 20
     p = _build_parser()
 
     # 1. config only: every config value beats the built-in default
-    a = p.parse_args(["in.csv"])
+    a = _parse_args_cli(p, ["in.csv"])
     _apply_config(p, a)
     assert (a.res, a.transform, a.workers, a.scale, a.value_col, a.cap_km) == (
         1000.0,
@@ -127,13 +128,14 @@ cap-km = 20
     )
 
     # 2. one flag: the flag beats its config value; the other config keys still apply
-    a = p.parse_args(["in.csv", "--res", "250"])
+    a = _parse_args_cli(p, ["in.csv", "--res", "250"])
     _apply_config(p, a)
     assert a.res == 250.0
     assert (a.transform, a.workers, a.scale, a.value_col, a.cap_km) == ("log10", 3, 10.0, "alt", 20.0)
 
     # 3. all six flags: every flag beats its config value
-    a = p.parse_args(
+    a = _parse_args_cli(
+        p,
         [
             "in.csv",
             "--res",
@@ -148,14 +150,14 @@ cap-km = 20
             "v2",
             "--cap-km",
             "40",
-        ]
+        ],
     )
     _apply_config(p, a)
     assert (a.res, a.transform, a.workers, a.scale, a.value_col, a.cap_km) == (300.0, "sqrt", 5, 50.0, "v2", 40.0)
 
     # 4. no config anywhere: built-in defaults, and no UNSET sentinel leaks
     (isolated / "ppgrid.toml").unlink()
-    a = p.parse_args(["in.csv"])
+    a = _parse_args_cli(p, ["in.csv"])
     _apply_config(p, a)
     assert (a.res, a.transform, a.workers, a.scale, a.value_col, a.cap_km) == (500.0, "auto", 4, 100.0, "value", "auto")
     for key, dest, _, _ in _CONFIG_OPTIONS:
@@ -172,7 +174,7 @@ def test_discovery_order(isolated: Path) -> None:
     p = _build_parser()
 
     def effective() -> tuple[float, Path | None]:
-        a = p.parse_args(["in.csv"])
+        a = _parse_args_cli(p, ["in.csv"])
         cfg = _apply_config(p, a)
         return a.res, cfg.resolve() if cfg is not None else None
 
@@ -192,13 +194,13 @@ def test_discovery_order(isolated: Path) -> None:
     # 4. explicit --config beats cwd
     explicit = isolated / "explicit.toml"
     explicit.write_text("res = 700\n")
-    a = p.parse_args(["in.csv", "--config", str(explicit)])
+    a = _parse_args_cli(p, ["in.csv", "--config", str(explicit)])
     cfg = _apply_config(p, a)
     assert a.res == 700.0
     assert cfg == explicit
 
     # 5. explicit but missing: usage error 2
-    a = p.parse_args(["in.csv", "--config", str(isolated / "nope.toml")])
+    a = _parse_args_cli(p, ["in.csv", "--config", str(isolated / "nope.toml")])
     with pytest.raises(SystemExit) as e:
         _apply_config(p, a)
     assert e.value.code == 2
