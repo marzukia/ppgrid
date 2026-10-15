@@ -25,6 +25,22 @@ from ppgrid.calibrate import PercentileTransform
 
 C = pytest.mark.skipif(not ci.available(), reason="C kernel unavailable (np.interp fallback active)")
 
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS-only: the CI macos leg must FAIL (not skip) if the JIT C build regresses",
+)
+def test_macos_c_kernel_required() -> None:
+    """Hard gate for the macOS CI leg (review minor-1, #123).
+
+    The C-requiring tests above skip when the kernel is unavailable, so a
+    regressed darwin link would otherwise leave every macos leg green via
+    skips + the bit-identical np.interp fallback. This assert makes the
+    leg red when the JIT build fails on macOS.
+    """
+    assert ci.available(), f"C kernel unavailable on macOS: {ci._reason}"
+
+
 SEED = 20261011
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
