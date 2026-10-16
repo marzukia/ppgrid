@@ -2,9 +2,11 @@
 
 The turbo write path used to copy each block's int16 DN grids into the tmpfs
 DN fields from the main thread as results arrived; the copies now run in the
-worker threads via ``_CTX["dn"]`` (disjoint block windows -> thread-safe,
-byte-identical fields). These e2e tests pin that both turbo regimes (shared
-in-RAM and per_box) still produce bytes identical to a non-turbo run.
+worker threads (disjoint block windows -> thread-safe, byte-identical
+fields). Since audit #83 the DN pair rides in each _process_block task tuple
+(cfg, dn, bx, by) instead of a module-global _CTX. These e2e tests pin that
+both turbo regimes (shared in-RAM and per_box) still produce bytes identical
+to a non-turbo run, and that no module-level run state survives a turbo run.
 """
 
 from __future__ import annotations
@@ -55,8 +57,12 @@ def test_turbo_e2e_perbox_worker_dn_write_matches_nonturbo(tmp_path: Path, monke
     assert _sha(s0) == _sha(s1)
 
 
-def test_ctx_dn_cleared_after_block_pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_CTX must not leak the DN pair into a subsequent serial (per-box) run."""
+def test_no_module_level_run_state_after_turbo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No module global carries run state after a turbo run (audit #83).
+
+    The DN pair reached the workers inside each task tuple, so a subsequent
+    serial (per-box) run cannot see it: there is no _CTX to leak from.
+    """
     import ppgrid.pipeline as pm
 
     monkeypatch.setattr(pm.turbop, "resolve_cap", _identity_cap)
@@ -72,4 +78,4 @@ def test_ctx_dn_cleared_after_block_pool(tmp_path: Path, monkeypatch: pytest.Mon
         turbo_cap_gb=64.0,
     )
     p1.run()
-    assert "dn" not in pm._CTX  # ruff: ignore[private-member-access]
+    assert not hasattr(pm, "_CTX")

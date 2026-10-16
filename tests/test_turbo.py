@@ -1242,6 +1242,24 @@ def test_turbo_zstd_ok_catches_available_failure(tmp_path: Path, monkeypatch: py
     assert p._turbo_zstd_ok() is False  # ruff: ignore[private-member-access]
 
 
+def test_oracle_probe_geometry_derived_from_tile_px() -> None:
+    """Probe geometry is a single source; the width stays a partial tile (audit #83).
+
+    Both probe writers (Pipeline._turbo_zstd_ok, _doc_zstdmt) build the
+    same tile from _oracle_probe_tile(): the width must never be a
+    multiple of TILE_PX, else GDAL stores full tiles and the gate loses
+    its partial-edge-tile coverage (audit #81 F-1). Height and block size
+    are TILE_PX itself, so a tile-size bump cannot desync the probe.
+    """
+    from ppgrid.pipeline import _ORACLE_PROBE_W, TILE_PX, _oracle_probe_tile
+
+    assert 0 < _ORACLE_PROBE_W < 2 * TILE_PX
+    assert _ORACLE_PROBE_W % TILE_PX != 0  # partial edge tile: GDAL zero-pads it
+    tile = _oracle_probe_tile()
+    assert tile.shape == (TILE_PX, _ORACLE_PROBE_W)
+    assert tile.dtype == np.int16
+
+
 def test_turbo_precheck_passes_memory_ceiling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Audit #78 P1-2: _turbo_precheck hands min(physical, cgroup) to precheck."""
     monkeypatch.setattr(pipeline_mod.turbop, "resolve_cap", _identity_cap)

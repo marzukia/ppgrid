@@ -276,7 +276,7 @@ def test_melb10_anchor_bit_equal(tmp_path: Path) -> None:
 
 
 def test_perbox_after_shared_no_stale_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A per-box run after a shared run in one process must not reuse stale _CTX."""
+    """A per-box run after a shared run in one process must not reuse stale run state (audit #83)."""
     import ppgrid.pipeline as ig
 
     # Force the per-box fallback for grid B while grid A stays on the shared

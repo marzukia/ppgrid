@@ -1,7 +1,8 @@
 """Parallel per-tile ZSTD compression via the GDAL CPL compressor registry.
 
-GDAL's GTiff driver compresses 512px tiles serially, one libtiff ZSTD call
-per tile. The CPL registry (CPLGetCompressor) exposes the same ZSTD backend
+GDAL's GTiff driver compresses the pipeline's tiles (pipeline.TILE_PX,
+currently 512px) serially, one libtiff ZSTD call per tile.
+The CPL registry (CPLGetCompressor) exposes the same ZSTD backend
 as a per-call function: fresh ZSTD_CCtx per call, ZSTD_compress2 at the
 registry default level. That is thread-safe and can be driven from a Python
 thread pool for per-tile parallelism (turbo design S3.4 part 2).
