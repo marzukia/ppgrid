@@ -1,0 +1,11 @@
+{
+  "n_source": 20000000,
+  "n_queries": 1000000,
+  "power": 2.0,
+  "k": 8,
+  "min_neighbours": "k",
+  "wall_limit_s": 600.0,
+  "rss_limit_gb": 32.0,
+  "needs_andryo_confirmation": true,
+  "note": "v1 claimed regime (issue #107, s29.7): 20M points / 1M queries / <10 min wall / <32 GB RSS. Author-claimed, pending Andryo confirmation - the limits are reported against, never enforced as thresholds."
+}
