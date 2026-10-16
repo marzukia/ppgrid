@@ -4547,9 +4547,12 @@ class Pipeline:
         finally:
             # Release the local DN memmap holders before the final unlink
             # (same WinError 32 on Windows): `val_dn` / `sup_dn` would
-            # otherwise live to the function end, and `arr` is the warp-loop
-            # variable still bound to the last band's field.
-            val_dn = sup_dn = arr = None
+            # otherwise live to the function end, `arr` is the warp-loop
+            # variable still bound to the last band's field, and `dn` is
+            # the (val_dn, sup_dn) tuple the task args rode on — the happy
+            # path releases it after the pool, an exception inside the pool
+            # skips that line.
+            val_dn = sup_dn = arr = dn = None
             self._remove_run_temps()
             for p in out_dir.glob("_stock_scratch_*.tif"):
                 p.unlink(missing_ok=True)

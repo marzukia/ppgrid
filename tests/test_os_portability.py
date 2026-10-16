@@ -468,7 +468,9 @@ def _write_sim_csv(tmp_path: Path) -> Path:
     return csv
 
 
-def _recorded_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **pipeline_kwargs: Any) -> None:
+def _recorded_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, expect_failure: bool = False, **pipeline_kwargs: Any
+) -> None:
     """Full pipeline run; no .npy unlink may hit a still-held memmap.
 
     Records every main-process memmap via weakref (weakref: the recorder
@@ -477,6 +479,9 @@ def _recorded_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **pipeline_kw
     WinError 32; the weakref invariant is its Linux proxy. Pre-fix the
     serial run violated on _points.npy (cfg.pts was never released) and the
     turbo run additionally on the mid-run removal of the live DN fields.
+    With expect_failure the run must raise (a forced worker error) and the
+    invariant still holds: the finally releases its holders before the
+    unlink, so the real error is not masked by a WinError 32.
     """
     rec: list[weakref.ref] = []
     violations: list[str] = []
@@ -509,7 +514,11 @@ def _recorded_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **pipeline_kw
     monkeypatch.setattr(Path, "unlink", _unlink)
     csv = _write_sim_csv(tmp_path)
     p = Pipeline(str(csv), "value", "longitude", "latitude", str(tmp_path / "out"), **pipeline_kwargs)
-    p.run()
+    if expect_failure:
+        with pytest.raises(RuntimeError, match="simulated worker failure"):
+            p.run()
+    else:
+        p.run()
     assert violations == [], f".npy unlinked while its memmap was still held: {violations}"
 
 
@@ -531,6 +540,40 @@ def test_windows_mmap_released_before_unlink_turbo_sim(tmp_path: Path, monkeypat
     _recorded_run(
         monkeypatch,
         tmp_path,
+        res=500.0,
+        cap_km=10.0,
+        workers=2,
+        seed=0,
+        turbo=True,
+        skip_calibration=True,
+    )
+
+
+def test_windows_mmap_released_before_unlink_turbo_exception_sim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Turbo + worker failure: the `dn` holder is released before the final unlink (W1).
+
+    The success-path sim above leaves a gap: a worker raising (or a Ctrl-C)
+    inside the block pool skips the happy-path `dn = None`, so the
+    (val_dn, sup_dn) holder tuple the task args rode on can still reference
+    the live memmaps when the finally's _remove_run_temps() unlinks them
+    -> WinError 32 on real Windows, masking the real worker error. Force
+    _process_block to raise and assert the same weakref invariant on the
+    exception path.
+
+    """
+    monkeypatch.setenv("PPGRID_FORCE_MEMMAP", "1")
+
+    def _boom(*_a: Any, **_k: Any) -> NoReturn:
+        msg = "simulated worker failure"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(pipeline_mod, "_process_block", _boom)
+    _recorded_run(
+        monkeypatch,
+        tmp_path,
+        expect_failure=True,
         res=500.0,
         cap_km=10.0,
         workers=2,
