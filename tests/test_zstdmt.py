@@ -352,6 +352,68 @@ def test_tif_info_parses_bigtiff(tmp_path: Path) -> None:
     assert info.tile_bytes[0][:4] == _ZSTD_MAGIC
 
 
+def _make_bigtiff(
+    tag: int,
+    typ: int,
+    count: int,
+    payload: bytes,
+    *,
+    value_off: int = 100,
+    inline_value: bool = False,
+) -> bytes:
+    """Minimal little-endian BigTIFF: one IFD entry, value at value_off.
+
+    The entry's 8-byte value field holds the external offset value_off,
+    except when inline_value is set, in which case payload (8 bytes)
+    fills the field directly — the case where the value fits.
+
+    """
+    header = b"II" + struct.pack("<HHH", 43, 8, 8) + struct.pack("<Q", 16)
+    entry = struct.pack("<HH", tag, typ) + struct.pack("<Q", count)
+    field = payload if inline_value else struct.pack("<Q", value_off)
+    assert len(field) == 8  # the BigTIFF value field is 8 bytes (spec)
+    ifd = struct.pack("<Q", 1) + entry + field + struct.pack("<Q", 0)
+    if inline_value:
+        return header + ifd
+    assert 16 + len(ifd) <= value_off
+    return header + ifd + b"\x00" * (value_off - 16 - len(ifd)) + payload
+
+
+def test_bigtiff_9_12_byte_value_decodes_from_offset() -> None:
+    """A 9-12-byte BigTIFF value must decode from its stored offset (spec: 8-byte field).
+
+    The TIFF spec gives a BigTIFF IFD entry an 8-byte value field; a
+    value wider than that is stored at an offset. Pre-#83 the two parsers
+    diverged here: the pipeline copy read up to 12 bytes inline, zstdmt
+    read up to 8. The unified parser must keep the spec rule (total > 8
+    -> external), which GDAL-produced files rely on. This is the targeted
+    decode test for the case that used to decode differently per module.
+    """
+    for count, total in ((5, 10), (6, 12)):  # SHORT x5 = 10 B, x6 = 12 B: the 9-12 band
+        payload = struct.pack("<6H", 11, 22, 33, 44, 55, 66)[:total]
+        data = _make_bigtiff(256, 3, count, payload)  # tag 256, type SHORT
+        e, big, off_fmt, entry_size, cnt_size, inline, ifd_off = zstdmt.parse_tiff_header(data)
+        assert big is True
+        assert inline == 8  # the spec value-field width (the pre-#83 pipeline copy said 12)
+        tags = zstdmt.parse_ifd_tags(data, e, ifd_off, off_fmt, cnt_size, entry_size, inline)
+        typ, n, pos = tags[256]
+        assert (typ, n) == (3, count)
+        assert pos == 100  # external offset — NOT the entry's value field
+        # ruff: ignore[private-member-access]
+        assert zstdmt._decode_ints(data[pos : pos + total], e, typ, n) == struct.unpack(f"<{count}H", payload)
+    # Boundary: total == 8 fits the value field and stays inline (pos =
+    # IFD start 16 + entry count 8 + entry header 8 = 32... the value
+    # field sits at entry offset 12, i.e. file offset 16 + 8 + 12 = 36).
+    payload8 = struct.pack("<4H", 1, 2, 3, 4)
+    data = _make_bigtiff(256, 3, 4, payload8, inline_value=True)
+    e, _big, off_fmt, entry_size, cnt_size, inline, ifd_off = zstdmt.parse_tiff_header(data)
+    tags = zstdmt.parse_ifd_tags(data, e, ifd_off, off_fmt, cnt_size, entry_size, inline)
+    typ, n, pos = tags[256]
+    assert pos == 36
+    # ruff: ignore[private-member-access]
+    assert zstdmt._decode_ints(data[pos : pos + 8], e, typ, n) == (1, 2, 3, 4)
+
+
 def test_oracle_runs_on_bigtiff(tmp_path: Path) -> None:
     """oracle_check on a BigTIFF runs end-to-end without crashing the parser.
 

@@ -1386,6 +1386,55 @@ def test_map_pipeline_errors_widened() -> None:
     assert ei.value.code == 1
 
 
+def test_unknown_transform_library_path_is_named_value_error(tmp_path: Path) -> None:
+    """An unknown transform name is a named ValueError, not a raw StopIteration (audit #83).
+
+    The CLI validates against the factory choices; the library path
+    (Pipeline(transform=...)) used to StopIteration in the refit branch.
+    Both now resolve names through calibrate.transform_named.
+    """
+    from ppgrid.calibrate import transform_named
+
+    with pytest.raises(ValueError, match="Unknown transform"):
+        transform_named("not_a_transform")
+
+    csv = _write_pos_values_csv(tmp_path)
+    p = Pipeline(
+        csv,
+        "value",
+        "longitude",
+        "latitude",
+        str(tmp_path / "o"),
+        res=500.0,
+        workers=1,
+        skip_calibration=True,
+        transform="not_a_transform",
+    )
+    with pytest.raises(ValueError, match="Unknown transform"):
+        p.run()
+
+
+def test_unmapped_exception_maps_to_named_exit1() -> None:
+    """Default mapping: an unmapped exception type is a named one-liner, exit 1 (audit #83).
+
+    The exit-code contract no longer depends on each new failure mode
+    being born as a mapped class: anything not explicitly mapped above
+    the OSError clause lands on the default mapping.
+    """
+    from ppgrid.pipeline import _map_pipeline_errors
+
+    class _WeirdError(Exception):
+        """A failure mode with no mapping clause of its own."""
+
+    def boom() -> NoReturn:
+        msg = "simulated"
+        raise _WeirdError(msg)
+
+    with pytest.raises(SystemExit) as ei:
+        _map_pipeline_errors(boom, "in.csv")
+    assert ei.value.code == 1
+
+
 def test_parquet_input_e2e(tmp_path: Path) -> None:
     """Parquet input runs the full pipeline (optional pyarrow extra)."""
     pytest.importorskip("pyarrow")

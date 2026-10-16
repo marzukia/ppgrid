@@ -1242,6 +1242,54 @@ def test_turbo_zstd_ok_catches_available_failure(tmp_path: Path, monkeypatch: py
     assert p._turbo_zstd_ok() is False  # ruff: ignore[private-member-access]
 
 
+def test_oracle_probe_geometry_derived_from_tile_px() -> None:
+    """Probe geometry is a single source; the width stays a partial tile (audit #83).
+
+    Both probe writers (Pipeline._turbo_zstd_ok, _doc_zstdmt) build the
+    same tile from _oracle_probe_tile(): the width must never be a
+    multiple of TILE_PX, else GDAL stores full tiles and the gate loses
+    its partial-edge-tile coverage (audit #81 F-1). Height and block size
+    are TILE_PX itself, so a tile-size bump cannot desync the probe.
+    """
+    from ppgrid.pipeline import _ORACLE_PROBE_W, TILE_PX, _oracle_probe_tile
+
+    assert 0 < _ORACLE_PROBE_W < 2 * TILE_PX
+    assert _ORACLE_PROBE_W % TILE_PX != 0  # partial edge tile: GDAL zero-pads it
+    tile = _oracle_probe_tile()
+    assert tile.shape == (TILE_PX, _ORACLE_PROBE_W)
+    assert tile.dtype == np.int16
+
+
+def test_doc_zstdmt_probe_width_from_single_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_doc_zstdmt's on-disk probe width comes from _ORACLE_PROBE_W (audit #83).
+
+    The geometry test above pins _oracle_probe_tile's shape, but a future
+    probe writer reverting to a literal `width=500` would still pass it
+    (the original connascence: two writers drifting). Run the doctor's
+    check with the throwaway-dir cleanup stubbed so the probe survives,
+    read the written TIFF back, and assert its width equals the single
+    source. available() is stubbed True so the probe-write branch runs on
+    every platform (macOS CI has no CPL zstd); the oracle verdict itself
+    is allowed to be whatever this stack produces.
+
+    """
+    from ppgrid.pipeline import _ORACLE_PROBE_W, TILE_PX, _doc_zstdmt
+
+    real_rmtree = pipeline_mod.shutil.rmtree
+    kept: list[Path] = []
+    monkeypatch.setattr(pipeline_mod.shutil, "rmtree", lambda path, **_kw: kept.append(Path(path)))
+    monkeypatch.setattr(pipeline_mod.zstdmt, "available", lambda: True)
+    try:
+        _doc_zstdmt()
+        assert kept, "the doctor wrote no probe (the available stub did not take?)"
+        with rasterio.open(kept[0] / "_zstd_oracle.tif") as ds:
+            assert ds.width == _ORACLE_PROBE_W
+            assert ds.height == TILE_PX
+    finally:
+        for d in kept:
+            real_rmtree(d, ignore_errors=True)
+
+
 def test_turbo_precheck_passes_memory_ceiling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Audit #78 P1-2: _turbo_precheck hands min(physical, cgroup) to precheck."""
     monkeypatch.setattr(pipeline_mod.turbop, "resolve_cap", _identity_cap)

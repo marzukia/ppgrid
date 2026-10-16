@@ -47,6 +47,7 @@ from .calibrate import (
     calibrate_fill_cap,
     choose_transform,
     make_transform,
+    transform_named,
     transforms,
     validate_calibration,
 )
@@ -297,6 +298,33 @@ FILL_FALLBACK_CAP_KM: float = 64.0
 # (byte-identity of the reprojected output).
 TILE_PX: int = 512
 
+# A.7 oracle probe geometry, single source for BOTH probe writers
+# (Pipeline._turbo_zstd_ok and the doctor check _doc_zstdmt; audit #83:
+# the literal width was duplicated in each, so a change could land in one
+# and not the other). One deterministic 500 x TILE_PX int16 tile: the
+# width is deliberately NOT a multiple of TILE_PX, so the tile spans a
+# partial edge column and GDAL zero-pads it — the gate covers the
+# partial-tile codec path (audit #81 F-1) in addition to the full-tile
+# path. The non-multiple invariant is pinned in tests.
+_ORACLE_PROBE_W: int = 500
+
+
+def _oracle_probe_tile() -> np.ndarray:
+    """Deterministic compressible A.7 oracle probe tile.
+
+    Both axes differ to small values, so predictor-2 output is near-zero
+    structured data (compressible, and the two codec paths compare
+    meaningfully).
+
+    Returns:
+        The int16 array, _ORACLE_PROBE_W x TILE_PX.
+
+    """
+    gx = np.arange(_ORACLE_PROBE_W, dtype=np.int16) * 13
+    gy = np.arange(TILE_PX, dtype=np.int16) * 7
+    return (gx[None, :] + gy[:, None]).astype(np.int16)
+
+
 # CLI/API defaults — single source for the Pipeline constructor and argparse
 # so the two can't drift.
 DEFAULT_RES: float = 500.0
@@ -475,8 +503,10 @@ class _WorkerConfig:
     The pipeline fields are set by Pipeline.grid(); the runtime fields
     (pts/tf/pct) are resolved once per run by Pipeline._write_rasters; the
     shared fields hold the full-field results when the shared path is
-    active. The object is stored in _CTX as-is (no per-field copy), so a
-    new field needs exactly one edit here.
+    active. The object is passed to every worker task as-is (no per-field
+    copy; audit #83: it used to ride a module-global _CTX that two
+    concurrent Pipeline.run() calls could clobber mid-run), so a new field
+    needs exactly one edit here.
     """
 
     pts_path: str
@@ -508,15 +538,6 @@ class _WorkerConfig:
     val_full: np.ndarray | None = None
     sup_full: np.ndarray | None = None
     near_full: np.ndarray | None = None
-
-
-# Worker state, shared by all worker threads in this process (one
-# ThreadPoolExecutor, one object — not local to each process). Holds the
-# _WorkerConfig as-is under "cfg"; workers read attributes off it.
-# Single-run scope: the ONLY key is "cfg", and both writers clear() it before
-# repopulating, so a second Pipeline.run in the same process never sees stale
-# state (re-runs with varied configs are exercised across the test suite).
-_CTX: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1179,24 +1200,31 @@ def _block_shared(cfg: _WorkerConfig, bx: int, by: int) -> tuple[np.ndarray, np.
 
 
 def _process_block(
-    args: tuple[int, int],
+    args: tuple[_WorkerConfig, tuple[np.ndarray, np.ndarray] | None, int, int],
 ) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
     """Interpolate a single output block using pull-push.
+
+    Args:
+        args: (cfg, dn, bx, by). cfg is the run's _WorkerConfig — per-
+            Pipeline instance state passed with every task (audit #83: the
+            worker used to read a module-global _CTX, which two concurrent
+            Pipeline.run() calls in one process would clobber mid-run).
+            dn is the (value, support) tmpfs DN-field pair when the turbo
+            write path is active, else None.
 
     Returns:
         Tuple of block coords and the (value, support) DN grids, or None when
         the block neighbourhood has no points (written as nodata).
 
-    When the run set ``_CTX["dn"]`` to the (value, support) tmpfs DN-field
-    pair (the turbo write path), the DN grids are written from this worker
-    thread straight into the block's disjoint window. The main thread used to
-    write them back as results arrived and sat on the critical path ahead of
-    the pool (issue #84); block windows are disjoint, so the writes are
-    thread-safe and the final fields are byte-identical.
+        When dn is set (the turbo write path), the DN grids are written from
+        this worker thread straight into the block's disjoint window. The
+        main thread used to write them back as results arrived and sat on
+        the critical path ahead of the pool (issue #84); block windows are
+        disjoint, so the writes are thread-safe and the final fields are
+        byte-identical.
 
     """
-    bx, by = args
-    cfg = _CTX["cfg"]
+    cfg, dn, bx, by = args
     if cfg.shared:
         grids = _block_shared(cfg, bx, by)
     else:
@@ -1230,7 +1258,6 @@ def _process_block(
         sl = (slice(a0, a0 + (i1 - i0)), slice(b0, b0 + (j1 - j0)))
         grids = _quantize(cfg, val[sl], sup[sl], near[sl])
 
-    dn = _CTX.get("dn")
     if dn is not None:
         vq, rq = grids
         val_dn, sup_dn = dn
@@ -2863,7 +2890,10 @@ class Pipeline:
         if cal and "transform_state" in cal and cal["transform_state"].get("name") == self.tname:
             self.tf = make_transform(cal["transform_state"])
         else:
-            self.tf = next(t for t in transforms() if t.name == self.tname).fit(self.v)
+            # Single source for the name lookup (audit #83): a renamed or
+            # unknown transform is a named ValueError, not a raw
+            # StopIteration (the CLI validates against the same factory).
+            self.tf = transform_named(self.tname).fit(self.v)
 
         # Same valid() guard choose_transform applies: a transform can be
         # invalid for this data (log10 on negatives -> NaN -> silent all-0
@@ -2882,7 +2912,7 @@ class Pipeline:
             )
             warnings.warn(msg, stacklevel=2)
             self.tname = "identity"
-            self.tf = next(t for t in transforms() if t.name == "identity")
+            self.tf = transform_named("identity")
 
         # Keep the cal dict in sync with the fitted transform (a forced
         # transform can differ from the calibration's choice): the transform
@@ -3733,20 +3763,16 @@ class Pipeline:
     def _turbo_zstd_ok(self) -> bool:
         """A.7 calibration oracle gate for the parallel ZSTD write.
 
-        Writes one deterministic 500x512 int16 probe (partial width, so
-        the gate also covers GDAL's zero-padding of edge tiles - audit
-        #81 F-1) with the stock codec settings, then asks zstdmt whether
-        the turbo-compressed frame is byte-equal to the bytes GDAL
-        stored. Mismatch (or unavailable) -> False: the caller writes
+        Writes one deterministic _ORACLE_PROBE_W x TILE_PX int16 probe
+        (partial width, so the gate also covers GDAL's zero-padding of edge
+        tiles - audit #81 F-1) with the stock codec settings, then asks
+        zstdmt whether the turbo-compressed frame is byte-equal to the bytes
+        GDAL stored. Mismatch (or unavailable) -> False: the caller writes
         with the stock-codec parallel path (_turbo_write_stock_parallel);
         the serial per-band write runs only if that writer's layout guards
         fail. Either way the output is byte-exact.
         """
-        # Deterministic compressible content: both axes differ to small
-        # values, so predictor 2 output is near-zero structured data.
-        gx = np.arange(500, dtype=np.int16) * 13
-        gy = np.arange(TILE_PX, dtype=np.int16) * 7
-        tile = (gx[None, :] + gy[:, None]).astype(np.int16)
+        tile = _oracle_probe_tile()
         probe = Path(self.out_dir) / "_zstd_oracle.tif"
         try:
             # zstdmt.available() inside the try (audit #81 F-3): a gate
@@ -3760,7 +3786,7 @@ class Pipeline:
                 "w",
                 driver="GTiff",
                 dtype="int16",
-                width=500,
+                width=_ORACLE_PROBE_W,
                 height=TILE_PX,
                 count=1,
                 nodata=NODATA,
@@ -4089,14 +4115,13 @@ class Pipeline:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
                     # One shared config object for all worker threads (no
-                    # per-field dict copy). Rebuilt fresh each run: stale state
-                    # from a previous run in this process is dropped.
-                    _CTX.clear()
+                    # per-field dict copy). Rebuilt fresh each run and passed
+                    # with every task: stale state from a previous run in this
+                    # process cannot reach the workers (audit #83).
                     cfg = self.cfg
                     cfg.pts = np.load(cfg.pts_path, mmap_mode="r")
                     cfg.tf = make_transform(cfg.transform_state)
                     cfg.pct = PercentileTransform(cfg.pct_quantiles)
-                    _CTX["cfg"] = cfg
                     # Progress (issue #101): the interpolate bar budgets the
                     # shared descent plus every task block, and advances as
                     # each block is written.
@@ -4129,7 +4154,12 @@ class Pipeline:
                             _prof.phase("write.serial"),
                             _WallPhase("interpolate", self._phase_wall),
                         ):
-                            results = zip(self.tasks, ex.map(_process_block, self.tasks), task_cells, strict=True)
+                            results = zip(
+                                self.tasks,
+                                ex.map(_process_block, [(cfg, None, bx, by) for bx, by in self.tasks]),
+                                task_cells,
+                                strict=True,
+                            )
                             for task, res, tc in results:
                                 bx, by = task
                                 _, _, out = res
@@ -4304,14 +4334,13 @@ class Pipeline:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="Setting the shape on a NumPy array")
                     # One shared config object for all worker threads (no
-                    # per-field dict copy). Rebuilt fresh each run: stale state
-                    # from a previous run in this process is dropped.
-                    _CTX.clear()
+                    # per-field dict copy). Rebuilt fresh each run and passed
+                    # with every task: stale state from a previous run in this
+                    # process cannot reach the workers (audit #83).
                     cfg = self.cfg
                     cfg.pts = np.load(cfg.pts_path, mmap_mode="r")
                     cfg.tf = make_transform(cfg.transform_state)
                     cfg.pct = PercentileTransform(cfg.pct_quantiles)
-                    _CTX["cfg"] = cfg
                     # Progress (issue #101): as the serial writer, but the
                     # blocks write DN grids straight into the tmpfs fields.
                     task_cells: list[int] = []
@@ -4336,18 +4365,27 @@ class Pipeline:
                         # copies as results arrived and sat on the critical path
                         # ahead of the pool. Block windows are disjoint, so the
                         # writes are thread-safe and the fields are byte-identical.
-                        _CTX["dn"] = (val_dn, sup_dn)
-                        try:
-                            with (
-                                _WallPhase("interpolate", self._phase_wall),
-                                ThreadPoolExecutor(max_workers=self.workers) as ex,
+                        # The pair rides in each task tuple (audit #83): it is
+                        # scoped to this block pool and cannot leak into a
+                        # later serial run.
+                        dn = (val_dn, sup_dn)
+                        with (
+                            _WallPhase("interpolate", self._phase_wall),
+                            ThreadPoolExecutor(max_workers=self.workers) as ex,
+                        ):
+                            for tc, _ in zip(
+                                task_cells,
+                                ex.map(_process_block, [(cfg, dn, bx, by) for bx, by in self.tasks]),
+                                strict=True,
                             ):
-                                for tc, _ in zip(task_cells, ex.map(_process_block, self.tasks), strict=True):
-                                    iph.advance(tc)
-                                    if self.ui is not None:
-                                        self.ui.maybe_refresh()
-                        finally:
-                            del _CTX["dn"]
+                                iph.advance(tc)
+                                if self.ui is not None:
+                                    self.ui.maybe_refresh()
+                        # Drop the holder before the final unlink (Windows:
+                        # an unlink of a held mmap is WinError 32, as in the
+                        # finally's val_dn/sup_dn/arr release). The workers
+                        # have consumed the pair; nothing else needs it.
+                        dn = None
                         iph.summary = f"{self.nx}x{self.ny} grid"
                     # The shared field is dead after the block loop: free it
                     # before the reproject/write (val/sup f32 + near bool,
@@ -4509,9 +4547,12 @@ class Pipeline:
         finally:
             # Release the local DN memmap holders before the final unlink
             # (same WinError 32 on Windows): `val_dn` / `sup_dn` would
-            # otherwise live to the function end, and `arr` is the warp-loop
-            # variable still bound to the last band's field.
-            val_dn = sup_dn = arr = None
+            # otherwise live to the function end, `arr` is the warp-loop
+            # variable still bound to the last band's field, and `dn` is
+            # the (val_dn, sup_dn) tuple the task args rode on — the happy
+            # path releases it after the pool, an exception inside the pool
+            # skips that line.
+            val_dn = sup_dn = arr = dn = None
             self._remove_run_temps()
             for p in out_dir.glob("_stock_scratch_*.tif"):
                 p.unlink(missing_ok=True)
@@ -4709,6 +4750,11 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
     exit 1 for pipeline/IO errors, exit 2 for validation errors (bad
     columns, no valid points), exit 3 passes through (--turbo-strict).
 
+    Default mapping (audit #83): an exception type NOT explicitly mapped
+    below is a pipeline failure — a named one-liner and exit 1, never a raw
+    traceback. The contract no longer depends on each new failure mode
+    being born as a mapped class.
+
     Args:
         fn: Zero-arg callable running the phase (or the full run).
         input_path: Input path for the FileNotFoundError message.
@@ -4717,7 +4763,8 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         The callable's return value.
 
     Raises:
-        SystemExit: 1 (pipeline/IO) or 2 (validation, unknown EPSG).
+        SystemExit: 1 (pipeline/IO, including the default mapping) or 2
+            (validation, unknown EPSG).
 
     """
     _load_native()  # the except clauses below reference CRSError (pyproj)
@@ -4764,6 +4811,13 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         if e.filename:
             _die(f"cannot access {e.filename}: {e.strerror or 'I/O error'}")
         _die(str(e))
+    except Exception as e:  # ruff: ignore[blind-except] - default mapping (audit #83)
+        # Any failure mode NOT mapped above is a pipeline failure: a named
+        # one-liner and exit 1, never a raw traceback. A new exception type
+        # cannot silently drift the exit-code contract; it is named on the
+        # same line as a mapped one. KeyboardInterrupt/SystemExit are
+        # BaseException and keep their own contracts.
+        _die(f"{type(e).__name__}: {e} (input: {input_path})")
 
 
 def _sanitize_json(obj: Any) -> Any:
@@ -6360,11 +6414,12 @@ def _doc_pyproj() -> tuple[str, str, str]:
 def _doc_zstdmt() -> tuple[str, str, str]:
     """Check: CPL zstd availability + the pipeline's A.7 byte-exact oracle.
 
-    Writes one throwaway 500x512 ZSTD tile under the temp dir — the same
-    shape the pipeline's turbo precheck probe (Pipeline._turbo_zstd_ok)
-    uses — and runs zstdmt.oracle_check on it: ok -> the turbo parallel
-    ZSTD write path is live on this stack; unavailable / mismatch -> the
-    stock-codec parallel path (warn, not fail: bytes are identical).
+    Writes one throwaway _ORACLE_PROBE_W x TILE_PX ZSTD tile under the temp
+    dir — the same shape the pipeline's turbo precheck probe
+    (Pipeline._turbo_zstd_ok) uses — and runs zstdmt.oracle_check on it:
+    ok -> the turbo parallel ZSTD write path is live on this stack;
+    unavailable / mismatch -> the stock-codec parallel path (warn, not
+    fail: bytes are identical).
     """
     if not zstdmt.available():
         return ("zstdmt", "warn", "CPL zstd unavailable; turbo writes use the stock-codec parallel path")
@@ -6374,15 +6429,13 @@ def _doc_zstdmt() -> tuple[str, str, str]:
         from rasterio.transform import from_origin
 
         probe = tmp / "_zstd_oracle.tif"
-        gx = np.arange(500, dtype=np.int16) * 13
-        gy = np.arange(TILE_PX, dtype=np.int16) * 7
-        tile = (gx[None, :] + gy[:, None]).astype(np.int16)
+        tile = _oracle_probe_tile()
         with rasterio.open(
             probe,
             "w",
             driver="GTiff",
             dtype="int16",
-            width=500,
+            width=_ORACLE_PROBE_W,
             height=TILE_PX,
             count=1,
             nodata=NODATA,

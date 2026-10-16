@@ -148,7 +148,8 @@ def _patch_timers() -> None:
 
     orig_bp = ig._process_block  # pyright: ignore[reportPrivateUsage]
 
-    def timed_bp(args: tuple[int, int]) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
+    def timed_bp(args: tuple) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
+        """Timing wrapper: (cfg, dn, bx, by) in, (bx, by, grids) out (audit #83)."""
         t0 = time.perf_counter()
         r = orig_bp(args)
         _TIMERS["block_cpu"] += time.perf_counter() - t0
