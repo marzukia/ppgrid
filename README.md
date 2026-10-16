@@ -91,6 +91,25 @@ cd ppgrid
 uv sync
 ```
 
+## Standalone binaries
+
+Each [release](https://github.com/marzukia/ppgrid/releases) carries
+prebuilt `ppgrid` binaries (Linux x86_64 and aarch64; macOS arm64 and
+x86_64) built by the `binary.yml` CI matrix. They are single-file builds with the Python
+interpreter, GDAL and the PROJ database bundled in — the target machine
+needs no Python, no GDAL install, and no compiler:
+
+```bash
+curl -LO https://github.com/marzukia/ppgrid/releases/download/v0.5.0/ppgrid-0.5.0-linux-x86_64.xz
+xz -d ppgrid-0.5.0-linux-x86_64.xz && chmod +x ppgrid
+./ppgrid --help
+```
+
+The fast C interpolation kernel ships prebuilt in the bundle; if it cannot
+load on an unusual platform, ppgrid falls back to the pure-numpy path,
+which produces identical output. Asset sha256s are listed in the release
+notes.
+
 ## Support
 
 **Python 3.11-3.14.** All four interpreters are tested in CI on every PR;
