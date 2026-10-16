@@ -21,10 +21,6 @@ on:
         description: "Skip the wall gate; upload the result JSON to commit as the new baseline"
         type: boolean
         default: false
-  # Transient: one more push to prove the gated path (baseline now present);
-  # removed in the next commit.
-  push:
-    branches: [pi-bg/20261015-233500-2024612]
   # While bench/results/baseline/ci.json is absent from the checkout the run
   # below cuts instead of gating (bootstrap for the first baseline).
 
