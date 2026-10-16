@@ -279,6 +279,7 @@ def test_e2e_record_schema(e2e_runs: list[dict]) -> None:
         "temp_disk_hwm_mb",
         "outputs_bytes",
         "shas",
+        "vs_baseline",
     ):
         assert k in rec, k
     for k in ("ingest", "calibrate", "grid", "write", "total"):

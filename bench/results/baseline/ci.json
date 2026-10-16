@@ -1,0 +1,687 @@
+{
+  "schema_version": 1,
+  "kind": "ppgrid-regime-results",
+  "tag": "ci-494f316",
+  "commit": "494f316f4b16d2e3f54ae606dbc0743aa5a6adf1",
+  "generated_utc": "2026-10-16T01:58:04Z",
+  "env": {
+    "os": "linux",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "n_cpus": 4,
+    "mem_total_gb": 15.6,
+    "python": "3.13.16",
+    "ppgrid": "0.4.2",
+    "numpy": "2.5.1",
+    "pyproj": "3.7.2",
+    "rasterio": "1.5.1",
+    "gdal": "3...1.2...4",
+    "cinterp_backend": "cinterp (C)"
+  },
+  "set": "ci",
+  "wall_gate": {
+    "status": "off",
+    "baseline": null,
+    "threshold": 2.0,
+    "per_config": {}
+  },
+  "runs": [
+    {
+      "config_id": "melb10",
+      "config": {
+        "id": "melb10",
+        "ci": true,
+        "generator": {
+          "type": "dataset",
+          "path": "data/melb_houses.csv",
+          "value_col": "price"
+        },
+        "pipeline": {
+          "workers": 4,
+          "res": 10.0,
+          "cap_km": 10.0,
+          "skip_calibration": true
+        },
+        "anchor": {
+          "value": "examples/melb/10m/value.tif",
+          "support": "examples/melb/10m/support_km.tif"
+        },
+        "note": "urban, 13.5k pts, 10 m \u2014 the canonical CI-safe anchor config"
+      },
+      "generator": {
+        "dataset": "data/melb_houses.csv"
+      },
+      "n_points": 13580,
+      "grid": {
+        "nx": 10561,
+        "ny": 7843,
+        "cells": 82829923,
+        "res_m": 10.0,
+        "x0_m": 13935688.096804237,
+        "y0_m": -4526175.172072712,
+        "nx_padded": 11264,
+        "ny_padded": 8192,
+        "levels": 10,
+        "step": 1024,
+        "halo": 1024,
+        "bsize": 2048,
+        "nbx": 6,
+        "nby": 4,
+        "n_tasks": 24,
+        "n_empty_blocks": 0,
+        "src_crs": 4326,
+        "work_crs": 6933,
+        "out_crs": 3857,
+        "saturation": 1.0,
+        "scale": 100.0,
+        "percentile_step": null,
+        "block_size": 2048,
+        "compress": "ZSTD"
+      },
+      "timings_s": {
+        "ingest": 0.015,
+        "calibrate": 0.002,
+        "grid": 0.01,
+        "write": 15.406,
+        "total": 15.434
+      },
+      "subphases_s": {
+        "descent": 3.556,
+        "interpolate": 1.457,
+        "reproject_value": 4.188,
+        "reproject_support": 2.745
+      },
+      "wall_process_s": 15.434,
+      "peak_rss_mib": 2490.3,
+      "temp_disk_hwm_mb": 56.39,
+      "temp_samples": 240,
+      "outputs_bytes": {
+        "value.tif": 24629700,
+        "support_km.tif": 4477588,
+        "calibration.json": 0
+      },
+      "shas": {
+        "value": "74d76b9b3a01dbc2ce76bf11c8fcd67d2c8b8b08ad1720b17983c28e00a5db43",
+        "support": "3d0822e1f15b545e359e51f748686d0500053f09b80e646ef7bf22b636a6c47d"
+      },
+      "correctness": {
+        "status": "pass",
+        "mode": "bit-identity",
+        "anchor": {
+          "value": "examples/melb/10m/value.tif",
+          "support": "examples/melb/10m/support_km.tif"
+        },
+        "bands": {
+          "value": {
+            "status": "bit-identical",
+            "sha256": "74d76b9b3a01dbc2ce76bf11c8fcd67d2c8b8b08ad1720b17983c28e00a5db43"
+          },
+          "support": {
+            "status": "bit-identical",
+            "sha256": "3d0822e1f15b545e359e51f748686d0500053f09b80e646ef7bf22b636a6c47d"
+          }
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "config_id": "melb500",
+      "config": {
+        "id": "melb500",
+        "ci": true,
+        "generator": {
+          "type": "dataset",
+          "path": "data/melb_houses.csv",
+          "value_col": "price"
+        },
+        "pipeline": {
+          "workers": 4,
+          "res": 500.0,
+          "cap_km": 10.0,
+          "skip_calibration": true
+        },
+        "anchor": {
+          "value": "examples/melb/500m/value.tif",
+          "support": "examples/melb/500m/support_km.tif"
+        },
+        "note": "same data, coarse res \u2014 resolution axis"
+      },
+      "generator": {
+        "dataset": "data/melb_houses.csv"
+      },
+      "n_points": 13580,
+      "grid": {
+        "nx": 212,
+        "ny": 157,
+        "cells": 33284,
+        "res_m": 500.0,
+        "x0_m": 13935688.096804237,
+        "y0_m": -4526175.172072712,
+        "nx_padded": 224,
+        "ny_padded": 160,
+        "levels": 5,
+        "step": 32,
+        "halo": 32,
+        "bsize": 2048,
+        "nbx": 1,
+        "nby": 1,
+        "n_tasks": 1,
+        "n_empty_blocks": 0,
+        "src_crs": 4326,
+        "work_crs": 6933,
+        "out_crs": 3857,
+        "saturation": 1.0,
+        "scale": 100.0,
+        "percentile_step": null,
+        "block_size": 2048,
+        "compress": "ZSTD"
+      },
+      "timings_s": {
+        "ingest": 0.017,
+        "calibrate": 0.002,
+        "grid": 0.003,
+        "write": 0.06,
+        "total": 0.082
+      },
+      "subphases_s": {
+        "descent": 0.006,
+        "interpolate": 0.01,
+        "reproject_value": 0.014,
+        "reproject_support": 0.009
+      },
+      "wall_process_s": 0.083,
+      "peak_rss_mib": 198.2,
+      "temp_disk_hwm_mb": 0.38,
+      "temp_samples": 2,
+      "outputs_bytes": {
+        "value.tif": 38321,
+        "support_km.tif": 12076,
+        "calibration.json": 0
+      },
+      "shas": {
+        "value": "4a30bf476a85c9d30bb46aa84aa3aa140c532af0d03fda1dc90a72bfda3d45a7",
+        "support": "530cc25f3d4c5ebe2ab17359baeac56c635bc2f0096a14d70d7e790efaad9346"
+      },
+      "correctness": {
+        "status": "pass",
+        "mode": "bit-identity",
+        "anchor": {
+          "value": "examples/melb/500m/value.tif",
+          "support": "examples/melb/500m/support_km.tif"
+        },
+        "bands": {
+          "value": {
+            "status": "bit-identical",
+            "sha256": "4a30bf476a85c9d30bb46aa84aa3aa140c532af0d03fda1dc90a72bfda3d45a7"
+          },
+          "support": {
+            "status": "bit-identical",
+            "sha256": "530cc25f3d4c5ebe2ab17359baeac56c635bc2f0096a14d70d7e790efaad9346"
+          }
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "config_id": "syn-unif-p1-o25",
+      "config": {
+        "id": "syn-unif-p1-o25",
+        "ci": true,
+        "generator": {
+          "type": "synthetic",
+          "seed": 20261,
+          "center": [
+            144.995,
+            -37.75
+          ],
+          "width_m": 10000,
+          "height_m": 10000,
+          "res_m": 10.0,
+          "points_per_cell": 1.0,
+          "occupied_fraction": 0.25,
+          "density": {
+            "mode": "uniform"
+          }
+        },
+        "pipeline": {
+          "workers": 4,
+          "res": 10.0,
+          "cap_km": 8.0,
+          "transform": "identity",
+          "skip_calibration": true
+        },
+        "anchor": {
+          "value": "examples/regimes/syn-unif-p1-o25/value.tif",
+          "support": "examples/regimes/syn-unif-p1-o25/support_km.tif"
+        },
+        "note": "sparse + gappy: 1 pt/cell in 25% of cells (~340k pts)"
+      },
+      "generator": {
+        "n_points": 342253,
+        "n_cells": 1000000,
+        "n_occupied": 250000,
+        "occupied_fraction": 0.25,
+        "points_per_occupied_cell": 1.369
+      },
+      "n_points": 342253,
+      "grid": {
+        "nx": 1000,
+        "ny": 1000,
+        "cells": 1000000,
+        "res_m": 10.0,
+        "x0_m": 13985028.352076665,
+        "y0_m": -4487448.48505595,
+        "nx_padded": 1024,
+        "ny_padded": 1024,
+        "levels": 10,
+        "step": 1024,
+        "halo": 1024,
+        "bsize": 2048,
+        "nbx": 1,
+        "nby": 1,
+        "n_tasks": 1,
+        "n_empty_blocks": 0,
+        "src_crs": 4326,
+        "work_crs": 6933,
+        "out_crs": 3857,
+        "saturation": 1.0,
+        "scale": 100.0,
+        "percentile_step": null,
+        "block_size": 2048,
+        "compress": "ZSTD"
+      },
+      "timings_s": {
+        "ingest": 0.181,
+        "calibrate": 0.023,
+        "grid": 0.036,
+        "write": 0.363,
+        "total": 0.603
+      },
+      "subphases_s": {
+        "descent": 0.061,
+        "interpolate": 0.136,
+        "reproject_value": 0.071,
+        "reproject_support": 0.071
+      },
+      "wall_process_s": 0.604,
+      "peak_rss_mib": 285.7,
+      "temp_disk_hwm_mb": 10.87,
+      "temp_samples": 12,
+      "outputs_bytes": {
+        "value.tif": 1078656,
+        "support_km.tif": 432599,
+        "calibration.json": 0
+      },
+      "shas": {
+        "value": "e18cbd6426fe7cd6d0bb801c6d173aceab18b10f2bc106bba441497f9b664468",
+        "support": "b8034e58d3d550ab7273d8976a1c012e1548111e063f75be04d34811f2b14c09"
+      },
+      "correctness": {
+        "status": "pass",
+        "mode": "bit-identity",
+        "anchor": {
+          "value": "examples/regimes/syn-unif-p1-o25/value.tif",
+          "support": "examples/regimes/syn-unif-p1-o25/support_km.tif"
+        },
+        "bands": {
+          "value": {
+            "status": "bit-identical",
+            "sha256": "e18cbd6426fe7cd6d0bb801c6d173aceab18b10f2bc106bba441497f9b664468"
+          },
+          "support": {
+            "status": "bit-identical",
+            "sha256": "b8034e58d3d550ab7273d8976a1c012e1548111e063f75be04d34811f2b14c09"
+          }
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "config_id": "syn-unif-p8-o50",
+      "config": {
+        "id": "syn-unif-p8-o50",
+        "ci": true,
+        "generator": {
+          "type": "synthetic",
+          "seed": 20262,
+          "center": [
+            144.995,
+            -37.75
+          ],
+          "width_m": 10000,
+          "height_m": 10000,
+          "res_m": 10.0,
+          "points_per_cell": 8.0,
+          "occupied_fraction": 0.5,
+          "density": {
+            "mode": "uniform"
+          }
+        },
+        "pipeline": {
+          "workers": 4,
+          "res": 10.0,
+          "cap_km": 8.0,
+          "transform": "identity",
+          "skip_calibration": true
+        },
+        "anchor": {
+          "value": "examples/regimes/syn-unif-p8-o50/value.tif",
+          "support": "examples/regimes/syn-unif-p8-o50/support_km.tif"
+        },
+        "note": "dense uniform: 8 pts/cell in 50% of cells (~4M pts)"
+      },
+      "generator": {
+        "n_points": 4000832,
+        "n_cells": 1000000,
+        "n_occupied": 500000,
+        "occupied_fraction": 0.5,
+        "points_per_occupied_cell": 8.0017
+      },
+      "n_points": 4000832,
+      "grid": {
+        "nx": 1000,
+        "ny": 1000,
+        "cells": 1000000,
+        "res_m": 10.0,
+        "x0_m": 13985028.211512174,
+        "y0_m": -4487448.490110751,
+        "nx_padded": 1024,
+        "ny_padded": 1024,
+        "levels": 10,
+        "step": 1024,
+        "halo": 1024,
+        "bsize": 2048,
+        "nbx": 1,
+        "nby": 1,
+        "n_tasks": 1,
+        "n_empty_blocks": 0,
+        "src_crs": 4326,
+        "work_crs": 6933,
+        "out_crs": 3857,
+        "saturation": 1.0,
+        "scale": 100.0,
+        "percentile_step": null,
+        "block_size": 2048,
+        "compress": "ZSTD"
+      },
+      "timings_s": {
+        "ingest": 2.001,
+        "calibrate": 0.216,
+        "grid": 0.383,
+        "write": 0.499,
+        "total": 3.1
+      },
+      "subphases_s": {
+        "descent": 0.206,
+        "interpolate": 0.13,
+        "reproject_value": 0.069,
+        "reproject_support": 0.068
+      },
+      "wall_process_s": 3.1,
+      "peak_rss_mib": 606.2,
+      "temp_disk_hwm_mb": 98.48,
+      "temp_samples": 61,
+      "outputs_bytes": {
+        "value.tif": 1024522,
+        "support_km.tif": 308623,
+        "calibration.json": 0
+      },
+      "shas": {
+        "value": "7a9ea44fb82d067034988152c050de1f0bbc3295c580a521462e3e80a52a86b0",
+        "support": "7e6bdf9f2b0ea6a1a2599735904c473123f5d45df06520c14974fdd525acca49"
+      },
+      "correctness": {
+        "status": "pass",
+        "mode": "bit-identity",
+        "anchor": {
+          "value": "examples/regimes/syn-unif-p8-o50/value.tif",
+          "support": "examples/regimes/syn-unif-p8-o50/support_km.tif"
+        },
+        "bands": {
+          "value": {
+            "status": "bit-identical",
+            "sha256": "7a9ea44fb82d067034988152c050de1f0bbc3295c580a521462e3e80a52a86b0"
+          },
+          "support": {
+            "status": "bit-identical",
+            "sha256": "7e6bdf9f2b0ea6a1a2599735904c473123f5d45df06520c14974fdd525acca49"
+          }
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "config_id": "syn-cluster-p4-o30",
+      "config": {
+        "id": "syn-cluster-p4-o30",
+        "ci": true,
+        "generator": {
+          "type": "synthetic",
+          "seed": 20263,
+          "center": [
+            144.995,
+            -37.75
+          ],
+          "width_m": 10000,
+          "height_m": 10000,
+          "res_m": 10.0,
+          "points_per_cell": 4.0,
+          "occupied_fraction": 0.3,
+          "density": {
+            "mode": "clustered",
+            "n_clusters": 8,
+            "boost": 8.0,
+            "sigma_frac": 0.15
+          }
+        },
+        "pipeline": {
+          "workers": 4,
+          "res": 10.0,
+          "cap_km": 8.0,
+          "transform": "identity",
+          "skip_calibration": true
+        },
+        "anchor": {
+          "value": "examples/regimes/syn-cluster-p4-o30/value.tif",
+          "support": "examples/regimes/syn-cluster-p4-o30/support_km.tif"
+        },
+        "note": "clustered-with-gaps: 8 hot clusters, 4 pts/cell in 30% of cells (~1.2M pts)"
+      },
+      "generator": {
+        "n_points": 1206382,
+        "n_cells": 1000000,
+        "n_occupied": 300000,
+        "occupied_fraction": 0.3,
+        "points_per_occupied_cell": 4.0213
+      },
+      "n_points": 1206382,
+      "grid": {
+        "nx": 1000,
+        "ny": 1000,
+        "cells": 1000000,
+        "res_m": 10.0,
+        "x0_m": 13985028.216606924,
+        "y0_m": -4487448.44083643,
+        "nx_padded": 1024,
+        "ny_padded": 1024,
+        "levels": 10,
+        "step": 1024,
+        "halo": 1024,
+        "bsize": 2048,
+        "nbx": 1,
+        "nby": 1,
+        "n_tasks": 1,
+        "n_empty_blocks": 0,
+        "src_crs": 4326,
+        "work_crs": 6933,
+        "out_crs": 3857,
+        "saturation": 1.0,
+        "scale": 100.0,
+        "percentile_step": null,
+        "block_size": 2048,
+        "compress": "ZSTD"
+      },
+      "timings_s": {
+        "ingest": 0.638,
+        "calibrate": 0.066,
+        "grid": 0.118,
+        "write": 0.387,
+        "total": 1.211
+      },
+      "subphases_s": {
+        "descent": 0.089,
+        "interpolate": 0.13,
+        "reproject_value": 0.075,
+        "reproject_support": 0.071
+      },
+      "wall_process_s": 1.211,
+      "peak_rss_mib": 313.5,
+      "temp_disk_hwm_mb": 31.12,
+      "temp_samples": 24,
+      "outputs_bytes": {
+        "value.tif": 816641,
+        "support_km.tif": 429644,
+        "calibration.json": 0
+      },
+      "shas": {
+        "value": "c34eb8614ae2f5a0585399437f20b59f04482a648c0015b681d05af34a7cedc1",
+        "support": "606ed3c1613b753a70cfb50dc51001db1c3e68739d83cf5cff843cf2aa3a3594"
+      },
+      "correctness": {
+        "status": "pass",
+        "mode": "bit-identity",
+        "anchor": {
+          "value": "examples/regimes/syn-cluster-p4-o30/value.tif",
+          "support": "examples/regimes/syn-cluster-p4-o30/support_km.tif"
+        },
+        "bands": {
+          "value": {
+            "status": "bit-identical",
+            "sha256": "c34eb8614ae2f5a0585399437f20b59f04482a648c0015b681d05af34a7cedc1"
+          },
+          "support": {
+            "status": "bit-identical",
+            "sha256": "606ed3c1613b753a70cfb50dc51001db1c3e68739d83cf5cff843cf2aa3a3594"
+          }
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "config_id": "syn-edge-p4-o40",
+      "config": {
+        "id": "syn-edge-p4-o40",
+        "ci": true,
+        "generator": {
+          "type": "synthetic",
+          "seed": 20264,
+          "center": [
+            144.995,
+            -37.75
+          ],
+          "width_m": 10000,
+          "height_m": 10000,
+          "res_m": 10.0,
+          "points_per_cell": 4.0,
+          "occupied_fraction": 0.4,
+          "density": {
+            "mode": "edge",
+            "gamma": 3.0,
+            "boost": 4.0
+          }
+        },
+        "pipeline": {
+          "workers": 4,
+          "res": 10.0,
+          "cap_km": 8.0,
+          "transform": "identity",
+          "skip_calibration": true
+        },
+        "anchor": {
+          "value": "examples/regimes/syn-edge-p4-o40/value.tif",
+          "support": "examples/regimes/syn-edge-p4-o40/support_km.tif"
+        },
+        "note": "edge-heavy: density rises toward the domain rim, 4 pts/cell in 40% of cells (~1.6M pts)"
+      },
+      "generator": {
+        "n_points": 1607388,
+        "n_cells": 1000000,
+        "n_occupied": 400000,
+        "occupied_fraction": 0.4,
+        "points_per_occupied_cell": 4.0185
+      },
+      "n_points": 1607388,
+      "grid": {
+        "nx": 1000,
+        "ny": 1000,
+        "cells": 1000000,
+        "res_m": 10.0,
+        "x0_m": 13985028.206099216,
+        "y0_m": -4487448.4913264355,
+        "nx_padded": 1024,
+        "ny_padded": 1024,
+        "levels": 10,
+        "step": 1024,
+        "halo": 1024,
+        "bsize": 2048,
+        "nbx": 1,
+        "nby": 1,
+        "n_tasks": 1,
+        "n_empty_blocks": 0,
+        "src_crs": 4326,
+        "work_crs": 6933,
+        "out_crs": 3857,
+        "saturation": 1.0,
+        "scale": 100.0,
+        "percentile_step": null,
+        "block_size": 2048,
+        "compress": "ZSTD"
+      },
+      "timings_s": {
+        "ingest": 0.94,
+        "calibrate": 0.091,
+        "grid": 0.153,
+        "write": 0.388,
+        "total": 1.573
+      },
+      "subphases_s": {
+        "descent": 0.1,
+        "interpolate": 0.13,
+        "reproject_value": 0.067,
+        "reproject_support": 0.068
+      },
+      "wall_process_s": 1.573,
+      "peak_rss_mib": 360.6,
+      "temp_disk_hwm_mb": 41.43,
+      "temp_samples": 32,
+      "outputs_bytes": {
+        "value.tif": 1066348,
+        "support_km.tif": 367967,
+        "calibration.json": 0
+      },
+      "shas": {
+        "value": "138d6afd549ab76f7de594274695e03e9722f6bafbc71f52d6327f5a1573dbe3",
+        "support": "6af3ab6a40ed531ac0dfd017c1446eec7b45891a6ec43112ff7b62d1c2c85acd"
+      },
+      "correctness": {
+        "status": "pass",
+        "mode": "bit-identity",
+        "anchor": {
+          "value": "examples/regimes/syn-edge-p4-o40/value.tif",
+          "support": "examples/regimes/syn-edge-p4-o40/support_km.tif"
+        },
+        "bands": {
+          "value": {
+            "status": "bit-identical",
+            "sha256": "138d6afd549ab76f7de594274695e03e9722f6bafbc71f52d6327f5a1573dbe3"
+          },
+          "support": {
+            "status": "bit-identical",
+            "sha256": "6af3ab6a40ed531ac0dfd017c1446eec7b45891a6ec43112ff7b62d1c2c85acd"
+          }
+        }
+      },
+      "status": "ok"
+    }
+  ]
+}

@@ -779,6 +779,9 @@ def run_worker(cfg: dict, outdir: Path) -> dict:
             "value": _sha256(cdir / "value.tif"),
             "support": _sha256(cdir / "support_km.tif"),
         },
+        # Reserved for #107's baseline-comparison column (values added later,
+        # schema stays v1-compatible).
+        "vs_baseline": {},
     }
     return rec
 

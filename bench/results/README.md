@@ -75,35 +75,45 @@ f42387c, `skip_calibration` + identity transform + pinned workers).
 
 ## Result JSON schema (v1)
 
-Top level:
+Top level (`kind: "ppgrid-regime-results"`):
 
 ```
 schema_version: 1            this file's format (bump on breaking change)
 tag: "ci-<commit12>"         default tag; --tag overrides
 commit: "<sha>"              the commit the run executed
+generated_utc: "<ISO-8601>"
+set: "ci" | "all" | ids as selected
 wall_gate: {status, baseline, threshold, per_config, note?}
   status: off | skipped | pass | fail
-  per_config[<id>]: {status, wall_s?, baseline_wall_s?, wall_ratio?, reasons?}
+  per_config[<id>]: {status, wall_s?, baseline_wall_s?, wall_ratio?,
+                     phase_ratios?, reasons?}
   off = no baseline file (note explains); skipped = every config skipped
-env: {hostname, os, n_cpus, n_bytes_memory, python, versions: {ppgrid, numpy,
-      rasterio, gdal, pyproj, pandas}}
+env: {os, platform, machine, n_cpus, mem_total_gb, python, ppgrid, numpy,
+      pyproj, rasterio, gdal, cinterp_backend}
 runs: [ per-config records, in spec order ]
 ```
 
 Per-run record:
 
 ```
-id, config (full spec), n_points, grid {nx, ny}, status: "ok" | "crashed"
-timings_s: {ingest, calibrate, grid, write, total}   (wall, from run_summary)
-peak_rss_bytes, tmp_disk_hwm_bytes, outputs_bytes {value.tif, support_km.tif,
-calibration.json, ...}, shas {value.tif, support_km.tif},
-correctness: {mode: bit-identity | functional | skipped, status:
-pass | fail | no-anchor, bands: {value, support}}
+config_id, config (full spec), generator (achieved descriptors: n_points,
+n_cells, n_occupied, occupied_fraction, points_per_occupied_cell),
+n_points, grid {nx, ny, cells, res_m, x0_m, y0_m, padded shape, levels,
+step, halo, bsize, block grid (nbx/nby/n_tasks/n_empty_blocks), CRS, ...}
+timings_s: {ingest, calibrate, grid, write, total}   (wall, run_summary)
+subphases_s: {descent, interpolate, reproject_value, reproject_support}
+wall_process_s, peak_rss_mib, temp_disk_hwm_mb, temp_samples
+outputs_bytes {value.tif, support_km.tif, calibration.json},
+shas {value, support}
+correctness: {status: pass | fail | no-anchor, mode: bit-identity |
+             functional | skipped, anchor?, bands: {value, support: {status,
+             sha256, anchor_sha256?}}}
+status: ok | crashed
 vs_baseline: {}            reserved (issue #107 baseline column)
 ```
 
-`tmp_disk_hwm_bytes` = high-water mark of `<outdir>/<id>/.work` (the pipeline's
-temp-file footprint), sampled at ~200 ms by a background thread; `peak_rss_bytes`
+`temp_disk_hwm_mb` = high-water mark of the config's `.work` temp dir, sampled
+at ~200 ms by a background thread (`temp_samples` = how many samples); `peak_rss_mib`
 = the worker subprocess's max RSS (one subprocess per config, so peaks are
 honest and independent).
 
