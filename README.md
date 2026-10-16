@@ -93,14 +93,22 @@ uv sync
 
 ## Standalone binaries
 
-The [releases](https://github.com/marzukia/ppgrid/releases) page carries
-platform-specific standalone binaries (e.g. `ppgrid-0.5.0-linux-x86_64.xz`):
-one-file builds of the `ppgrid` console script with the Python interpreter,
-GDAL (rasterio wheel) and the PROJ database bundled, so a run needs no
-Python, no GDAL install, and no compiler on the target machine. The
-bit-identical C interpolation kernel ships prebuilt in the bundle; if it ever
-fails to load there, the binary falls back to plain `np.interp`, which
-produces the same output bytes.
+Each [release](https://github.com/marzukia/ppgrid/releases) carries
+prebuilt `ppgrid` binaries (Linux x86_64; macOS arm64 and x86_64 via the
+`binary.yml` CI matrix). They are single-file builds with the Python
+interpreter, GDAL and the PROJ database bundled in — the target machine
+needs no Python, no GDAL install, and no compiler:
+
+```bash
+curl -LO https://github.com/marzukia/ppgrid/releases/download/v0.5.0/ppgrid-0.5.0-linux-x86_64.xz
+xz -d ppgrid-0.5.0-linux-x86_64.xz && chmod +x ppgrid
+./ppgrid --help
+```
+
+The fast C interpolation kernel ships prebuilt in the bundle; if it cannot
+load on an unusual platform, ppgrid falls back to the pure-numpy path,
+which produces identical output. Asset sha256s are listed in the release
+notes.
 
 ## Support
 
