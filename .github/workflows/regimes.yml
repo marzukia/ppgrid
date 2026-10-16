@@ -39,7 +39,7 @@ jobs:
           # Pinned: CI must not depend on the runner's ambient Python (ci.yml convention).
           python-version: "3.13"
       - run: uv sync --all-extras --locked
-      - name: "Run the ci regime set (wall gate ${{ not inputs.cut_baseline }})"
+      - name: "Run the ci regime set (wall gate ${{ ! inputs.cut_baseline }})"
         run: |
           OUT=out/regimes
           mkdir -p "$OUT"
