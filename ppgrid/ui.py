@@ -584,6 +584,22 @@ def _has_ppgrid_handler() -> bool:
     )
 
 
+def rebind_ppgrid_streams() -> None:
+    """Rebind the plain stderr handler to the current sys.stderr.
+
+    Repeated main() calls in one process (tests): capsys swaps sys.stderr
+    between runs, and the previous run's _configure_logging bound its
+    handler to that run's stderr object. Warnings emitted before this
+    run's preflight (the config unknown-key lines) would otherwise land
+    in the closed previous capture. _configure_logging rebinds again once
+    it runs, so this only closes the pre-preflight window.
+
+    """
+    for h in logging.getLogger("ppgrid").handlers:
+        if getattr(h, "ppgrid_handler", False) and h.stream is not sys.stderr:
+            h.stream = sys.stderr
+
+
 # ---------------------------------------------------------------------------
 # Phase handle + UI.
 # ---------------------------------------------------------------------------

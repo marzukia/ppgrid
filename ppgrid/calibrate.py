@@ -105,6 +105,10 @@ class PercentileTransform(Transform):
         self.name: str = "percentile"
         self.valid: Callable[[np.ndarray], bool] = lambda _v: True
         self.q: np.ndarray | None = None if q is None else np.asarray(q, np.float64)
+        # The 0-100 percentile grid is a constant (NQ points); build it once
+        # instead of recomputing the linspace on every fwd/inv call
+        # (issue #84 a7).
+        self._p: np.ndarray = np.linspace(0.0, PERCENTILE_MAX, self.NQ)
         # C-interp slope tables, filled lazily by _cprep on first use.
         self._c_ready: bool = False
         self._slopes_q_to_p: np.ndarray | None = None
@@ -166,10 +170,6 @@ class PercentileTransform(Transform):
         self._slopes_q_to_p = None
         self._slopes_p_to_q = None
         return self
-
-    @property
-    def _p(self) -> np.ndarray:
-        return np.linspace(0.0, PERCENTILE_MAX, self.NQ)
 
     def fwd(self, v: np.ndarray) -> np.ndarray:
         """Map values to percentiles.
@@ -360,21 +360,6 @@ def icc_from_inv(inv: np.ndarray, values: np.ndarray) -> float:
     return float(1.0 - within / total) if total > 0 else 0.0
 
 
-def icc(values: np.ndarray, x: np.ndarray, y: np.ndarray, res: float) -> float:
-    """Intraclass correlation at cell size `res`.
-
-    The share of total variance explained by location. ~0 means the value
-    is not a spatial field at all.
-
-    Returns:
-        ICC value between 0 and 1.
-
-    """
-    key = _cell_key(x, y, res)
-    _, inv = np.unique(key, return_inverse=True)
-    return icc_from_inv(inv.ravel(), values)
-
-
 def choose_transform(
     x: np.ndarray,
     y: np.ndarray,
@@ -463,24 +448,6 @@ def _fit_predict(
     return val[ix, iy], sup[ix, iy] / M_PER_KM
 
 
-class CVDetail(dict):
-    """Single CV bin result."""
-
-    lo_km: float
-    hi_km: float
-    n: int
-    skill: float
-    ci_lo: float
-    ci_hi: float
-
-
-class CVCurve(dict):
-    """Per-block-size CV results."""
-
-    overall_skill: float
-    rows: list[CVDetail]
-
-
 def blocked_cv_skill(
     x: np.ndarray,
     y: np.ndarray,
@@ -495,7 +462,7 @@ def blocked_cv_skill(
     n_boot: int = 200,
     min_n: int = 150,
     boot_max_n: int = 200_000,
-) -> tuple[float, list[CVDetail]]:
+) -> tuple[float, list[dict[str, Any]]]:
     """Hold out whole spatial blocks, predict them, and report skill.
 
     Report skill (1 - RMSE/RMSE_baseline) per support-scale bin with a
@@ -508,8 +475,10 @@ def blocked_cv_skill(
     rng = np.random.default_rng(seed)
     block_size_m = block_km * M_PER_KM
     # Clamp grid resolution: full-bounding-box binning at 1 km OOMs on large
-    # extents (e.g. ~40,000 km global -> ~1.6B cells). Cap the grid at 4096
-    # cells per axis.
+    # extents (e.g. ~40,000 km global -> ~1.6B cells). The clamp keeps the
+    # raw grid at ~extent/4096 cells per axis (a point landing exactly on
+    # the far edge makes 4097); pad_to_pyramid then rounds up to a power of
+    # two, so the padded grid can be larger.
     extent = max(float(np.ptp(x)), float(np.ptp(y)))
     res = max(res, extent / 4096.0)
     bkey = _cell_key(x, y, block_size_m)
@@ -540,7 +509,7 @@ def blocked_cv_skill(
         return 0.0, []
     base = float(np.mean(act))
 
-    rows: list[CVDetail] = []
+    rows: list[dict[str, Any]] = []
     for lo, hi in itertools.pairwise(edges):
         m = (sup >= lo) & (sup < hi)
         n = int(m.sum())
@@ -596,8 +565,15 @@ def calibrate_fill_cap(
     min_skill: float = 0.05,
     default_km: float = FILL_CAP_DEFAULT_KM,
     saturation: float = 1.0,
-    **kw: Any,
-) -> tuple[float, dict[float, CVCurve]]:
+    seed: int = 0,
+    res: float = 1000.0,
+    levels: int = 9,
+    n_folds: int = 4,
+    edges: tuple[float, ...] = _CV_EDGES,
+    n_boot: int = 200,
+    min_n: int = 150,
+    boot_max_n: int = 200_000,
+) -> tuple[float, dict[float, dict[str, Any]]]:
     """Derive the fill cap from blocked CV across several held-out block sizes.
 
     RULE 1 (admissibility): a support-scale bin is only admissible for a given
@@ -607,14 +583,34 @@ def calibrate_fill_cap(
     RULE 2 (smallest admissible block wins, not the worst): a bin far below
     its block size is populated only by points near the block boundary.
 
+    The CV knobs (seed/res/levels/n_folds/edges/n_boot/min_n/boot_max_n) are
+    explicit parameters, not a **kw catch-all: a typo used to be swallowed
+    silently (e.g. `seedd=1` ran with the default seed) (issue #84 a7).
+
     Returns:
-        Tuple of fill cap in km and per-block-size CV curves.
+        Tuple of fill cap in km and per-block-size CV curves (each with
+        overall_skill and per-bin rows; the chosen cap is NOT repeated per
+        block - it is the single value returned first).
 
     """
-    detail: dict[float, CVCurve] = {}
+    detail: dict[float, dict[str, Any]] = {}
     curve: dict[float, tuple[float, float, int, int]] = {}
     for bk in sorted(block_km):
-        overall, rows = blocked_cv_skill(x, y, tv, block_km=bk, saturation=saturation, **kw)
+        overall, rows = blocked_cv_skill(
+            x,
+            y,
+            tv,
+            block_km=bk,
+            saturation=saturation,
+            seed=seed,
+            res=res,
+            levels=levels,
+            n_folds=n_folds,
+            edges=edges,
+            n_boot=n_boot,
+            min_n=min_n,
+            boot_max_n=boot_max_n,
+        )
         detail[bk] = {"overall_skill": overall, "rows": rows}
         for r in rows:
             if r["hi_km"] <= bk / 2.0 and r["hi_km"] not in curve:
@@ -631,6 +627,7 @@ def calibrate_fill_cap(
             cap = hi
         else:
             break
-    for curve_data in detail.values():
-        curve_data["cap_km"] = cap
-    return (float(cap) if cap else default_km), detail
+    # `is not None`, not truthiness: a cap of 0.0 is falsy but is a value
+    # (in practice the first bin edge is 2 km, so this is defensive)
+    # (issue #84 a7).
+    return (float(cap) if cap is not None else default_km), detail

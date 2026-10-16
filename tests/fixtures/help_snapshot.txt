@@ -87,7 +87,10 @@ memory/turbo:
 
 output:
   -o, --out OUT         Output directory (default: out/)
-  --compress COMPRESS   GeoTIFF tile compression codec (default: ZSTD)
+  --compress COMPRESS   GeoTIFF tile compression codec (default: ZSTD); one of
+                        NONE, ZSTD, LZW, DEFLATE, PACKBITS, LERC, LZMA.
+                        Unknown values are rejected here because GDAL would
+                        ignore them and write uncompressed
   --force               Overwrite existing outputs in the out dir (default:
                         exit 2 when value.tif / support_km.tif /
                         calibration.json / run_summary.json are already

@@ -664,8 +664,3 @@ def test_physical_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     # File missing (non-Linux, no /proc) -> unknown (None), not an error.
     monkeypatch.setattr(turbop, "MEMINFO_PATH", str(tmp_path / "nope"))
     assert _read_physical_gb() is None
-
-
-# ---------------------------------------------------------------------------
-# Runtime RSS backstop
-# ---------------------------------------------------------------------------

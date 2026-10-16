@@ -42,8 +42,8 @@ __all__ = [
     "descent_band_bytes",
     "detect_cap_gb",
     "est_peak",
+    "per_box_peak_bytes",
     "per_box_wall_s",
-    "phase_peak_bytes",
     "plan",
     "precheck",
     "precheck_budget_bytes",
@@ -555,8 +555,18 @@ def _finish_plan(
     sizing: float,
     wall: float,
 ) -> TurboPlan:
-    """Assemble a TurboPlan; wall range from the table row, else +/-15%."""
-    wall_range = row.wall_range_s if row is not None and row.regime == regime else (0.85 * wall, 1.15 * wall)
+    """Assemble a TurboPlan; wall range from the table row, else +/-15%.
+
+    The row range applies only when the row's regime AND worker count match
+    the actual plan (audit #84 a4): the table ranges were measured at each
+    row's worker count, and a geometry that plans the same regime with more
+    workers puts the wall_model_s central estimate outside the stale range.
+    """
+    wall_range = (
+        row.wall_range_s
+        if row is not None and row.regime == regime and row.workers == workers
+        else (0.85 * wall, 1.15 * wall)
+    )
     return TurboPlan(
         cap_gb=cap_gb,
         n_cells=n_cells,
@@ -589,6 +599,11 @@ def _read_cgroup_max_gb() -> float:
     Falls back to the fixed v2/v1 paths when /proc/self/cgroup is
     unavailable (old kernels, some containers). 'max', missing, or
     unreadable everywhere -> inf.
+
+    cgroup v2 only (audit #84 a4): on a pure cgroup v1 host the limits
+    live in memory.limit_in_bytes, which this reader does not parse, so
+    the cap falls back to the physical-RAM floor. v1 hosts are out of
+    scope (current fleet + CI runners are v2).
 
     """
     limit = math.inf
@@ -832,6 +847,7 @@ def precheck(
     strict: bool = False,
     cap_source: str = "auto",
     per_box_peak_bytes: int | None = None,
+    per_box_in_flight: int | None = None,
     available_gb: float | None = None,
 ) -> PrecheckDecision:
     """Gate the selected regime's est peak against the 0.85*C budget.
@@ -855,6 +871,10 @@ def precheck(
         cap_source: Human-readable cap source from :func:`resolve_cap`.
         per_box_peak_bytes: Worst-case per-box fallback peak in bytes
             (:func:`per_box_peak_bytes`); None = not estimated.
+        per_box_in_flight: The actual in-flight box count the estimate used
+            (the pipeline's min(workers, tasks), i.e. the real CLI
+            --workers); None = fall back to plan.workers (audit #84 a4:
+            the message must name the count the estimate actually used).
         available_gb: The process's actual memory ceiling in GB (min of
             physical RAM and the cgroup limit; the pipeline passes it).
             When the plan's budget 0.85 * cap exceeds it - the 8 GB floor
@@ -914,7 +934,8 @@ def precheck(
     per_box_gb = per_box_peak_bytes / GB if per_box_peak_bytes is not None else None
     est_gb = per_box_gb if per_box_gb is not None else est_a_gb
     if per_box_gb is not None:
-        summary += f"; per-box est {per_box_gb:.1f} GB (worst snapped box x {plan.workers} in-flight)"
+        in_flight = per_box_in_flight if per_box_in_flight is not None else plan.workers
+        summary += f"; per-box est {per_box_gb:.1f} GB (worst snapped box x {in_flight} in-flight)"
     if strict:
         message = f"error: --turbo est peak {est_a_gb:.1f} GB > budget {budget_gb:.1f} GB; shared path infeasible"
         if per_box_gb is not None:

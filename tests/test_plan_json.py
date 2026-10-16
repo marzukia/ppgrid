@@ -254,7 +254,7 @@ def test_plan_text_and_json_share_source(tmp_path: Path, capsys: pytest.CaptureF
     text = capsys.readouterr().out
     g = doc["grid"]
     for line in (
-        "ppgrid run plan (--plan: nothing written, exit 0)",
+        "ppgrid run plan (--plan: nothing written, exit 0; 3 with --turbo-strict infeasible)",
         f"  input:         {doc['input']}",
         f"  grid extent:   x0={g['x0_m']:.3f} m, y0={g['y0_m']:.3f} m (work CRS EPSG:{g['work_crs']}, metres)",
         (
@@ -270,7 +270,8 @@ def test_plan_text_and_json_share_source(tmp_path: Path, capsys: pytest.CaptureF
         f"  saturation:    {g['saturation']:g}",
         f"  scale:         {g['scale']:g} (DN = percentile * scale), percentile-step: off",
         f"  seed:          {doc['seed']}",
-        f"  workers:       {doc['workers']}, max-band-parallel: default (--workers)",
+        f"  workers:       {doc['workers']} (block pool), n_threads: 1 (warp/ingest)",
+        "  max-band-parallel: default (--workers)",
         f"  compress:      {g['compress']}",
         f"  outputs:       value.tif (EPSG:{g['out_crs']}) + support_km.tif",
         "  turbo:         off",

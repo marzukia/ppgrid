@@ -114,11 +114,14 @@ _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _COMPRESSOR_ID = b"zstd"
 
 # Field offsets in the GDAL CPLCompressor struct (port/cpl_compressor.h;
-# layout verified against GDAL 3.12.4). An ABI change is caught by the
-# executable-region check and the magic-byte self-check, not by these
-# numbers.
+# layout verified against GDAL 3.12.4: nStructVersion@0, pszId@8, eType@16,
+# papszMetadata@24, pfnFunc@32, user_data@40). An ABI change is caught by
+# the nStructVersion check, the executable-region check, and the
+# magic-byte / round-trip self-checks, not by these numbers.
+_OFF_VERSION = 0
 _OFF_PFN = 32
 _OFF_USER_DATA = 40
+_STRUCT_VERSION = 1  # cpl_compressor.h: "should be set to 1"
 
 # CPLCompressorFunc: bool(const void *input, size_t input_size,
 #   void **output, size_t *output_size, CSLConstList options, void *user_data).
@@ -194,7 +197,11 @@ def _gdal_path() -> str:
         lo, hi = parts[0].split("-", 1)
         sizes[parts[5]] = max(sizes.get(parts[5], 0), int(hi, 16) - int(lo, 16))
     if not sizes:
-        msg = "libgdal not found in /proc/self/maps; import rasterio first"
+        # "import rasterio first" would not help: zstdmt is only reached
+        # after the pipeline has already loaded rasterio, and re-importing
+        # cannot change what is mapped. A missing libgdal mapping means
+        # the rasterio build does not expose a standard-named GDAL runtime.
+        msg = "libgdal not found in /proc/self/maps; the loaded rasterio build has no standard-named libgdal runtime"
         raise ZstdmtError(msg)
     return max(sizes, key=sizes.get)
 
@@ -259,9 +266,14 @@ def _extract_fn(cpl: int, what: str) -> tuple[_CPL_FN, int]:
     """Read the function pointer out of a CPLCompressor struct, with guards.
 
     Raises:
-        ZstdmtError: If the pfn is NULL or outside the libgdal exec mappings.
+        ZstdmtError: If nStructVersion is not 1, the pfn is NULL, or the
+            pfn is outside the libgdal exec mappings.
 
     """
+    version = ctypes.c_int.from_address(cpl + _OFF_VERSION).value
+    if version != _STRUCT_VERSION:
+        msg = f"CPLCompressor.{what} nStructVersion is {version}, expected {_STRUCT_VERSION} (ABI drift?)"
+        raise ZstdmtError(msg)
     pfn_addr = ctypes.c_void_p.from_address(cpl + _OFF_PFN).value
     user_data = ctypes.c_void_p.from_address(cpl + _OFF_USER_DATA).value
     if not pfn_addr:
@@ -320,13 +332,14 @@ def _compressor() -> tuple[ctypes.CDLL, _CPL_FN, int]:
 
 
 def _decompressor() -> tuple[ctypes.CDLL, _CPL_FN, int]:
-    """Resolve the CPL zstd decompressor once (same guards, no magic probe).
+    """Resolve the CPL zstd decompressor once (same guards, plus a probe).
 
     Returns:
         The (lib, pfn, user_data) triple.
 
     Raises:
-        ZstdmtError: If the decompressor is missing or the guards fail.
+        ZstdmtError: If the decompressor is missing, the guards fail, or
+            the round-trip probe mismatches.
 
     """
     with _DECOMP_LOCK:
@@ -338,6 +351,17 @@ def _decompressor() -> tuple[ctypes.CDLL, _CPL_FN, int]:
             msg = 'CPLGetDecompressor("zstd") returned NULL (libgdal built without ZSTD?)'
             raise ZstdmtError(msg)
         pfn, user_data = _extract_fn(cpl, "zstd-decompressor")
+        # Round-trip probe (issue #84 a6): the decompressor used to go
+        # unprobed (exec-range guard only). Decompressing a frame the
+        # in-process compressor just produced validates the pfn against
+        # real data. _compressor takes _LOCK, not _DECOMP_LOCK: no deadlock.
+        probe_in = b"ppgrid-zstdmt-decomp-probe"
+        cpl_lib, cpl_pfn, cpl_user = _compressor()
+        probe_frame = _call_fn(cpl_lib, cpl_pfn, cpl_user, probe_in, "compressor")
+        probe_out = _call_fn(lib, pfn, user_data, probe_frame, "decompressor")
+        if probe_out != probe_in:
+            msg = "zstd decompressor round-trip mismatch (pfn ABI drift?)"
+            raise ZstdmtError(msg)
         _DECOMP_CACHE["lib"], _DECOMP_CACHE["pfn"], _DECOMP_CACHE["user_data"] = lib, pfn, user_data
         return lib, pfn, user_data
 
@@ -378,12 +402,18 @@ def compress_tile(data: bytes) -> bytes:
 def decompress_tile(data: bytes) -> bytes:
     """Decompress one ZSTD frame through the CPL zstd decompressor pfn.
 
-    The CPL decompressor sizes the output from the frame content size
-    field, so the frame must carry one (all compress_tile output does).
-    Raises ZstdmtError if the decompressor is unavailable or the call fails.
+    The CPL decompressor sizes its output from the frame's content-size
+    header, so the input must be a self-contained frame carrying one:
+    every compress_tile / compress_tiles output does. Stock GTiff ZSTD
+    tiles written by GDAL through libtiff's streaming encoder do NOT
+    (libtiff frames omit the content size; GDAL reads them back with
+    ZSTD_decompressStream, which only needs the destination size), so
+    decompress_tile cannot read them - to decode stock tiles, use
+    ZSTD_decompressStream with the known tile size. Raises ZstdmtError if
+    the decompressor is unavailable or the call fails.
 
     Args:
-        data: One self-contained ZSTD frame.
+        data: One self-contained ZSTD frame (content-size header present).
 
     Returns:
         The decompressed bytes.
@@ -609,9 +639,13 @@ def _decode_ints(raw: bytes, e: str, typ: int, count: int) -> tuple[int, ...]:
 def _tif_info(path: Path) -> _TifInfo:
     """Parse the first image IFD of a classic or BigTIFF file.
 
-    Reads only what the oracle needs: image size, tile geometry,
-    predictor, and the stored bytes of every tile. Follows the IFD chain
-    to the first IFD that carries TileOffsets.
+    Reads what the oracle needs: image size, tile geometry, predictor, and
+    the stored bytes of every tile. Follows the IFD chain to the first IFD
+    that carries TileOffsets.
+
+    Memory: the whole file is read into RAM (path.read_bytes), and
+    tile_bytes holds every tile, so callers must pass probe-sized files -
+    the pipeline's oracle reference is one 512x512 tile (issue #84 a6).
 
     Raises:
         ZstdmtError: On a non-tiled or unsupported layout.
@@ -709,7 +743,9 @@ def oracle_check(
     TIFF predictor exactly as the stock encoder does, compresses the
     result with `compress` (default: the CPL zstd pfn), and byte-compares
     against the tile bytes actually stored in the file by the stock GDAL
-    write path.
+    write path. The whole file is read into RAM (_tif_info), so pass
+    probe-sized rasters (the pipeline passes one 512x512 tile; issue #84
+    a6).
 
     Args:
         path: A GeoTIFF written by the stock GDAL path (tiled, int16,

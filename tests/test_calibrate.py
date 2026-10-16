@@ -273,7 +273,10 @@ def test_fill_cap_nonfinite_ci_uses_point_skill(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(cal, "blocked_cv_skill", fake_blocked)
     cap, detail = cal.calibrate_fill_cap(np.empty(0), np.empty(0), np.empty(0), block_km=(100.0,))
     assert cap == 8.0  # not 25.0 (FILL_CAP_DEFAULT_KM) and not broken at the first bin
-    assert detail[100.0]["cap_km"] == 8.0
+    # The chosen cap is the single returned value, not repeated per block
+    # size (issue #84 a7: 4x duplication in calibration.json).
+    assert "cap_km" not in detail[100.0]
+    assert detail[100.0]["rows"][0]["hi_km"] == 2.0
 
 
 # Audit #83: saturation plumbing + CV edge derivation

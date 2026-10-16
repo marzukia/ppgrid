@@ -7,6 +7,7 @@ capped raster surface, in minutes, on a single machine, with no GPU.
 from __future__ import annotations
 
 import argparse
+import csv
 import difflib
 import errno
 import hashlib
@@ -61,6 +62,7 @@ from .pullpush import (
     box_count_banded,
     box_count_mt,
     downsample_sum,
+    grid_index_mt,
     pull_push,
 )
 
@@ -293,6 +295,30 @@ SUPPORT_KM_FLOOR: float = 1e-3  # keeps log2 finite for sub-mm support
 # returns when no bin clears the skill bar.
 FILL_FALLBACK_CAP_KM: float = 64.0
 
+# Final-output names published into the out dir on success. Single source
+# for the overwrite guard (#54), the stale-outputs warning (#40/#77), the
+# staging/temp names, and the post-write check (#67): a new final output is
+# one edit here (audit #84 a1). The first two entries are the rasters.
+FINAL_RASTER_NAMES: tuple[str, ...] = ("value.tif", "support_km.tif")
+FINAL_OUTPUT_NAMES: tuple[str, ...] = (*FINAL_RASTER_NAMES, "calibration.json", "run_summary.json")
+
+# Work-CRS staging names (the reproject intermediates). Pinned explicitly,
+# not derived from FINAL_RASTER_NAMES: the stems are historically
+# asymmetric — value.tif -> _value_tmp.tif, but support_km.tif ->
+# _support_tmp.tif (no "_km"). Deriving _support_km_tmp.tif silently drops
+# _support_tmp.tif from the run-temp cleanup set (audit #84 a8, full-suite
+# residue failures in test_turbo / test_cli_interrupt).
+WORK_STAGING_TIF_NAMES: tuple[str, ...] = ("_value_tmp.tif", "_support_tmp.tif")
+
+# GeoTIFF tile codecs the pipeline supports (audit #84 a1): the GTiff
+# driver COMPRESS values verified to take effect on ppgrid's write profile
+# (tiled int16, predictor 2) on the reference stack. GDAL silently ignores
+# an unknown COMPRESS value (the file is written uncompressed), so preflight
+# rejects anything outside this set (exit 2) and the write phase reads the
+# tag back as a stack-variance guard. CCITTRLE/JPEG raise for int16; BZIP2
+# is silently ignored by current GDAL.
+COMPRESS_CHOICES: tuple[str, ...] = ("NONE", "ZSTD", "LZW", "DEFLATE", "PACKBITS", "LERC", "LZMA")
+
 # GeoTIFF tile size. Must stay 512: _reproject_band flushes TILE_PX blocks
 # in raster-scan order to reproduce the on-disk layout of the 512px baseline
 # (byte-identity of the reprojected output).
@@ -482,17 +508,30 @@ def _run_temp_names(n_levels: int = _RUN_LEVELS_MAX) -> tuple[str, ...]:
     ]
     names.extend(f"_{band}_lvl{k}.npy" for k in range(1, n_levels) for band in ("val", "sup"))
     # Write-phase staging files (issue #40): the final rasters are written
-    # to these names and os.replace()'d over value.tif / support_km.tif
-    # only on success, so a mid-write crash never truncates the finals.
-    names.extend(("_value_tmp.tif", "_support_tmp.tif", "value.tif.tmp", "support_km.tif.tmp"))
+    # to these names and os.replace()'d over the finals only on success, so
+    # a mid-write crash never truncates the finals. The work-CRS
+    # intermediates come from WORK_STAGING_TIF_NAMES (asymmetric stems, see
+    # the constant); the .tmp finals are derived from FINAL_RASTER_NAMES
+    # (audit #84 a1).
+    names.extend(WORK_STAGING_TIF_NAMES)
+    names.extend(f"{name}.tmp" for name in FINAL_RASTER_NAMES)
     return tuple(names)
 
 
 _RUN_TEMP_FILES = _run_temp_names()
 
+# Per-run temp files that cannot be enumerated by name (audit #84 a4):
+# _stock_scratch_{thread id}.tif (one per writer thread), *.refhead.tif
+# (one per dst band, classic-TIFF reference head), _zstd_oracle.tif (zstd
+# oracle probe). Both cleanup sites (the SIGINT handler and run()'s
+# finally) glob these, so a hard kill mid-run leaves no leftovers outside
+# _RUN_TEMP_FILES.
+_RUN_TEMP_GLOBS: tuple[str, ...] = ("_stock_scratch_*.tif", "*.refhead.tif", "_zstd_oracle.tif")
+
 # Ingest parallelism (S3.5): minimum data rows per CSV chunk for the process
-# pool. Below this the pool overhead exceeds the parse time, so ingest stays
-# on the single serial parse.
+# pool. The split gate is 2x this floor, so inputs under 200k data rows stay
+# on the single serial parse (equakes, 44,376 rows): below the floor the
+# per-chunk C-parser startup and pool overhead exceed the parse time.
 _INGEST_MIN_CHUNK_ROWS = 100_000
 
 
@@ -661,6 +700,13 @@ class _NoPhase:
         pass
 
 
+# The --turbo preset set derives from SIZING_TABLE (audit #84 a4: the CLI
+# validated a hand-copied list that could drift from the table). "auto" is
+# the bare --turbo (auto-detect cap); the numeric presets are the table's
+# cap rows in table order.
+_TURBO_PRESETS: tuple[str, ...] = ("auto", *(f"{row.cap_gb:g}" for row in turbop.SIZING_TABLE))
+
+
 def _env_report_line(preset: float | None) -> str:
     """Build the ``--verbose`` one-line environment report (issue #101).
 
@@ -797,7 +843,7 @@ def _warn_stale_outputs(out: Path, published: set[str] | None = None) -> None:
     if not out.is_dir():
         return
     published = published or set()
-    existing = [name for name in ("value.tif", "support_km.tif") if (out / name).is_file() and name not in published]
+    existing = [name for name in FINAL_RASTER_NAMES if (out / name).is_file() and name not in published]
     if not existing:
         return
     _ui_note(
@@ -837,12 +883,17 @@ def _interrupted_exit(out: Path | None, p: Pipeline | None) -> NoReturn:
             except OSError:
                 if fpath.is_file():
                     retained.append(fname)
-        for scratch in sorted(out.glob("_stock_scratch_*.tif")):
-            try:
-                scratch.unlink(missing_ok=True)
-            except OSError:
-                if scratch.is_file():
-                    retained.append(scratch.name)
+        # An interrupted run discards the calibration.json it wrote fresh,
+        # same as the other failure paths (audit #84 a4).
+        if p is not None:
+            p._discard_fresh_calibration()  # ruff: ignore[private-member-access] - CLI-internal failure path
+        for pattern in _RUN_TEMP_GLOBS:
+            for scratch in sorted(out.glob(pattern)):
+                try:
+                    scratch.unlink(missing_ok=True)
+                except OSError:
+                    if scratch.is_file():
+                        retained.append(scratch.name)
     if retained:
         print(f"interrupted; retained partials: {', '.join(retained)}", file=sys.stderr)  # ruff: ignore[print]
     else:
@@ -1590,9 +1641,12 @@ def _reproject_band(
             )
 
             def warp_tile(i0: int) -> tuple[int, np.ndarray]:
-                with count_lock:
-                    counters["tiles"] += 1
-                    if skip and not _footprint_has_task(
+                # The skip test runs outside the lock (audit #84 a3): the GDAL
+                # transform_bounds inside it must not serialize all warp
+                # threads; the lock only guards the counter pair.
+                do_skip = False
+                if skip:
+                    do_skip = not _footprint_has_task(
                         rasterio.windows.bounds(Window(i0, j0, min(2048, dst_width - i0), band_h), dst_transform),
                         dst_crs,
                         src_crs,
@@ -1605,7 +1659,10 @@ def _reproject_band(
                         bsize,
                         nby,
                         task_bids,
-                    ):
+                    )
+                with count_lock:
+                    counters["tiles"] += 1
+                    if do_skip:
                         # All-NoData tile: no warp, plain NoData buffer.
                         counters["skipped"] += 1
                         return i0, np.full((band_h, min(2048, dst_width - i0)), NODATA, np.int16)
@@ -2123,9 +2180,11 @@ def _turbo_write_stock_parallel(
         if total > info["inline"] and voff + total > info["first"]:
             _ui_note("warn", "turbo stock head: value array overlaps tiles; serial write")
             return False
-    # Compressed frames are never longer than the raw band, so raw size is
-    # a sound classic-4GiB upper bound.
-    if not info["big"] and head_end + arr.nbytes > _TIFF_CLASSIC_MAX_BYTES:
+    # Compressed frames are never longer than the raw DST band, so raw DST
+    # size is a sound classic-4GiB upper bound. (audit #84 a4: was
+    # arr.nbytes - the work-CRS source array, the wrong geometry when
+    # out_crs != work_crs.)
+    if not info["big"] and head_end + dst_width * dst_height * arr.itemsize > _TIFF_CLASSIC_MAX_BYTES:
         _ui_note("warn", "turbo stock head: assembled file may exceed classic 4 GiB; serial write")
         return False
 
@@ -2415,8 +2474,9 @@ class Pipeline:
 
     Exceptions:
         ``__init__`` raises ``ValueError`` on invalid parameters (scale * 100
-        > int16 max, percentile_step outside (0, 100], saturation <= 0,
-        n_threads < 1, unknown turbo preset, ...).
+        > int16 max, percentile_step outside (0, 100], res/scale/saturation
+        not finite and > 0, workers/calib_max_points/n_threads < 1, unknown
+        turbo preset, ...).
         ``run()`` / ``plan()`` raise ``ValueError`` on validation failures
         (missing input columns, no valid points, non-positive geometry
         values), ``OSError``/``FileNotFoundError`` on I/O errors (missing
@@ -2464,7 +2524,11 @@ class Pipeline:
         Raises:
             ValueError: If scale * PERCENTILE_MAX exceeds int16 max.
             ValueError: If percentile_step is outside (0, PERCENTILE_MAX].
-            ValueError: If saturation is not > 0.
+            ValueError: If saturation is not finite and > 0.
+            ValueError: If res is not finite and > 0.
+            ValueError: If scale is not finite and > 0.
+            ValueError: If workers is not >= 1.
+            ValueError: If calib_max_points is not >= 1.
             ValueError: If n_threads is not >= 1.
             ValueError: If max_band_parallel is not >= 1.
             ValueError: If turbo_cap_gb is not > 0.
@@ -2490,10 +2554,22 @@ class Pipeline:
         if percentile_step is not None and not (0 < percentile_step <= PERCENTILE_MAX):
             msg = f"percentile_step must be in (0, {PERCENTILE_MAX:g}]: {percentile_step}"
             raise ValueError(msg)
-        if saturation <= 0:
-            msg = f"saturation must be > 0: {saturation}"
+        if not math.isfinite(saturation) or saturation <= 0:
+            msg = f"saturation must be finite and > 0: {saturation}"
+            raise ValueError(msg)
+        if not math.isfinite(res) or res <= 0:
+            msg = f"res must be finite and > 0: {res}"
+            raise ValueError(msg)
+        if not math.isfinite(scale) or scale <= 0:
+            msg = f"scale must be finite and > 0: {scale}"
+            raise ValueError(msg)
+        if workers < 1:
+            msg = f"workers must be >= 1: {workers}"
             raise ValueError(msg)
         self.calib_max_points = calib_max_points
+        if calib_max_points < 1:
+            msg = f"calib_max_points must be >= 1: {calib_max_points}"
+            raise ValueError(msg)
         self.src_crs = src_crs
         self.work_crs = work_crs
         self.out_crs = out_crs
@@ -2512,6 +2588,11 @@ class Pipeline:
         self.turbo = turbo
         self.turbo_cap_gb = turbo_cap_gb
         self.turbo_strict = turbo_strict
+        # Set by calibrate() when THIS run writes a fresh calibration.json
+        # (the default out-dir path, not a user --calibration file). A
+        # failed run discards it so a naive re-run is not blocked by an
+        # output this run never completed (audit #84 a4).
+        self._cal_fresh_path: Path | None = None
         if seed < 0:
             msg = f"seed must be >= 0: {seed}"
             raise ValueError(msg)
@@ -2783,10 +2864,21 @@ class Pipeline:
         Returns:
             Tuple of (value, lon, lat) float64 arrays in original row order.
 
+        Raises:
+            ParserError: A structural CSV fault (ragged rows);
+                when exactly one wanted column is at fault the message
+                names it (audit #84 a1).
+            ValueError: A non-numeric cell in a wanted column; the message
+                names the column (audit #84 a1).
+            EmptyDataError: An empty input file (no columns at
+                all, so none to name).
+
         """
 
         def serial() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             dtype = dict.fromkeys(wanted, np.float64)
+            # A parse failure (non-numeric value) propagates to the
+            # _read_points except below, which names the column.
             df = pd.read_csv(self.input_path, usecols=wanted, dtype=dtype)
             return (
                 df[self.value_col].to_numpy(dtype=np.float64),
@@ -2794,31 +2886,77 @@ class Pipeline:
                 df[self.lat_col].to_numpy(dtype=np.float64),
             )
 
-        tasks = _csv_chunk_tasks(self.input_path, wanted, self.n_threads) if self.n_threads > 1 else None
-        ph = self._active_phase
-        if tasks is None:
-            if ph is not None:
-                ph.set_total(0)  # serial parse: no reliable total -> indeterminate
-            return serial()
-        task_list, expected = tasks
-        if ph is not None:
-            ph.set_total(expected)
-        chunks: list[dict[str, np.ndarray]] = []
-        with ProcessPoolExecutor(max_workers=len(task_list)) as ex:
-            for chunk in ex.map(_read_csv_chunk, task_list):
-                chunks.append(chunk)
+        try:
+            tasks = _csv_chunk_tasks(self.input_path, wanted, self.n_threads) if self.n_threads > 1 else None
+            ph = self._active_phase
+            if tasks is None:
                 if ph is not None:
-                    ph.advance(int(chunk[self.value_col].size))
-                    if self.ui is not None:
-                        self.ui.maybe_refresh()
-        # Index by column name, not position (audit #83): the chunk dicts
-        # carry the same names the serial path uses.
-        v = np.concatenate([c[self.value_col] for c in chunks])
-        lon = np.concatenate([c[self.lng_col] for c in chunks])
-        lat = np.concatenate([c[self.lat_col] for c in chunks])
-        if v.size != expected:
+                    ph.set_total(0)  # serial parse: no reliable total -> indeterminate
+                return serial()
+            task_list, expected = tasks
+            if ph is not None:
+                ph.set_total(expected)
+            chunks: list[dict[str, np.ndarray]] = []
+            with ProcessPoolExecutor(max_workers=len(task_list)) as ex:
+                for chunk in ex.map(_read_csv_chunk, task_list):
+                    chunks.append(chunk)
+                    if ph is not None:
+                        ph.advance(int(chunk[self.value_col].size))
+                        if self.ui is not None:
+                            self.ui.maybe_refresh()
+            # Index by column name, not position (audit #83): the chunk dicts
+            # carry the same names the serial path uses.
+            v = np.concatenate([c[self.value_col] for c in chunks])
+            lon = np.concatenate([c[self.lng_col] for c in chunks])
+            lat = np.concatenate([c[self.lat_col] for c in chunks])
+            if v.size == expected:
+                return v, lon, lat
+            # Row-count mismatch (quoted newlines / blank lines): the newline
+            # scan and the C parser disagree, so the serial re-parse is the
+            # correct one. Name it instead of hiding a second full parse of
+            # a large file (audit #84 a2).
+            _ui_note(
+                "warn",
+                f"ingest: parallel parse row mismatch (expected {expected}, got {v.size}); re-running serial parse",
+            )
             return serial()
-        return v, lon, lat
+        except (pd.errors.ParserError, ValueError) as e:
+            # Parse failures from read_csv surface as ParserError (ragged
+            # rows) or ValueError (a non-numeric cell with dtype=float64);
+            # a chunk worker's copy propagates through ex.map. Name the
+            # offending column on every path (audit #84 a1). An empty file
+            # (EmptyDataError) has no columns at all: keep its own message.
+            if isinstance(e, pd.errors.EmptyDataError):
+                raise
+            raise self._name_non_numeric_column(e) from None
+
+    def _name_non_numeric_column(self, err: pd.errors.ParserError | ValueError) -> Exception:
+        """Re-raise a float-parse failure naming the offending column (audit #84 a1).
+
+        pandas names the unparseable value (and the line) but not the
+        column; re-reading each wanted column alone finds the offender.
+        Error path only: the happy path pays nothing. The error is named
+        only when exactly one column fails to parse — a structural CSV
+        fault (ragged rows) fails several columns at once and keeps its
+        original message. The returned error keeps the input's type
+        (ParserError stays a ParserError) so the CLI exit code is unchanged.
+
+        Raises:
+            EmptyDataError: An empty input file, re-raised as-is
+                (there is no column to name).
+
+        """
+        bad: list[str] = []
+        for col in (self.value_col, self.lng_col, self.lat_col):
+            try:
+                pd.read_csv(self.input_path, usecols=[col], dtype={col: np.float64})
+            except pd.errors.EmptyDataError:
+                raise
+            except (pd.errors.ParserError, ValueError):
+                bad.append(col)
+        if len(bad) == 1:
+            return type(err)(f"non-numeric value in column {bad[0]!r}: {err}")
+        return err
 
     def calibrate(self) -> None:
         """Load or run calibration. Sets transform, percentile, cap.
@@ -2842,8 +2980,15 @@ class Pipeline:
             msg = f"--calibration file not found: {cpath_obj} (run without --calibration to create one)"
             raise ValueError(msg)
         if cpath_obj is not None:
-            with cpath_obj.open(encoding="utf-8") as f:
-                cal = json.load(f)
+            try:
+                with cpath_obj.open(encoding="utf-8") as f:
+                    cal = json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                # A malformed file is a validation error (exit 2) naming the
+                # path (audit #84 a1): the bare JSONDecodeError message
+                # carries no file name.
+                msg = f"calibration file {cpath_obj}: {e}"
+                raise ValueError(msg) from None
             # User-supplied file: validate the schema before use so a bad
             # file is a friendly exit-2 naming the file, not a raw
             # traceback mid-run (issue #79).
@@ -2862,7 +3007,13 @@ class Pipeline:
                 # discarded anyway, and it dominates run time / memory).
                 cap, detail = float(self.cap_km), {}
             else:
-                cap, detail = calibrate_fill_cap(cx, cy, tf.fwd(cv), seed=self.seed, saturation=self.saturation)
+                # The fill cap is tuned by blocked CV in the transform space
+                # the run will ACTUALLY use: a forced --transform can differ
+                # from the auto choice, and a cap tuned on the other space
+                # mis-estimates this run's own skill (issue #84 a7).
+                cap_name = self.transform if self.transform != "auto" else tf.name
+                cap_tf = tf if cap_name == tf.name else next(t for t in transforms() if t.name == cap_name).fit(cv)
+                cap, detail = calibrate_fill_cap(cx, cy, cap_tf.fwd(cv), seed=self.seed, saturation=self.saturation)
 
             cal = {
                 "transform": tf.name,
@@ -2871,9 +3022,11 @@ class Pipeline:
                 "transform_state": tf.state(),
                 "percentile_quantiles": pct_fit.q.tolist(),
                 "cap_km": cap,
-                "cv": {
-                    str(k): {"overall_skill": d["overall_skill"], "cap_km": d.get("cap_km")} for k, d in detail.items()
-                },
+                # Per-bin CV detail (n/skill/CI) ships with the file now:
+                # it was computed at 200 bootstrap draws and then discarded
+                # (issue #84 a7). The chosen cap is the top-level cap_km;
+                # it is not repeated per block size.
+                "cv": {str(k): {"overall_skill": d["overall_skill"], "rows": d["rows"]} for k, d in detail.items()},
             }
             # The file is written below, after the forced-transform override
             # is final (issue #23).
@@ -2921,6 +3074,15 @@ class Pipeline:
         if cal is not None:
             cal["transform"] = self.tname
             cal["transform_state"] = self.tf.state()
+            # LUT pairing (issue #84 a7): the percentile LUT must be the
+            # fitted transform's own. With n > calib_max_points the transform
+            # above refits on the full data while the initial pct_fit used
+            # the calibration sample, and shipping both LUTs in one file
+            # encoded the value band with one while interpolating with the
+            # other. This also self-heals older files on reload (the loaded
+            # transform_state LUT wins for both fields).
+            if self.tname == "percentile" and isinstance(self.tf, PercentileTransform):
+                cal["percentile_quantiles"] = self.tf.q.tolist()
 
         # Write the cal file only after the transform above is final
         # (issue #23): the file must record the transform actually used, else
@@ -2932,6 +3094,11 @@ class Pipeline:
             cal_path = cpath_obj or Path(self.out_dir) / "calibration.json"
             with cal_path.open("w", encoding="utf-8") as f:
                 json.dump(cal, f, indent=2, allow_nan=False)
+            # Only the default out-dir file is discardable on failure: a
+            # user --calibration path is a request to reuse (or extend) a
+            # file the user owns (issue #21) - never delete it.
+            if cpath_obj is None:
+                self._cal_fresh_path = cal_path
 
         self.pct_q = (
             PercentileTransform(cal["percentile_quantiles"])
@@ -2981,23 +3148,31 @@ class Pipeline:
         self.nbx = math.ceil(self.nx / self.bsize)
         self.nby = math.ceil(self.ny / self.bsize)
 
-        # Spatial index
-        bx_ = np.clip(((self.x - self.x0) // self.res // self.bsize).astype(np.int64), 0, self.nbx - 1)
-        by_ = np.clip(((self.y - self.y0) // self.res // self.bsize).astype(np.int64), 0, self.nby - 1)
-        bid = bx_ * self.nby + by_
-        order = np.argsort(bid, kind="stable")
-        self.starts = np.searchsorted(bid[order], np.arange(self.nbx * self.nby + 1))
-
-        # Memmap for workers (bands PTS_X/PTS_Y/PTS_TV — see constants above).
-        # Fresh 0600 file, never follows a pre-planted symlink (issue #15).
-        # Skipped in --plan dry-run mode (no files are created; the write
-        # phase, which reads it, never runs).
+        # Spatial index (S3.6, issue #84 a5): with >1 worker the block-id
+        # division and the memmap scatter run thread-chunked via
+        # grid_index_mt; dry runs and single-worker runs keep the original
+        # inline formula. Either way the bytes are bit-identical: the pool
+        # fills disjoint ranges of the same deterministic values and the
+        # stable argsort stays sequential (bincount exactness).
         self.pts_path = Path(self.out_dir) / "_points.npy"
-        if not self.dry_run:
+        if not self.dry_run and self.workers > 1:
+            # Fresh 0600 file, never follows a pre-planted symlink (issue #15).
             pts = _open_fresh_memmap(self.pts_path, np.float64, (PTS_NBANDS, self.n))
-            pts[PTS_X] = self.x[order]
-            pts[PTS_Y] = self.y[order]
-            pts[PTS_TV] = self.tv[order]
+            bid, order = grid_index_mt(
+                self.x,
+                self.y,
+                self.tv,
+                self.x0,
+                self.y0,
+                self.res,
+                self.bsize,
+                self.nbx,
+                self.nby,
+                pts[PTS_X],
+                pts[PTS_Y],
+                pts[PTS_TV],
+                n_threads=self.workers,
+            )
             pts.flush()
             # Drop the reference now, not at frame end: the write phase
             # re-opens the file (mmap read). On Windows the OS handle
@@ -3007,6 +3182,19 @@ class Pipeline:
             # 38207801346 W1). numpy 2.4+ has no memmap.close() API;
             # CPython refcounting releases the handle.
             pts = None
+        else:
+            bx_ = np.clip(((self.x - self.x0) // self.res // self.bsize).astype(np.int64), 0, self.nbx - 1)
+            by_ = np.clip(((self.y - self.y0) // self.res // self.bsize).astype(np.int64), 0, self.nby - 1)
+            bid = bx_ * self.nby + by_
+            order = np.argsort(bid, kind="stable")
+            if not self.dry_run:
+                pts = _open_fresh_memmap(self.pts_path, np.float64, (PTS_NBANDS, self.n))
+                pts[PTS_X] = self.x[order]
+                pts[PTS_Y] = self.y[order]
+                pts[PTS_TV] = self.tv[order]
+                pts.flush()
+                pts = None
+        self.starts = np.searchsorted(bid[order], np.arange(self.nbx * self.nby + 1))
 
         # Task list (one pass: blocks whose 3x3 neighbourhood holds points
         # are computed, the rest are written as nodata)
@@ -3175,8 +3363,7 @@ class Pipeline:
         out = Path(args.out)
         # Overwrite behaviour of a real (non-plan) run: mirrors the #54
         # guard (guarded names present without --force -> exit 2).
-        guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
-        existing = [name for name in guarded if (out / name).is_file()]
+        existing = [name for name in FINAL_OUTPUT_NAMES if (out / name).is_file()]
         if out.is_dir() and existing:
             overwrite = "force" if args.force else "guarded"
         elif out.is_dir():
@@ -3264,8 +3451,15 @@ class Pipeline:
             f"  blocks:        {g['nbx']} x {g['nby']} of bsize={g['bsize']} "
             f"({g['n_tasks']} tasks, {g['n_empty_blocks']} empty)"
         )
+        # Two distinct thread counts (audit #84 a1): `--workers` sizes the
+        # block pool only; warp/ingest run on n_threads, which the CLI never
+        # sets (serial, 1) outside turbo, where the turbo plan budgets it.
+        if data["turbo"] is not None:
+            nt = f"{data['turbo']['plan']['workers']} (warp; ingest 1)"
+        else:
+            nt = f"{self.n_threads} (warp/ingest)"
         lines = [
-            "ppgrid run plan (--plan: nothing written, exit 0)",
+            "ppgrid run plan (--plan: nothing written, exit 0; 3 with --turbo-strict infeasible)",
             f"  input:         {args.input}",
             f"  columns:       value={args.value_col!r} lng={args.lng_col!r} lat={args.lat_col!r}",
             f"  out dir:       {args.out} ({'exists' if out.is_dir() else 'does not exist yet'})",
@@ -3278,7 +3472,8 @@ class Pipeline:
             f"  saturation:    {g['saturation']:g}",
             f"  scale:         {g['scale']:g} (DN = percentile * scale), percentile-step: {pct_step}",
             f"  seed:          {data['seed']}",
-            f"  workers:       {data['workers']}, max-band-parallel: {mbp}",
+            f"  workers:       {data['workers']} (block pool), n_threads: {nt}",
+            f"  max-band-parallel: {mbp}",
             f"  compress:      {g['compress']}",
             f"  outputs:       value.tif (EPSG:{g['out_crs']}) + support_km.tif{json_extra}",
         ]
@@ -3289,7 +3484,8 @@ class Pipeline:
                 mode += " (shared path)"
             lines.append(
                 f"  turbo:         on — {mode}, cap {pl['cap_gb']:g} GB, "
-                f"budget {dec['budget_gb']:g} GB, est peak {dec['est_peak_gb']:g} GB, workers {pl['workers']}"
+                f"budget {dec['budget_gb']:g} GB, est peak {dec['est_peak_gb']:g} GB, "
+                f"n_threads {pl['workers']}"
             )
         elif self.turbo:
             lines.append("  turbo:         on")
@@ -3332,7 +3528,14 @@ class Pipeline:
         pw = self._phase_wall
         disk_v = Path(vpath).stat().st_size
         disk_s = Path(spath).stat().st_size
-        raw = self.nx * self.ny * 2  # one int16 band
+        # raw = the uncompressed int16 payload of the FINAL (output-CRS)
+        # raster, not the work grid: when out_crs != work_crs the reproject
+        # rescales the cell count, so the work-grid size conflated the
+        # rescale with the compression and the "ratio" included it
+        # (audit #84 a1). Header-only open of the value file: both bands
+        # share the same output grid (one calculate_default_transform).
+        with rasterio.open(vpath) as dst:
+            raw = dst.width * dst.height * 2  # one int16 band
         cells_per_level = [(self.nx_padded >> k) * (self.ny_padded >> k) for k in range(self.levels + 1)]
         turbo: dict[str, Any] | None = None
         if self._turbo_decision is not None:
@@ -3658,6 +3861,19 @@ class Pipeline:
             cgroup_gb=turbop._read_cgroup_max_gb(),  # ruff: ignore[private-member-access]
         )
 
+    def _discard_fresh_calibration(self) -> None:
+        """Delete the calibration.json this run wrote (audit #84 a4).
+
+        Called from the run-failure paths: a failed run leaves no usable
+        output set, and a fresh cal file would make the next naive re-run
+        demand --force. User-supplied --calibration files are never set
+        here, so they survive failures untouched. Idempotent.
+
+        """
+        if self._cal_fresh_path is not None:
+            self._cal_fresh_path.unlink(missing_ok=True)
+            self._cal_fresh_path = None
+
     def _per_box_peak_bytes(self) -> int | None:
         """Worst-case per-box fallback peak, or None pre-grid (M-3).
 
@@ -3721,11 +3937,17 @@ class Pipeline:
         cgroup_gb = turbop._read_cgroup_max_gb()  # ruff: ignore[private-member-access]
         finite = [g for g in (physical_gb, cgroup_gb) if g is not None and math.isfinite(g)]
         available_gb = min(finite) if finite else None
+        # The per-box estimate must be announced with the in-flight count it
+        # actually used: the CLI's real --workers, not plan.workers
+        # (audit #84 a4).
+        per_box_peak = self._per_box_peak_bytes()
+        in_flight = min(self.workers, len(self.tasks)) if per_box_peak is not None else None
         decision = turbop.precheck(
             plan,
             strict=self.turbo_strict,
             cap_source=cap_source,
-            per_box_peak_bytes=self._per_box_peak_bytes(),
+            per_box_peak_bytes=per_box_peak,
+            per_box_in_flight=in_flight,
             available_gb=available_gb,
         )
         self._turbo_plan = plan
@@ -4062,7 +4284,37 @@ class Pipeline:
             self._write_rasters_turbo(vprof, sprof, vpath, spath, vtags, stags, xform)
         else:
             self._write_rasters_serial(vprof, sprof, vpath, spath, vtags, stags)
+        self._verify_compress_readback(vpath, spath)
         return str(vpath), str(spath)
+
+    def _verify_compress_readback(self, vpath: Path, spath: Path) -> None:
+        """Read the COMPRESS tag back off the published finals (audit #84 a1).
+
+        Preflight rejects codecs outside COMPRESS_CHOICES; this guard covers
+        stack variance (a codec the local GDAL build silently drops, e.g.
+        LZMA without liblzma). A silent degrade to uncompressed is a
+        RuntimeError (exit 1), not a successful run.
+
+        Args:
+            vpath: Published value GeoTIFF.
+            spath: Published support GeoTIFF.
+
+        Raises:
+            RuntimeError: If either final's stored codec differs from the
+                requested one.
+
+        """
+        _load_native()
+        want = "none" if self.compress.upper() == "NONE" else self.compress.lower()
+        for path in (vpath, spath):
+            with rasterio.open(path) as ds:
+                actual = (ds.profile.get("compress") or "none").lower()
+            if actual != want:
+                msg = (
+                    f"--compress {self.compress} not effective in {path.name}: file is '{actual}' "
+                    f"(this GDAL build appears to lack the codec)"
+                )
+                raise RuntimeError(msg)
 
     def _write_rasters_serial(
         self,
@@ -4086,8 +4338,8 @@ class Pipeline:
         ftmp_v = Path(self.out_dir) / (vpath.name + ".tmp")
         ftmp_s = Path(self.out_dir) / (spath.name + ".tmp")
         if self.out_crs != self.work_crs:
-            wtmp_v = Path(self.out_dir) / "_value_tmp.tif"
-            wtmp_s = Path(self.out_dir) / "_support_tmp.tif"
+            wtmp_v = Path(self.out_dir) / WORK_STAGING_TIF_NAMES[0]
+            wtmp_s = Path(self.out_dir) / WORK_STAGING_TIF_NAMES[1]
         else:
             wtmp_v, wtmp_s = ftmp_v, ftmp_s
         partial = False
@@ -4204,6 +4456,21 @@ class Pipeline:
                         "nby": self.nby,
                         "task_bids": {bx * self.nby + by for bx, by in self.tasks},
                     }
+                    if self.work_crs != WORK_CRS or self.out_crs != OUT_CRS:
+                        # The skip test's "a false empty is not possible"
+                        # premise is verified only for the default 6933 -> 3857
+                        # pair (audit #84 a3): on exotic --work-crs/--out-crs
+                        # pairs the densified inverse footprint may miss the
+                        # true inverse footprint by more than the one-cell
+                        # pad, so a skippable tile could be false-empty. Warn
+                        # once; the run still writes (skip stays conservative
+                        # for the default pair only).
+                        _ui_note(
+                            "warn",
+                            f"no-data tile skip active with a non-default work/out CRS pair "
+                            f"({self.work_crs} -> {self.out_crs}); the skip test's footprint "
+                            "premise is verified only for 6933 -> 3857 — check the output",
+                        )
                 with self._phase("reproject", total=2 * dst_width * dst_height, unit="cells") as rph:
 
                     def _reproj_progress(done: int) -> None:
@@ -4247,7 +4514,7 @@ class Pipeline:
                 mb_v = Path(vpath).stat().st_size / 1e6
                 mb_s = Path(spath).stat().st_size / 1e6
                 wph.summary = f"value.tif {mb_v:.1f} MB, support_km.tif {mb_s:.1f} MB"
-            if wtmp_v is not ftmp_v:
+            if wtmp_v != ftmp_v:
                 wtmp_v.unlink(missing_ok=True)
                 wtmp_s.unlink(missing_ok=True)
         except BaseException as exc:
@@ -4554,8 +4821,9 @@ class Pipeline:
             # skips that line.
             val_dn = sup_dn = arr = dn = None
             self._remove_run_temps()
-            for p in out_dir.glob("_stock_scratch_*.tif"):
-                p.unlink(missing_ok=True)
+            for pattern in _RUN_TEMP_GLOBS:
+                for p in out_dir.glob(pattern):
+                    p.unlink(missing_ok=True)
             if partial and not interrupted:
                 _ui_note(
                     "warn",
@@ -4608,14 +4876,53 @@ def _input_columns(path: str) -> list[str] | None:
 
             with pq.ParquetFile(path) as f:
                 return [str(n) for n in f.schema.names]
+        names = _raw_csv_header_names(path)
+        if names is not None:
+            return names
         df = pd.read_csv(path, nrows=0)
         return [str(c) for c in df.columns]
     except Exception:  # ruff: ignore[blind-except] — preflight is best-effort; the run reports the real error
         return None
 
 
+def _raw_csv_header_names(path: str) -> list[str] | None:
+    """Raw CSV header names, duplicates preserved (audit #84 a2 preflight).
+
+    pandas mangles duplicate headers (value -> value.1), which hides a
+    duplicated role column; the raw header line keeps it. None when the
+    header is not plain text (compressed input, no header line): the
+    caller falls back to the pandas names. A quoted multi-line header
+    (unterminated quote on the first physical line) yields the partial
+    first-line name list: `csv.reader` does not error on an unterminated
+    quote. That matches the pandas parse for default column names; only
+    an explicit `--*-col` name spanning the quoted field can disagree.
+
+    Args:
+        path: CSV input path.
+
+    Returns:
+        Raw header name list, or None to fall back.
+
+    """
+    try:
+        with Path(path).open(newline="", encoding="utf-8-sig") as f:
+            line = f.readline()
+        if not line:
+            return None
+        return [str(n) for n in next(csv.reader([line]))]
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return None
+
+
 def _check_columns(path: str, value_col: str, lng_col: str, lat_col: str) -> None:
     """Exit 2 with the real columns + closest matches on a missing column (#57).
+
+    Every missing requested column is reported in one pass (audit #84 a2: the
+    old loop exited on the first miss) and a role name that appears more than
+    once in the input is rejected as ambiguous — pandas mangles duplicate CSV
+    headers (value -> value.1, so the first column is silently taken) while a
+    Parquet with two same-named columns makes df[col] 2-D and the run crashes
+    with an unmapped IndexError.
 
     Args:
         path: Input file path.
@@ -4624,16 +4931,29 @@ def _check_columns(path: str, value_col: str, lng_col: str, lat_col: str) -> Non
         lat_col: --lat-col name.
 
     Raises:
-        SystemExit: code 2 when a requested column is absent from the input.
+        SystemExit: code 2 when a requested column is absent or duplicated.
 
     """
     cols = _input_columns(path)
     if cols is None:
         return
-    for flag, name in (("--value-col", value_col), ("--lng-col", lng_col), ("--lat-col", lat_col)):
-        if name in cols:
-            continue
-        shown = ", ".join(cols[:24]) + (f", ... ({len(cols)} total)" if len(cols) > 24 else "")
+    roles = (("--value-col", value_col), ("--lng-col", lng_col), ("--lat-col", lat_col))
+    counts: dict[str, int] = {}
+    for c in cols:
+        counts[c] = counts.get(c, 0) + 1
+    for flag, name in roles:
+        if counts.get(name, 0) > 1:
+            _ui_note(
+                "error",
+                f"{flag} {name!r} appears {counts[name]} times in {path}; "
+                "duplicate column names are ambiguous (CSV takes the first, Parquet errors)",
+            )
+            raise SystemExit(2)
+    shown = ", ".join(cols[:24]) + (f", ... ({len(cols)} total)" if len(cols) > 24 else "")
+    # Collect every miss first (audit #84 a2): one pass reports all of them
+    # instead of stopping at the first, then exits 2 once.
+    misses = [(flag, name) for flag, name in roles if name not in cols]
+    for flag, name in misses:
         _ui_note("error", f"{flag} {name!r} not found in {path}")
         # Auxiliary detail lines, not standalone events: raw indented print
         # right after the unified error line (D-7).
@@ -4642,6 +4962,7 @@ def _check_columns(path: str, value_col: str, lng_col: str, lat_col: str) -> Non
         if close:
             detail.append(f"  did you mean: {', '.join(close)}?")
         print("\n".join(detail), file=sys.stderr)  # ruff: ignore[print]
+    if misses:
         raise SystemExit(2)
 
 
@@ -4802,6 +5123,11 @@ def _map_pipeline_errors(fn: Callable[[], Any], input_path: str) -> Any:
         # other pipeline failures rather than exit 2 (audit #83).
         _die(f"{type(e).__name__}: {e} (input: {input_path})")
     except (KeyError, ValueError) as e:
+        # pyarrow raises ArrowInvalid (a ValueError subclass) on a corrupt
+        # .parquet; like the CSV ParserError path above, a corrupt input is a
+        # pipeline/IO failure (exit 1), not a validation error (audit #84 a2).
+        if type(e).__module__.startswith("pyarrow."):
+            _die(f"malformed input file: {e}")
         _ui_note("error", str(e))  # D-7: unified error line
         raise SystemExit(2) from None
     except OSError as e:
@@ -4825,7 +5151,10 @@ def _sanitize_json(obj: Any) -> Any:
 
     An external --calibration file may carry NaN/Infinity literals in
     fields that are not pre-validated; json.dump(allow_nan=False) would
-    raise, so they become null in the summary.
+    raise, so they become null in the summary. Remaining non-JSON-native
+    values (a future np.float32 / set / Path / Decimal) are stringified by
+    the dump-site default=str fallback instead of crashing the summary
+    (audit #84 a1).
 
     Args:
         obj: Summary structure (dict/list/scalar).
@@ -4866,7 +5195,9 @@ def _write_json_summary(p: Pipeline, args: argparse.Namespace, out: Path) -> Non
     tmp = out / "run_summary.json.tmp"
     try:
         with os.fdopen(_staging_fd(tmp), "wb") as f:
-            f.write((json.dumps(_sanitize_json(summary), indent=2, allow_nan=False) + "\n").encode("utf-8"))
+            f.write(
+                (json.dumps(_sanitize_json(summary), indent=2, allow_nan=False, default=str) + "\n").encode("utf-8")
+            )
         tmp.replace(path)
     except OSError as e:
         tmp.unlink(missing_ok=True)
@@ -4892,7 +5223,7 @@ def _params_fingerprint(params: dict[str, Any]) -> str:
     params share one fingerprint regardless of when they ran.
 
     """
-    canonical = json.dumps(_sanitize_json(params), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    canonical = json.dumps(_sanitize_json(params), sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -4947,7 +5278,9 @@ def _write_run_sidecar(args: argparse.Namespace, out: Path) -> None:
     tmp = out / "ppgrid_run.json.tmp"
     try:
         with os.fdopen(_staging_fd(tmp), "wb") as f:
-            f.write((json.dumps(_sanitize_json(payload), indent=2, allow_nan=False) + "\n").encode("utf-8"))
+            f.write(
+                (json.dumps(_sanitize_json(payload), indent=2, allow_nan=False, default=str) + "\n").encode("utf-8")
+            )
         tmp.replace(path)
     except OSError as e:
         tmp.unlink(missing_ok=True)
@@ -5165,10 +5498,11 @@ def _set_config_value(
             resolved = text
     if action.choices is not None and resolved not in action.choices:
         parser.error(f"config: {key!r} must be one of {', '.join(action.choices)}: {value!r} ({cfg})")
-    if key == "turbo" and resolved not in ("auto", "16", "32", "64", "128"):
+    if key == "turbo" and resolved not in _TURBO_PRESETS:
         # --turbo carries no type checker (optional-arg const); the preset
-        # set is validated the same way _main_preflight does.
-        parser.error(f"config: 'turbo' must be auto|16|32|64|128: {value!r} ({cfg})")
+        # set (derived from SIZING_TABLE) is validated the same way
+        # _main_preflight does.
+        parser.error(f"config: 'turbo' must be {'|'.join(_TURBO_PRESETS)}: {value!r} ({cfg})")
     setattr(args, dest, resolved)
 
 
@@ -5365,9 +5699,12 @@ def _build_parser() -> argparse.ArgumentParser:
         const="auto",
         default=UNSET,
         metavar="GB",
-        help="Turbo mode: parallel phases sized to a RAM budget. "
-        "Optional RAM cap preset 16|32|64|128 (GB, decimal 1e9 bytes); bare --turbo = auto-detect. "
-        "Presets are common sizes; use --max-ram GB for any value.",
+        help=(
+            "Turbo mode: parallel phases sized to a RAM budget. "
+            f"Optional RAM cap preset {'|'.join(p for p in _TURBO_PRESETS if p != 'auto')} "
+            "(GB, decimal 1e9 bytes); bare --turbo = auto-detect. "
+            "Presets are common sizes; use --max-ram GB for any value."
+        ),
     )
     g_mem.add_argument(
         "--max-ram",
@@ -5386,7 +5723,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     g_out = parser.add_argument_group("output")
     g_out.add_argument("-o", "--out", default=UNSET, help="Output directory (default: out/)")
-    g_out.add_argument("--compress", default=UNSET, help="GeoTIFF tile compression codec (default: ZSTD)")
+    g_out.add_argument(
+        "--compress",
+        default=UNSET,
+        help=f"GeoTIFF tile compression codec (default: ZSTD); one of {', '.join(COMPRESS_CHOICES)}. "
+        "Unknown values are rejected here because GDAL would ignore them and write uncompressed",
+    )
     g_out.add_argument(
         "--force",
         action="store_true",
@@ -5567,12 +5909,21 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
         parser.error("--calib-max-points must be at least 1")
     if args.seed < 0:
         parser.error("--seed must be >= 0")
+    # Audit #84 a1: GDAL silently ignores an unknown COMPRESS value (exit 0,
+    # file written uncompressed). Validate against the supported set; the
+    # comparison is case-insensitive because the GTiff driver is.
+    if args.compress.upper() not in COMPRESS_CHOICES:
+        parser.error(f"--compress must be one of {', '.join(COMPRESS_CHOICES)}: {args.compress}")
+    if not args.out:
+        # Path("") == Path("."): an empty --out would silently write into the
+        # CWD (audit #84 a1).
+        parser.error("--out must not be empty (it would default to the CWD)")
     for flag, val in (("--src-crs", args.src_crs), ("--work-crs", args.work_crs), ("--out-crs", args.out_crs)):
         if val <= 0:
             parser.error(f"{flag} must be a positive EPSG code")
-    if args.turbo is not None and args.turbo not in ("auto", "16", "32", "64", "128"):
+    if args.turbo is not None and args.turbo not in _TURBO_PRESETS:
         parser.error(
-            f"--turbo preset must be auto|16|32|64|128: {args.turbo} "
+            f"--turbo preset must be {'|'.join(_TURBO_PRESETS)}: {args.turbo} "
             "(presets are common sizes; use --max-ram GB for any value)"
         )
     if args.max_ram is None:
@@ -5609,7 +5960,7 @@ def _main_preflight(parser: argparse.ArgumentParser, args: argparse.Namespace, o
             # (schema_version 1) and nothing else; the human printer is
             # skipped. stderr (phase logs, the strict precheck line) keeps
             # the run --json contract.
-            payload = json.dumps(_sanitize_json(p.plan_data(args)), indent=2, allow_nan=False) + "\n"
+            payload = json.dumps(_sanitize_json(p.plan_data(args)), indent=2, allow_nan=False, default=str) + "\n"
             sys.stdout.write(payload)
             sys.stdout.flush()
         elif plan_ui is not None:
@@ -5893,10 +6244,7 @@ def _compare_resolve(out1: str, out2: str) -> list[tuple[str, Path, Path]]:
         msg = "cannot mix directory and file arguments (pass two output dirs or two GeoTIFFs)"
         raise ValueError(msg)
     if a.is_dir():
-        pairs = [
-            ("value", a / "value.tif", b / "value.tif"),
-            ("support_km", a / "support_km.tif", b / "support_km.tif"),
-        ]
+        pairs = [(name[:-4], a / name, b / name) for name in FINAL_RASTER_NAMES]
         missing = [f.name for _, pa, pb in pairs for f in (pa, pb) if not f.is_file()]
         if missing:
             msg = f"not a ppgrid output dir (missing: {', '.join(missing)})"
@@ -6295,7 +6643,7 @@ def _post_write_check(p: Pipeline, out: Path) -> None:
         exp_w, exp_h, exp_tf = p.nx, p.ny, from_origin(p.x0, p.y0 + p.ny * p.res, p.res, p.res)
     exp_crs = CRS.from_user_input(out_crs)
     cap_cells = round(p.cap_km_val * M_PER_KM / p.res)
-    for name in ("value.tif", "support_km.tif"):
+    for name in FINAL_RASTER_NAMES:
         path = out / name
         if not path.is_file():
             problems.append(f"{name}: file missing (expected {path})")
@@ -7152,6 +7500,10 @@ def main(argv: list[str] | None = None) -> None:
         # this invocation. main() is the only builder; library callers pass
         # their own (or no) UI straight to Pipeline.
         ui = _ui.UI.from_cli(quiet=args.quiet, color=args.color)
+        # A previous main() in this process (tests) may have bound its log
+        # handler to that run's stderr; rebind before the config-merge
+        # warnings, which land before this run's _configure_logging.
+        _ui.rebind_ppgrid_streams()
         _CURRENT_UI["ui"] = ui
         out: Path | None = None  # bound after the config merge (it may set out); None = interrupt during parse/merge
         try:
@@ -7220,8 +7572,7 @@ def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Pat
         # #54: overwrite guard — a non-empty out dir means an earlier run's
         # outputs; require --force to clobber them.
         if not args.force:
-            guarded = ("value.tif", "support_km.tif", "calibration.json", "run_summary.json")
-            existing = [name for name in guarded if (out / name).is_file()]
+            existing = [name for name in FINAL_OUTPUT_NAMES if (out / name).is_file()]
             if existing:
                 _ui_note("error", f"output directory {args.out} already contains: {', '.join(existing)}")
                 _ui_note(
@@ -7246,7 +7597,15 @@ def _run_cli(parser: argparse.ArgumentParser, args: argparse.Namespace, out: Pat
             # same exit-code mapping as the run phase (review M-1, #56
             # contract).
             p = _map_pipeline_errors(lambda: _make_pipeline(args, dry_run=False, ui=ui), args.input)
-            _map_pipeline_errors(p.run, args.input)
+            try:
+                _map_pipeline_errors(p.run, args.input)
+            except BaseException:
+                # A failed run discards the calibration.json it wrote fresh
+                # so a naive re-run is not blocked by an output of a run
+                # that never completed (audit #84 a4). User --calibration
+                # files are never discarded.
+                p._discard_fresh_calibration()  # ruff: ignore[private-member-access] - CLI-internal failure path
+                raise
             if args.check:
                 _post_write_check(p, out)
             _write_run_sidecar(args, out)  # #64: run fingerprint sidecar

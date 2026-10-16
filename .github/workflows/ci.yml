@@ -23,15 +23,17 @@ jobs:
   # x every platform above (verified against uv.lock 2026-10-12), so
   # `uv sync --all-extras --locked` never needs a source build.
   #
-  # Anchor gate: every leg re-runs the CI-safe configs (melb10 + melb500,
-  # 2.4 GB peak RSS measured) and fails when outputs drift from the
+  # Anchor gate: every leg re-runs the CI-safe configs (all six melb
+  # resolutions, melb10 the heaviest at 2.4 GB peak RSS measured) and fails
+  # when outputs drift from the
   # committed examples/ anchors — byte-exact on canonical x86_64 Linux,
   # functional-equivalence (grid/metadata + decoded pixels) on the other
   # legs. Cross-OS writer drift (GDAL/zstd/libtiff build deltas) is a leg
   # failure, not a warning. equakes-scale anchors
   # (8.1-8.4 GB peak) stay out of the CI anchor scope (Linux/hydrogen-
-  # verified via compare_tier2.py); melb10+melb500 are the conservative
-  # CI-safe choice.
+  # verified via compare_tier2.py); all six melb resolutions fit the CI-safe
+  # bound (issue #84 a8: the 25/50/100/250m rasters were previously
+  # unanchored).
   test:
     if: github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
@@ -70,8 +72,9 @@ jobs:
   # named 'nf' is registered on the marzukia account, so the first main
   # push (#39 merge) queued 9.5h starved. Wire real self-hosted runners
   # to this account before switching back.
-  # Anchor gate added 2026-10-12: melb10+melb500 fit the 16 GB runner
-  # (2.4 GB peak RSS, measured on hydrogen).
+  # Anchor gate added 2026-10-12: the six melb resolutions fit the 16 GB
+  # runner (melb10 = 2.4 GB peak RSS, measured on hydrogen; the rest are
+  # coarser and lighter).
   test-main:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest

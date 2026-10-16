@@ -393,9 +393,14 @@ Follow-ups (separate work items, not part of this fix):
 
 ## 11. Benchmark harness spec
 
-`bench/sparse_bench.py` (created for this design; not committed to the repo —
-the harness lives on the author's box; no pipeline code modified —
-instrumentation is monkey-patching).
+`bench/sparse_bench.py` (created for this design; not committed to the repo).
+
+> **Status note (2026-10-15, issue #84 a8):** the harness file has been lost
+> (it lived on the author's box and was never committed), so the numbers below
+> are historical and not reproducible from a checkout. The captured outputs
+> (`/home/monky/tmp/sparse_bench/`, `/home/monky/tmp/sparse_bench_cap2/`) still
+> exist on that box. The spec below is kept so the harness can be rebuilt if
+> the benchmark is ever rerun.
 
 ```
 cd <worktree>

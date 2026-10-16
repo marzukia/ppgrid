@@ -3,6 +3,8 @@
 Repro: uv run python -m bench.turbo_bench
 """
 
+import atexit
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -13,9 +15,26 @@ import rasterio
 from rasterio.warp import calculate_default_transform
 
 from ppgrid.pipeline import NODATA, TILE_PX, Pipeline, _reproject_band
-from tests.test_turbo import _write_src_tif
 
-TMP = Path(tempfile.mkdtemp(prefix="turbo_bench"))
+try:
+    from bench._helpers import write_src_tif  # python -m bench.turbo_bench
+except ImportError:  # python bench/turbo_bench.py (script dir on sys.path)
+    from _helpers import write_src_tif
+
+_TMP: Path | None = None
+
+
+def _tmp() -> Path:
+    """Scratch dir, created on first use and removed at exit.
+
+    No import-time mkdtemp (issue #84 a8): importing the harness used to
+    leak a tempdir, and -m/--help-style imports paid for it.
+    """
+    global _TMP
+    if _TMP is None:
+        _TMP = Path(tempfile.mkdtemp(prefix="turbo_bench"))
+        atexit.register(shutil.rmtree, str(_TMP), ignore_errors=True)
+    return _TMP
 
 
 def median(f, runs=3):
@@ -28,8 +47,8 @@ def median(f, runs=3):
 
 
 def bench_reproject():
-    src = TMP / "src.tif"
-    _write_src_tif(src, 5000, 4000)
+    src = _tmp() / "src.tif"
+    write_src_tif(src, 5000, 4000)
     with rasterio.open(src) as ds:
         t, w, h = calculate_default_transform(ds.crs, "EPSG:3857", ds.width, ds.height, *ds.bounds)
     profile = {
@@ -43,7 +62,7 @@ def bench_reproject():
         "predictor": 2,
         "count": 1,
     }
-    out = TMP / "out.tif"
+    out = _tmp() / "out.tif"
     t1 = median(lambda: _reproject_band(str(src), str(out), profile, "EPSG:3857", t, w, h))
     t4 = median(lambda: _reproject_band(str(src), str(out), profile, "EPSG:3857", t, w, h, n_threads=4))
     print(f"reproject band {w}x{h}: serial {t1:.3f}s, 4t {t4:.3f}s, speedup {t1 / t4:.2f}x")
@@ -51,7 +70,7 @@ def bench_reproject():
 
 def bench_ingest(n_rows=1_000_000):
     rng = np.random.default_rng(0)
-    csv = TMP / "big.csv"
+    csv = _tmp() / "big.csv"
     pd.DataFrame(
         {
             "value": rng.normal(0.0, 100.0, n_rows),
@@ -59,8 +78,8 @@ def bench_ingest(n_rows=1_000_000):
             "latitude": rng.uniform(-50.0, -10.0, n_rows),
         },
     ).to_csv(csv, index=False)
-    t1 = median(lambda: Pipeline(str(csv), "value", "longitude", "latitude", str(TMP / "o1"), n_threads=1).ingest())
-    t4 = median(lambda: Pipeline(str(csv), "value", "longitude", "latitude", str(TMP / "o4"), n_threads=4).ingest())
+    t1 = median(lambda: Pipeline(str(csv), "value", "longitude", "latitude", str(_tmp() / "o1"), n_threads=1).ingest())
+    t4 = median(lambda: Pipeline(str(csv), "value", "longitude", "latitude", str(_tmp() / "o4"), n_threads=4).ingest())
     print(f"ingest {n_rows} rows: serial {t1:.3f}s, 4t {t4:.3f}s, speedup {t1 / t4:.2f}x")
 
 
