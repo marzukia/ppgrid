@@ -94,8 +94,8 @@ uv sync
 ## Standalone binaries
 
 Each [release](https://github.com/marzukia/ppgrid/releases) carries
-prebuilt `ppgrid` binaries (Linux x86_64; macOS arm64 and x86_64 via the
-`binary.yml` CI matrix). They are single-file builds with the Python
+prebuilt `ppgrid` binaries (Linux x86_64 and aarch64; macOS arm64 and
+x86_64) built by the `binary.yml` CI matrix. They are single-file builds with the Python
 interpreter, GDAL and the PROJ database bundled in — the target machine
 needs no Python, no GDAL install, and no compiler:
 
