@@ -330,6 +330,66 @@ def test_perbox_after_shared_no_stale_ctx(tmp_path: Path, monkeypatch: pytest.Mo
     assert (vb_alone != NODATA).sum() > 1000, "expected real content, got empty raster"
 
 
+def test_two_concurrent_runs_no_cross_clobber(tmp_path: Path) -> None:
+    """Two concurrent Pipeline.run() calls in one process must not share run state (audit #83).
+
+    The _CTX module global was deleted so each run's state rides its own
+    instance (_WorkerConfig) into the task args; this pins the hazard the
+    deletion exists for. Two tiny pipelines with different configs (res,
+    cap_km, data range -> different grids and origins) run in threads; each
+    output must equal its own single-run reference. A stale cross-run field
+    would change the grid size or origin and break at least one comparison.
+
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def make_csv(name: str, seed: int, lon_span: float) -> Path:
+        rng = np.random.default_rng(seed)
+        n = 3000
+        path = tmp_path / name
+        pd.DataFrame(
+            {
+                "lon": 144.9 + rng.uniform(0, lon_span, n),
+                "lat": -37.6 + rng.uniform(0, 0.02, n),
+                "val": rng.uniform(1, 100, n),
+            }
+        ).to_csv(path, index=False)
+        return path
+
+    def run_one(csv: Path, out: Path, res: float, cap_km: float) -> tuple[np.ndarray, np.ndarray]:
+        p = Pipeline(
+            str(csv),
+            "val",
+            "lon",
+            "lat",
+            str(out),
+            res=res,
+            cap_km=cap_km,
+            workers=2,
+            skip_calibration=True,
+            out_crs=6933,
+        )
+        p.run()
+        with rasterio.open(out / "value.tif") as v, rasterio.open(out / "support_km.tif") as s:
+            return v.read(1), s.read(1)
+
+    ca, cb = make_csv("a.csv", 101, 0.02), make_csv("b.csv", 202, 0.04)
+    ref_a = run_one(ca, tmp_path / "ref_a", 10.0, 10.0)
+    ref_b = run_one(cb, tmp_path / "ref_b", 20.0, 4.0)
+    assert ref_a[0].shape != ref_b[0].shape, "configs must yield different grids"
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fa = ex.submit(run_one, ca, tmp_path / "conc_a", 10.0, 10.0)
+        fb = ex.submit(run_one, cb, tmp_path / "conc_b", 20.0, 4.0)
+        got_a = fa.result()
+        got_b = fb.result()
+
+    assert np.array_equal(got_a[0], ref_a[0]), "concurrent run A: value differs from single-run ref"
+    assert np.array_equal(got_a[1], ref_a[1]), "concurrent run A: support differs from single-run ref"
+    assert np.array_equal(got_b[0], ref_b[0]), "concurrent run B: value differs from single-run ref"
+    assert np.array_equal(got_b[1], ref_b[1]), "concurrent run B: support differs from single-run ref"
+
+
 # --- banded descent: parallel row-bands --------------------------------------
 
 
