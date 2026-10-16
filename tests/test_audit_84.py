@@ -640,6 +640,52 @@ def test_a7_percentile_lut_pairing(tmp_path: Path) -> None:
     assert "cap_km" in cal
 
 
+def test_a7_old_format_calibration_loads(tmp_path: Path) -> None:
+    """a7 review-minor pin: pre-#84 calibration files still load.
+
+    Per-block cap_km with no rows (the pre-#84 shape) must still validate,
+    rebuild, and round-trip — the CHANGELOG's "older files load unchanged"
+    claim.
+    """
+    from ppgrid.calibrate import make_transform, validate_calibration
+
+    n = 200
+    rng = np.random.default_rng(1)
+    x_deg = 144.90 + rng.uniform(-0.03, 0.03, n)
+    y_deg = -37.81 + rng.uniform(-0.03, 0.03, n)
+    v = rng.uniform(1.0, 1000.0, n)
+    csv = _write_xy_csv(tmp_path, x_deg, y_deg, v)
+    p = _pl.Pipeline(
+        str(csv),
+        "value",
+        "longitude",
+        "latitude",
+        str(tmp_path / "out"),
+        res=500.0,
+        cap_km="auto",
+        transform="percentile",
+        out_crs=_pl.WORK_CRS,
+    )
+    p.ingest()
+    p.calibrate()
+    cal = p._cal
+    assert cal is not None
+    # Downgrade the fresh (post-#84) file to the pre-#84 shape: per-block
+    # cap_km, no rows. Everything else (transform_state, quantiles, LUT)
+    # was already present in the old format.
+    old = json.loads(json.dumps(cal))
+    for entry in old["cv"].values():
+        rows = entry.pop("rows")
+        entry["cap_km"] = rows[-1]["hi"] if rows else old["cap_km"]
+    validate_calibration(old, "legacy.json")
+    tf = make_transform(old["transform_state"])
+    lo, hi = old["percentile_quantiles"][0], old["percentile_quantiles"][-1]
+    sample = lo + np.linspace(0.1, 0.9, 9) * (hi - lo)
+    pct = tf.fwd(sample)
+    assert np.all(np.isfinite(pct))
+    assert np.allclose(tf.inv(pct), sample)
+
+
 # ---------------------------------------------------------------------------
 # a8 — tests / docs
 # ---------------------------------------------------------------------------

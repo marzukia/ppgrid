@@ -4890,8 +4890,12 @@ def _raw_csv_header_names(path: str) -> list[str] | None:
 
     pandas mangles duplicate headers (value -> value.1), which hides a
     duplicated role column; the raw header line keeps it. None when the
-    header is not plain text (compressed input, no header line, quoted
-    multi-line header): the caller falls back to the pandas names.
+    header is not plain text (compressed input, no header line): the
+    caller falls back to the pandas names. A quoted multi-line header
+    (unterminated quote on the first physical line) yields the partial
+    first-line name list: `csv.reader` does not error on an unterminated
+    quote. That matches the pandas parse for default column names; only
+    an explicit `--*-col` name spanning the quoted field can disagree.
 
     Args:
         path: CSV input path.
