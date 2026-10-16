@@ -107,6 +107,7 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = Path(__file__).resolve()
 
 SCHEMA_VERSION = 1
+RESULTS_KIND = "ppgrid-regime-results"
 WALL_GATE_THRESHOLD = 2.0
 _TEMP_SAMPLE_S = 0.05
 
@@ -591,17 +592,29 @@ def default_configs() -> list[dict]:
     return table
 
 
+def _spec_error(msg: str) -> None:
+    """Print one clean line to stderr and exit 2 (contract: 2 = config/spec error).
+
+    Raises:
+        SystemExit: 2, after the message is printed.
+    """
+    print(f"[config] {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
 def load_configs(args: argparse.Namespace) -> list[dict]:
     """Resolve the selected config list from CLI + spec file.
 
-    Raises:
-        SystemExit: 2 on unreadable/invalid spec file or empty selection.
+    Spec/config errors (unreadable/invalid spec file, unknown ids, empty
+    selection) print one clean line and raise SystemExit(2) via _spec_error.
     """
     if args.config_file:
-        spec = json.loads(Path(args.config_file).read_text(encoding="utf-8"))
+        try:
+            spec = json.loads(Path(args.config_file).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            _spec_error(f"config file {args.config_file}: {e}")
         if spec.get("schema_version") != SCHEMA_VERSION:
-            msg = f"config file schema_version {spec.get('schema_version')!r} != {SCHEMA_VERSION}"
-            raise SystemExit(msg)
+            _spec_error(f"config file schema_version {spec.get('schema_version')!r} != {SCHEMA_VERSION}")
         table = spec["configs"]
     else:
         table = default_configs()
@@ -612,14 +625,12 @@ def load_configs(args: argparse.Namespace) -> list[dict]:
         known = {c["id"] for c in table}
         missing = wanted - known
         if missing:
-            msg = f"unknown config id(s): {', '.join(sorted(missing))} (known: {', '.join(sorted(known))})"
-            raise SystemExit(msg)
+            _spec_error(f"unknown config id(s): {', '.join(sorted(missing))} (known: {', '.join(sorted(known))})")
         table = [c for c in table if c["id"] in wanted]
     elif args.set == "ci":
         table = [c for c in table if c.get("ci")]
     if not table:
-        msg = "empty config selection"
-        raise SystemExit(msg)
+        _spec_error("empty config selection")
     return table
 
 
@@ -648,7 +659,6 @@ def _mem_total_gb() -> float | None:
                     return round(int(line.split()[1]) / 1_048_576, 1)
     except (OSError, ValueError):
         pass
-    return None
     return None
 
 
@@ -710,6 +720,7 @@ def _env_block() -> dict:
 
     from ppgrid import __version__, _cinterp
 
+    gdal = rasterio.gdal_version()  # a str on rasterio 1.5 (e.g. "3.12.4")
     return {
         "os": sys.platform,
         "platform": platform.platform(),
@@ -721,7 +732,7 @@ def _env_block() -> dict:
         "numpy": np.__version__,
         "pyproj": pyproj.__version__,
         "rasterio": rasterio.__version__,
-        "gdal": ".".join(str(p) for p in rasterio.gdal_version()),
+        "gdal": gdal if isinstance(gdal, str) else ".".join(map(str, gdal)),
         "cinterp_backend": _cinterp.backend(),
     }
 
@@ -836,6 +847,43 @@ def _functional_equivalent(got: Path, want: Path) -> bool:
     return fe(got, want)
 
 
+def _load_baseline(path: Path) -> dict:
+    """Parse + shape-check a baseline results doc.
+
+    Raises:
+        ValueError: Unreadable file, invalid JSON, wrong schema_version/kind,
+            or runs not a list of objects with a string config_id.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        msg = f"baseline {path}: cannot read ({e})"
+        raise ValueError(msg) from e
+    try:
+        bl = json.loads(raw)
+    except json.JSONDecodeError as e:
+        msg = f"baseline {path}: invalid JSON ({e})"
+        raise ValueError(msg) from e
+    if not isinstance(bl, dict):
+        msg = f"baseline {path}: top level must be an object"
+        raise ValueError(msg)
+    if bl.get("schema_version") != SCHEMA_VERSION:
+        msg = f"baseline {path}: schema_version {bl.get('schema_version')!r} != {SCHEMA_VERSION}"
+        raise ValueError(msg)
+    if bl.get("kind") != RESULTS_KIND:
+        msg = f"baseline {path}: kind {bl.get('kind')!r} != {RESULTS_KIND!r}"
+        raise ValueError(msg)
+    runs = bl.get("runs")
+    if not isinstance(runs, list):
+        msg = f"baseline {path}: 'runs' must be a list"
+        raise ValueError(msg)
+    for i, r in enumerate(runs):
+        if not isinstance(r, dict) or not isinstance(r.get("config_id"), str):
+            msg = f"baseline {path}: runs[{i}] must be an object with a string 'config_id'"
+            raise ValueError(msg)
+    return bl
+
+
 def check_wall(runs: list[dict], baseline_path: Path | None, threshold: float) -> dict:
     """Compare total walls against the committed baseline; fail above threshold.
 
@@ -856,8 +904,8 @@ def check_wall(runs: list[dict], baseline_path: Path | None, threshold: float) -
         gate["status"] = "off"
         gate["note"] = f"baseline file missing: {baseline_path}"
         return gate
-    bl = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
-    bl_runs = {r["config_id"]: r for r in bl.get("runs", [])}
+    bl = _load_baseline(baseline_path)
+    bl_runs = {r["config_id"]: r for r in bl["runs"]}
     skip_reasons: list[str] = []
     if bl.get("env", {}).get("n_cpus") != os.cpu_count():
         skip_reasons.append(f"n_cpus mismatch: baseline {bl.get('env', {}).get('n_cpus')} vs current {os.cpu_count()}")
@@ -868,6 +916,14 @@ def check_wall(runs: list[dict], baseline_path: Path | None, threshold: float) -
         if b is None:
             gate["per_config"][cid] = {"status": "no-baseline"}
             continue
+        btm = b.get("timings_s")
+        bt = btm.get("total") if isinstance(btm, dict) else None
+        if b.get("status") == "crashed":
+            gate["per_config"][cid] = {"status": "no-baseline", "reasons": ["baseline entry crashed"]}
+            continue
+        if bt is None:
+            gate["per_config"][cid] = {"status": "no-baseline", "reasons": ["baseline entry has no timings"]}
+            continue
         if r.get("status") == "crashed":
             gate["per_config"][cid] = {"status": "skipped", "reasons": ["run crashed"]}
             continue
@@ -877,7 +933,6 @@ def check_wall(runs: list[dict], baseline_path: Path | None, threshold: float) -
         if json.dumps(r["config"], sort_keys=True) != json.dumps(b.get("config", {}), sort_keys=True):
             gate["per_config"][cid] = {"status": "config-changed"}
             continue
-        bt = b["timings_s"]["total"]
         ct = r["timings_s"]["total"]
         ratio = ct / bt if bt > 0 else None
         status = "pass" if (ratio is not None and ratio <= threshold) else "fail"
@@ -969,10 +1024,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         configs = load_configs(args)
-    except SystemExit as e:
-        if e.code:
-            print(f"[config] {e}", file=sys.stderr)
-        raise
     except ValueError as e:
         print(f"[config] {e}", file=sys.stderr)
         return 2
@@ -986,6 +1037,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         baseline_path = REPO / "bench" / "results" / "baseline" / f"{args.set}.json"
     results_path = Path(args.results_out) if args.results_out else outdir / f"{tag}.json"
+
+    if baseline_path is not None and baseline_path.is_file():
+        try:
+            _load_baseline(baseline_path)  # fail early, before the run loop
+        except ValueError as e:
+            print(f"[config] {e}", file=sys.stderr)
+            return 2
 
     outdir.mkdir(parents=True, exist_ok=True)
     print(f"regime bench: set={args.set} tag={tag} commit={commit[:12]} outdir={outdir}", flush=True)
@@ -1052,7 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
 
     doc = {
         "schema_version": SCHEMA_VERSION,
-        "kind": "ppgrid-regime-results",
+        "kind": RESULTS_KIND,
         "tag": tag,
         "commit": commit,
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

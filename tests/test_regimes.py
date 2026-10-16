@@ -197,7 +197,7 @@ def _fake_run(cid: str, total: float, cfg: dict | None = None) -> dict:
 def _write_baseline(tmp_path: Path, runs: list[dict], n_cpus: int | None = 4) -> Path:
     """Write a baseline results doc and return its path."""
     p = tmp_path / "base.json"
-    doc = {"schema_version": 1, "env": {"n_cpus": n_cpus}, "runs": runs}
+    doc = {"schema_version": 1, "kind": regimes.RESULTS_KIND, "env": {"n_cpus": n_cpus}, "runs": runs}
     p.write_text(json.dumps(doc), encoding="utf-8")
     return p
 
@@ -234,6 +234,84 @@ def test_wall_gate_missing_baseline_file(tmp_path: Path) -> None:
     assert "missing" in off["note"]
     none = regimes.check_wall([_fake_run("a", 99.0)], None, 2.0)
     assert none["status"] == "off"
+
+
+def test_wall_gate_crashed_baseline_entry(tmp_path: Path) -> None:
+    """A crashed baseline entry (no timings_s) is a per-config no-baseline skip, not a crash."""
+    crashed = {"config_id": "a", "config": {"res": 10.0}, "status": "crashed", "exit_code": 1}
+    base = _write_baseline(tmp_path, [crashed, _fake_run("b", 10.0)], n_cpus=os.cpu_count())
+    gate = regimes.check_wall([_fake_run("a", 15.0), _fake_run("b", 15.0)], base, 2.0)
+    assert gate["status"] == "pass"  # b still gates and passes
+    assert gate["per_config"]["a"]["status"] == "no-baseline"
+    assert gate["per_config"]["a"]["reasons"] == ["baseline entry crashed"]
+    assert gate["per_config"]["b"]["status"] == "pass"
+    # Every entry crashed => all skip, never a fail.
+    allc = _write_baseline(tmp_path, [crashed], n_cpus=os.cpu_count())
+    sk = regimes.check_wall([_fake_run("a", 15.0)], allc, 2.0)
+    assert sk["status"] == "skipped"
+    assert sk["per_config"]["a"]["status"] == "no-baseline"
+
+
+def test_wall_gate_baseline_without_timings(tmp_path: Path) -> None:
+    """A baseline entry that is not crashed but lacks timings_s also no-baselines."""
+    odd = {"config_id": "a", "config": {"res": 10.0}, "status": "ok"}
+    base = _write_baseline(tmp_path, [odd], n_cpus=os.cpu_count())
+    gate = regimes.check_wall([_fake_run("a", 15.0)], base, 2.0)
+    assert gate["status"] == "skipped"
+    assert gate["per_config"]["a"]["reasons"] == ["baseline entry has no timings"]
+
+
+def test_baseline_shape_validation(tmp_path: Path) -> None:
+    """Malformed baseline docs give one clean ValueError, not a KeyError traceback."""
+
+    def _w(doc: object, name: str) -> Path:
+        p = tmp_path / name
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        return p
+
+    good = {"schema_version": 1, "kind": regimes.RESULTS_KIND, "runs": []}
+    assert regimes._load_baseline(_w(good, "good.json")) == good
+    with pytest.raises(ValueError, match="schema_version"):
+        regimes._load_baseline(_w({**good, "schema_version": 2}, "sv.json"))
+    with pytest.raises(ValueError, match="kind"):
+        regimes._load_baseline(_w({**good, "kind": "nope"}, "kind.json"))
+    with pytest.raises(ValueError, match="runs"):
+        regimes._load_baseline(_w({**good, "runs": "nope"}, "runs.json"))
+    with pytest.raises(ValueError, match="config_id"):
+        regimes._load_baseline(_w({**good, "runs": [{"id": "a"}]}, "cid.json"))
+    p = tmp_path / "raw.json"
+    p.write_text("not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON"):
+        regimes._load_baseline(p)
+
+
+def test_spec_errors_exit_2(tmp_path: Path) -> None:
+    """Spec/config errors exit 2 per the documented contract (finding 3)."""
+    import argparse
+
+    def _ns(**kw: object) -> argparse.Namespace:
+        base = {"config_file": None, "ids": None, "set": "ci"}
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    with pytest.raises(SystemExit) as e:
+        regimes.load_configs(_ns(ids="nope"))
+    assert e.value.code == 2
+    with pytest.raises(SystemExit) as e:
+        regimes.load_configs(_ns(config_file=str(tmp_path / "missing.json")))
+    assert e.value.code == 2
+    p = tmp_path / "spec.json"
+    p.write_text(json.dumps({"schema_version": 99, "configs": []}), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        regimes.load_configs(_ns(config_file=str(p)))
+    assert e.value.code == 2
+    # Non-empty table whose ci filter empties the selection (finding 2's trap) also exits 2.
+    cfg = _cfg("x", _gen(), {"res": 10.0, "cap_km": 2.0, "transform": "identity", "skip_calibration": True})
+    cfg["ci"] = False
+    p.write_text(json.dumps({"schema_version": 1, "configs": [cfg]}), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        regimes.load_configs(_ns(config_file=str(p), set="ci"))
+    assert e.value.code == 2
 
 
 # --- end-to-end: record schema + rerun bit-identity -------------------------------
@@ -293,3 +371,36 @@ def test_e2e_record_schema(e2e_runs: list[dict]) -> None:
     assert 1 <= rec["grid"]["ny"] <= 10
     assert rec["generator"]["n_occupied"] == 50  # 0.5 x 100 cells, exact
     assert rec["n_points"] == rec["generator"]["n_points"]  # ingest lost nothing
+
+
+# --- end-to-end: crashed baseline through main() --------------------------------
+
+
+def test_main_crashed_baseline_entry_writes_results(tmp_path: Path) -> None:
+    """Reviewer probe: crashed baseline entry => clean skip, results JSON written, exit 0."""
+    cfg = _cfg(
+        "cb",
+        _GEN_E2E,
+        {"res": 100.0, "cap_km": 2.0, "transform": "identity", "skip_calibration": True, "workers": 2},
+    )
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps({"schema_version": 1, "configs": [cfg]}), encoding="utf-8")
+    crashed = {"config_id": "cb", "config": cfg, "status": "crashed", "exit_code": 137}
+    base = _write_baseline(tmp_path, [crashed], n_cpus=os.cpu_count())
+    rc = regimes.main(["--config-file", str(spec_path), "--baseline", str(base), "--outdir", str(tmp_path / "out")])
+    assert rc == 0
+    results = tmp_path / "out" / f"ci-{regimes._commit_hash()[:7]}.json"
+    assert results.is_file()
+    doc = json.loads(results.read_text(encoding="utf-8"))
+    assert doc["wall_gate"]["status"] == "skipped"
+    assert doc["wall_gate"]["per_config"]["cb"]["status"] == "no-baseline"
+    assert doc["wall_gate"]["per_config"]["cb"]["reasons"] == ["baseline entry crashed"]
+    assert doc["runs"][0]["status"] == "ok"
+
+
+def test_main_malformed_baseline_exits_2(tmp_path: Path) -> None:
+    """Malformed baseline file = clean one-line exit 2 before any run starts."""
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"schema_version": 99, "kind": "x", "runs": []}), encoding="utf-8")
+    rc = regimes.main(["--baseline", str(bad), "--outdir", str(tmp_path / "out")])
+    assert rc == 2

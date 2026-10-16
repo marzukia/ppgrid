@@ -79,13 +79,13 @@ Top level (`kind: "ppgrid-regime-results"`):
 
 ```
 schema_version: 1            this file's format (bump on breaking change)
-tag: "ci-<commit12>"         default tag; --tag overrides
+tag: "ci-<commit7>"          default tag; --tag overrides
 commit: "<sha>"              the commit the run executed
 generated_utc: "<ISO-8601>"
-set: "ci" | "all" | ids as selected
+set: "ci" | "all"            the --set value (--ids filters within it)
 wall_gate: {status, baseline, threshold, per_config, note?}
   status: off | skipped | pass | fail
-  per_config[<id>]: {status, wall_s?, baseline_wall_s?, wall_ratio?,
+  per_config[<id>]: {status, total_s?, baseline_total_s?, wall_ratio?,
                      phase_ratios?, reasons?}
   off = no baseline file (note explains); skipped = every config skipped
 env: {os, platform, machine, n_cpus, mem_total_gb, python, ppgrid, numpy,
@@ -96,8 +96,9 @@ runs: [ per-config records, in spec order ]
 Per-run record:
 
 ```
-config_id, config (full spec), generator (achieved descriptors: n_points,
-n_cells, n_occupied, occupied_fraction, points_per_occupied_cell),
+config_id, config (full spec), generator (synthetic achieved descriptors:
+n_points, n_cells, n_occupied, occupied_fraction, points_per_occupied_cell;
+dataset: {dataset: path}),
 n_points, grid {nx, ny, cells, res_m, x0_m, y0_m, padded shape, levels,
 step, halo, bsize, block grid (nbx/nby/n_tasks/n_empty_blocks), CRS, ...}
 timings_s: {ingest, calibrate, grid, write, total}   (wall, run_summary)
@@ -106,14 +107,16 @@ wall_process_s, peak_rss_mib, temp_disk_hwm_mb, temp_samples
 outputs_bytes {value.tif, support_km.tif, calibration.json},
 shas {value, support}
 correctness: {status: pass | fail | no-anchor, mode: bit-identity |
-             functional | skipped, anchor?, bands: {value, support: {status,
-             sha256, anchor_sha256?}}}
+             functional-equivalence | null, anchor?, bands: {value, support:
+             {status, sha256?, anchor_sha256?, path?}}}
+             (mode null = no anchor; block absent when --skip-correctness)
 status: ok | crashed
 vs_baseline: {}            reserved (issue #107 baseline column)
 ```
 
-`temp_disk_hwm_mb` = high-water mark of the config's `.work` temp dir, sampled
-at ~200 ms by a background thread (`temp_samples` = how many samples); `peak_rss_mib`
+`temp_disk_hwm_mb` = high-water mark of the config's run dir temp files
+(start `_`, end `.tmp`), sampled at 50 ms by a background thread
+(`temp_samples` = how many samples); `peak_rss_mib`
 = the worker subprocess's max RSS (one subprocess per config, so peaks are
 honest and independent).
 
@@ -123,5 +126,11 @@ honest and independent).
   drift — a stale baseline must not turn a healthy run red.
 - Crashed configs are excluded from the gate (skipped, reason "run crashed")
   and still fail the overall run via their `status: "crashed"` record.
+- Baseline entries without usable timings (a crashed cut, a malformed entry)
+  are `no-baseline` for that config — skipped, never failed. A malformed
+  baseline file (bad JSON, schema_version, kind, or runs shape) is a clean
+  one-line exit-2 config error before any run starts.
+- Spec/config errors (bad schema_version, unknown ids, empty selection,
+  unreadable spec file) exit 2, per the documented exit-code contract.
 - The ci set excludes equakes500 (8.1–8.4 GB peak RSS vs the 16 GB runner's
   headroom — same precedent as the anchor gate in `ci.yml`).
