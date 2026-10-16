@@ -1,0 +1,56 @@
+# Regime bench (issue #108): on-demand cost + correctness run of the ci regime
+# set with a wall-gate against the committed baseline (bench/results/README.md).
+#
+# Dispatch: github -> ppgrid -> Regimes bench -> Run workflow.
+#   cut baseline = true  -> wall gate off; the result JSON artifact is the new
+#                           baseline (commit it as bench/results/baseline/ci.json).
+#   cut baseline = false -> fails on >2x total-wall regression per config or a
+#                           correctness mismatch. n_cpus/spec drift reports
+#                           skipped (never a red run) — see bench/results/README.md.
+#
+# Sizing: the ci set (melb10 + melb500 + four 10 km synthetic regimes) is the
+# same set the anchor gate already proves fits a 16 GB runner; measured 60 s
+# on the 48-core hydrogen, budget 45 min on 4 vCPU. equakes500 (8 GB peak RSS)
+# is hydrogen-only by design.
+name: Regimes bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      cut_baseline:
+        description: "Skip the wall gate; upload the result JSON to commit as the new baseline"
+        type: boolean
+        default: false
+  # Bootstrap (removed once the baseline is committed): while
+  # bench/results/baseline/ci.json is absent from the checkout the run below
+  # cuts instead of gating, so the first push of this branch produces the
+  # ubuntu-latest baseline without needing a default-branch workflow first.
+  push:
+    branches: [pi-bg/20261015-233500-2024612]
+
+jobs:
+  regimes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          # Pinned: CI must not depend on the runner's ambient Python (ci.yml convention).
+          python-version: "3.13"
+      - run: uv sync --all-extras --locked
+      - name: "Run the ci regime set (wall gate ${{ not inputs.cut_baseline }})"
+        run: |
+          OUT=out/regimes
+          mkdir -p "$OUT"
+          if [ -f bench/results/baseline/ci.json ] && [ "${{ inputs.cut_baseline }}" != "true" ]; then
+            uv run python bench/regimes.py --set ci --outdir "$OUT"
+          else
+            uv run python bench/regimes.py --set ci --outdir "$OUT" --no-wall-gate
+          fi
+      - name: Upload result JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regime-results
+          path: out/regimes/ci-*.json

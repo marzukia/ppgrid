@@ -105,6 +105,15 @@ ignore = [
 "ppgrid/turbop.py" = [
     "suspicious-subprocess-import",   # S404: sysctl fixed argv, no shell
 ]
+# bench/regimes.py is bench glue: it spawns one worker subprocess per config
+# and reads git rev-parse; fixed argv, no shell, returncodes checked by hand.
+"bench/regimes.py" = [
+    "suspicious-subprocess-import",   # S404: worker spawn + git, fixed argv
+    "subprocess-without-shell-equals-true",   # no shell, fixed argv
+    "subprocess-run-without-check",   # returncode checked explicitly
+    "start-process-with-partial-path",   # S607: git with fixed argv
+    "type-check-without-type-error",   # spec validation: ValueError, not TypeError
+]
 # ppgrid/_cinterp.py is JIT-build glue: a subprocess cc call and module-level
 # backend state are the whole point; the strict rules fit its callers, not it.
 "ppgrid/_cinterp.py" = [
@@ -162,6 +171,12 @@ ignore = [
     "S404",   # suspicious subprocess import
     "S602",   # subprocess.run([sys.executable, -c, <own constant>]), no shell
     "S603",   # returncode asserted explicitly
+]
+# tests/test_regimes.py imports the bench script as a module (sys.path insert
+# first, mirroring bench/check_anchors.py's sibling-import convention).
+"tests/test_regimes.py" = [
+    "module-import-not-at-top-of-file",
+    "SLF001",   # private member access (harness drives _validate_cfg & co.)
 ]
 # tests/test_public_api.py runs fresh-interpreter guards (issue #109).
 "tests/test_public_api.py" = [
@@ -227,6 +242,7 @@ ignore = [
     "PLW0603",    # global statement
     "C408",       # unnecessary collection call
     "ERA001",     # commented-out code
+    "RET504",     # record dict built then returned (readability)
     "RUF100",     # unused noqa
 ]
 
