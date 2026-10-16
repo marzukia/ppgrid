@@ -32,6 +32,11 @@ on:
     types: [published]
   workflow_dispatch:
 
+# The upload step attaches assets to the existing release; public repos
+# default GITHUB_TOKEN to read-only, so contents:write is explicit.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
