@@ -499,6 +499,47 @@ def test_a6_memmap_dir_path_raises_valueerror(tmp_path: Path) -> None:
         _open_fresh_memmap(d, np.float64, (2, 2))
 
 
+def test_a6_memmap_dir_eperm_maps_to_valueerror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """a6-1 macOS pin: unlink() on a dir raises EPERM, not EISDIR (BSD).
+
+    Linux raises IsADirectoryError; macOS/BSD raise PermissionError(EPERM).
+    Both must map to the same named ValueError. Monkeypatch Path.unlink to
+    raise PermissionError so the BSD branch is exercised on every platform.
+    A genuine permission error on a regular file is re-raised untouched.
+    """
+    from typing import NoReturn
+
+    from ppgrid._tempfiles import _open_fresh_memmap
+
+    d = tmp_path / "_points.npy"
+    d.mkdir()
+
+    def _raise_eperm(self: Path, *, missing_ok: bool = False) -> NoReturn:
+        """Stand-in for macOS/BSD unlink(dir): raises EPERM (not EISDIR).
+
+        Args:
+            self: The path (a directory, mirroring unlink(dir)).
+            missing_ok: Signature parity with Path.unlink; unused.
+
+        Raises:
+            PermissionError: Always (EPERM), as BSD unlink(2) on a directory.
+
+        """
+        del missing_ok
+        raise PermissionError(1, "Operation not permitted", str(self))
+
+    monkeypatch.setattr(Path, "unlink", _raise_eperm)
+    with pytest.raises(ValueError, match="is a directory"):
+        _open_fresh_memmap(d, np.float64, (2, 2))
+
+    # A regular file with a genuine permission error is NOT a directory:
+    # the PermissionError propagates, it is not swallowed into ValueError.
+    f = tmp_path / "_points2.npy"
+    f.touch()
+    with pytest.raises(PermissionError):
+        _open_fresh_memmap(f, np.float64, (2, 2))
+
+
 def test_a6_cpl_struct_version_checked() -> None:
     """a6-3 pin: a CPLCompressor with nStructVersion != 1 is rejected before the pfn read."""
     import ctypes
