@@ -91,6 +91,17 @@ cd ppgrid
 uv sync
 ```
 
+## Standalone binaries
+
+The [releases](https://github.com/marzukia/ppgrid/releases) page carries
+platform-specific standalone binaries (e.g. `ppgrid-0.5.0-linux-x86_64.xz`):
+one-file builds of the `ppgrid` console script with the Python interpreter,
+GDAL (rasterio wheel) and the PROJ database bundled, so a run needs no
+Python, no GDAL install, and no compiler on the target machine. The
+bit-identical C interpolation kernel ships prebuilt in the bundle; if it ever
+fails to load there, the binary falls back to plain `np.interp`, which
+produces the same output bytes.
+
 ## Support
 
 **Python 3.11-3.14.** All four interpreters are tested in CI on every PR;

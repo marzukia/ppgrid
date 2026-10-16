@@ -1,0 +1,186 @@
+name: Standalone binaries
+
+# One-file PyInstaller builds of the `ppgrid` console script, published as
+# release assets. Normal path = release publication (e.g. v0.5.0);
+# workflow_dispatch = verification path (no matching release -> the build
+# lands as a workflow artifact instead, so it stays inspectable).
+#
+# Recipe (identical to the local 0.5.0 linux build that passed the anchor
+# gate byte-for-byte; see that build's PR body for the proof):
+#   - platform prebuilt of the C interp, compiled with the exact recipe in
+#     ppgrid/_cinterp.py (bit-identical to np.interp; the .so filename
+#     carries the cinterp.c src hash, so a stale build is never loaded)
+#   - --collect-data pyproj / --collect-submodules pyproj (the PROJ
+#     database ships inside the pyproj wheel)
+#   - --collect-all rasterio (the wheel bundles the GDAL libs; PyInstaller
+#     has no hook for it, the default analysis misses its data)
+#   - --hidden-import pandas (loaded via importlib.import_module, invisible
+#     to PyInstaller's static analysis)
+#   - --copy-metadata ppgrid (the package reads __version__ via
+#     importlib.metadata; PyInstaller strips dist-info by default)
+#   - --add-data ppgrid/cinterp.c + ppgrid/_cinterp_c-<hash>.so:ppgrid
+#     (the loader needs cinterp.c present to even look for the .so)
+#
+# The anchor gate (byte-exact vs the committed examples) runs only on the
+# canonical ubuntu x86_64 leg: the anchors are Linux-anchored, and the
+# macOS legs are expected to emit different (functionally equivalent)
+# writer bytes (see bench/check_anchors.py). macOS legs get the functional
+# clean-env e2e instead.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os-name: linux
+            arch: x86_64
+          - os: macos-latest
+            os-name: macos
+            arch: arm64
+          - os: macos-13
+            os-name: macos
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          # Pinned: the anchor gate (ubuntu) is only byte-exact on the
+          # toolchain this repo develops on.
+          python-version: "3.13"
+      - run: uv sync --locked -q
+      - name: Resolve version (pyproject is the source of truth)
+        id: ver
+        run: |
+          ver=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "PVERSION=${ver}" >> "$GITHUB_ENV"
+          echo "ppgrid standalone build: version ${ver} (${RUNNER_OS})"
+      - name: Build platform C interp prebuild (ppgrid._cinterp cc recipe)
+        run: |
+          uv run python - <<'PY'
+          import ppgrid._cinterp as c
+          dst = c._candidate_paths()[0]  # next to the package; name carries the src hash
+          assert c._build(c._SRC, dst), f"cc build failed: {c._build_err}"
+          print("built", dst.name)
+          PY
+          uv run python -c "import ppgrid._cinterp as c; assert c.available(), c.reason(); print('backend:', c.backend())"
+      - name: PyInstaller one-file build
+        run: |
+          set -euo pipefail
+          SO=$(uv run python -c "import ppgrid._cinterp as c; print(c._candidate_paths()[0].name)")
+          mkdir -p build
+          cat > build/entry.py <<'PY'
+          from ppgrid.pipeline import main
+
+          if __name__ == "__main__":
+              main()
+          PY
+          uv run --with pyinstaller pyinstaller --noconfirm --onefile --console --name ppgrid \
+            --collect-data pyproj \
+            --collect-submodules pyproj \
+            --collect-all rasterio \
+            --hidden-import pandas \
+            --copy-metadata ppgrid \
+            --add-data "ppgrid/cinterp.c:ppgrid" \
+            --add-data "ppgrid/${SO}:ppgrid" \
+            build/entry.py
+      - name: Smoke test (--version + clean-env e2e)
+        run: |
+          set -euo pipefail
+          SMOKE_HOME=$(mktemp -d)
+          printf 'value,lng,lat\n100,145.0,-37.8\n200,145.01,-37.81\n300,145.02,-37.82\n' > smoke.csv
+          dist/ppgrid --version
+          dist/ppgrid --help > /dev/null
+          # Clean environment: no venv, no PYTHONPATH, fresh HOME. The
+          # binary must be fully self-contained (bundled Python + GDAL +
+          # PROJ + the C interp).
+          env -i HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+            dist/ppgrid smoke.csv -o "$SMOKE_HOME/out" --lng-col lng --lat-col lat --res 5000 --cap-km auto
+          [ -f "$SMOKE_HOME/out/value.tif" ] && [ -f "$SMOKE_HOME/out/support_km.tif" ]
+          echo "clean-env e2e ok (fresh HOME, no venv)"
+      - name: "No-compiler e2e (ubuntu: PATH without cc/gcc/clang)"
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          # The bundled tier-1 .so must be the only way the C interp loads:
+          # fresh writable HOME + a PATH with no cc/gcc/clang. If the .so
+          # failed to load, the JIT step would create $HOME/.cache/ppgrid.
+          BINDIR=$(mktemp -d)/bin
+          mkdir -p "$BINDIR"
+          (cd "$BINDIR" && for d in /usr/bin /bin; do
+            for f in "$d"/*; do
+              b=$(basename "$f")
+              case "$b" in cc|gcc*|clang*) ;; *) [ -e "$b" ] || ln -s "$f" "$b" ;; esac
+            done
+          done)
+          SMOKE_HOME=$(mktemp -d)
+          printf 'value,lng,lat\n100,145.0,-37.8\n200,145.01,-37.81\n300,145.02,-37.82\n' > smoke.csv
+          env -i HOME="$SMOKE_HOME" PATH="$BINDIR" \
+            dist/ppgrid smoke.csv -o "$SMOKE_HOME/out" --lng-col lng --lat-col lat --res 5000 --cap-km auto
+          [ -f "$SMOKE_HOME/out/value.tif" ] && [ -f "$SMOKE_HOME/out/support_km.tif" ]
+          [ ! -e "$SMOKE_HOME/.cache" ]
+          echo "no-compiler e2e ok (C interp loaded from the bundle, not JIT)"
+      - name: Anchor gate (byte-exact vs committed examples, ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          # The two pinned anchor resolutions, exact bench tier2 config
+          # (bench/bench_tier2.py CONFIGS: value_col price, cap_km 10,
+          # skip_calibration, workers 4). The anchors were cut on the
+          # canonical x86_64 Linux toolchain, so this leg is byte-exact.
+          for spec in "10:10m" "500:500m"; do
+            res="${spec%%:*}"
+            dir="${spec##*:}"
+            env -i PATH=/usr/bin:/bin HOME="$(mktemp -d)" \
+              dist/ppgrid data/melb_houses.csv -o "/tmp/ppgrid-anchor-${dir}" \
+              --value-col price --res "${res}" --cap-km 10 --skip-calibration --workers 4
+            for band in value support_km; do
+              got=$(sha256sum "/tmp/ppgrid-anchor-${dir}/${band}.tif" | cut -d' ' -f1)
+              want=$(sha256sum "examples/melb/${dir}/${band}.tif" | cut -d' ' -f1)
+              if [ "$got" != "$want" ]; then
+                echo "::error::anchor mismatch ${dir}/${band}.tif got=${got} want=${want}"
+                exit 1
+              fi
+              echo "anchor ok: ${dir}/${band}.tif ${got}"
+            done
+          done
+      - name: xz the binary
+        run: |
+          set -euo pipefail
+          NAME="ppgrid-${PVERSION}-${{ matrix.os-name }}-${{ matrix.arch }}.xz"
+          xz -T0 -c dist/ppgrid > "$NAME"
+          sha256sum "$NAME"
+          ls -la "$NAME"
+      - name: Check release presence
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${PVERSION}" > /dev/null 2>&1; then
+            echo "has_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_release=false" >> "$GITHUB_OUTPUT"
+          fi
+      # softprops/action-release@v2 was renamed to action-gh-release; the
+      # successor keeps the tag-based upload with overwrite by default.
+      - name: Upload to release (v$PVERSION)
+        if: steps.rel.outputs.has_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.ver.outputs.version }}"
+          files: "ppgrid-${{ steps.ver.outputs.version }}-${{ matrix.os-name }}-${{ matrix.arch }}.xz"
+      - name: Fall back to workflow artifact (no matching release)
+        if: steps.rel.outputs.has_release == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ppgrid-${{ steps.ver.outputs.version }}-${{ matrix.os-name }}-${{ matrix.arch }}.xz"
+          path: "ppgrid-${{ steps.ver.outputs.version }}-${{ matrix.os-name }}-${{ matrix.arch }}.xz"
+          if-no-files-found: error
