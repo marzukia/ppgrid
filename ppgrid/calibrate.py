@@ -220,24 +220,46 @@ def transforms() -> list[Transform]:
     ]
 
 
+def transform_named(name: str) -> Transform:
+    """Look up an unfitted transform by name.
+
+    The single source for every name -> transform resolution: the CLI
+    --transform choices, calibration files, and Pipeline.tname all resolve
+    through here, so a rename in the factory is a loud ValueError naming
+    the known set, never a raw StopIteration in one of the call sites
+    (audit #83).
+
+    Args:
+        name: The transform name.
+
+    Returns:
+        A fresh unfitted transform instance.
+
+    Raises:
+        ValueError: If name is not in the transforms() factory.
+
+    """
+    for t in transforms():
+        if t.name == name:
+            return t
+    known = ", ".join(sorted(t.name for t in transforms()))
+    msg = f"Unknown transform: {name!r} (known: {known})"
+    raise ValueError(msg)
+
+
 def make_transform(state: dict[str, Any]) -> Transform:
     """Rebuild a fitted transform from its serialised state.
+
+    Non-percentile names resolve through transform_named (a single source
+    for name lookup, audit #83); an unknown name is a named ValueError.
 
     Returns:
         Reconstructed transform instance.
 
-    Raises:
-        ValueError: If the transform name is not recognised.
-
     """
     if state.get("name") == "percentile":
         return PercentileTransform(state.get("quantiles"))
-    name = state.get("name")
-    for t in transforms():
-        if t.name == name:
-            return t
-    msg = f"Unknown transform: {name!r}"
-    raise ValueError(msg)
+    return transform_named(state.get("name"))
 
 
 def _check_quantiles_list(q: Any, path: str, field: str) -> None:
