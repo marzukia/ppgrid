@@ -36,6 +36,18 @@ _COUNT_EPS = 1e-9
 # Sentinel support (metres) for "no data anywhere in the pyramid ancestry".
 _UNRESOLVED_M = 1e9
 
+
+def _level_support_m(res: float, k: int) -> np.float32:
+    """Support radius (metres) of pyramid level k, as the float32 scalar.
+
+    Single source for the per-level support formula (issue #84 a5): every
+    seed/blend site must use this identical float32, so the support field
+    stays bit-consistent across the alloc, banded, and threaded descent
+    paths.
+    """
+    return np.float32(res * (1 << k))
+
+
 try:
     _LIBC = ctypes.CDLL(None, use_errno=True)
 except (TypeError, OSError, AttributeError):
@@ -99,7 +111,13 @@ def downsample_sum(a: np.ndarray) -> np.ndarray:
     Returns:
         Downsampled array with half the dimensions.
 
+    Raises:
+        ValueError: If a is not 2-D or a dimension is odd.
+
     """
+    if a.ndim != 2 or a.shape[0] % 2 or a.shape[1] % 2:
+        msg = f"downsample_sum needs a 2-D array with even dimensions; got shape {a.shape}"
+        raise ValueError(msg)
     out = np.empty((a.shape[0] // 2, a.shape[1] // 2), dtype=a.dtype)
     _nohuge(out)
     np.add(a[0::2, 0::2], a[1::2, 0::2], out=out)
@@ -153,7 +171,7 @@ def upsample_bilinear(a: np.ndarray) -> np.ndarray:
         Upsampled and smoothed array with double the dimensions.
 
     """
-    return _smooth3(upsample_nearest(a).astype(np.float32))
+    return _smooth3(upsample_nearest(a).astype(np.float32, copy=False))
 
 
 def _smooth3_into(a: np.ndarray, out: np.ndarray, t: np.ndarray) -> None:
@@ -270,8 +288,9 @@ def box_count(counts: np.ndarray, radius: int) -> np.ndarray:
     At 2**24 or more total points it falls back to the exact int64 path.
 
     Returns:
-        Box-count array with same shape as input. float32 (exact integer
-        values) on the fast path, int64 on the fallback.
+        Box-count array with same shape as input. radius == 0 returns the
+        counts as int64; otherwise float32 (exact integer values) on the
+        fast path, int64 on the 2**24 fallback.
 
     """
     if radius == 0:
@@ -569,7 +588,7 @@ def _descent_band_body(
         pv = upsample(val[e0:e1])[r0 - p0 : r1 - p0]
         ps = upsample(sup[e0:e1])[r0 - p0 : r1 - p0]
         out[r0:r1] = np.where(a >= 1.0, local, a * local + (1.0 - a) * pv)
-        outs[r0:r1] = a * np.float32(res * (1 << k)) + (1.0 - a) * ps
+        outs[r0:r1] = a * _level_support_m(res, k) + (1.0 - a) * ps
         return
     # Preallocated path (issue #39): same formulas and IEEE-754 association
     # as the alloc path, but every scratch array is a per-thread buffer, so
@@ -616,7 +635,7 @@ def _descent_band_body(
     o += om
     np.copyto(o, local, where=a >= 1.0)
     os = outs[r0:r1]
-    np.multiply(a, np.float32(res * (1 << k)), out=os)
+    np.multiply(a, _level_support_m(res, k), out=os)
     # om holds (1-a)*pv after the value blend; recompute 1-a so the
     # support blend is a*res2k + (1-a)*ps, not (1-a)*pv*ps.
     np.subtract(1.0, a, out=om)
@@ -653,8 +672,8 @@ def _pull_push_descent(
             >1 shrinks thin cells toward the coarser (more reliable) estimate.
         unresolved_m: Support assigned to cells with no data anywhere in their
             pyramid ancestry.
-        stop_level: Descend down to (but not including) this level. 0 = full
-            descent to the finest grid.
+        stop_level: Descend down to this level, inclusive (the final output
+            level). 0 = full descent to the finest grid.
         free_levels: Release pyramid levels once consumed (saves memory on
             large grids). Mutates the input lists (sets entries to None).
         n_threads: Thread pool size for the per-level row chunks (S3.2).
@@ -683,7 +702,7 @@ def _pull_push_descent(
     val = sums[-1] / np.maximum(counts[-1], _COUNT_EPS)
     sup = np.where(
         counts[-1] > 0,
-        np.float32(res * (1 << levels)),
+        _level_support_m(res, levels),
         np.float32(unresolved_m),
     ).astype(np.float32)
 
@@ -751,7 +770,7 @@ def _pull_push_descent(
                 np.multiply(om, upsample(val), out=om)
                 out_val += om
                 np.copyto(out_val, local, where=sat)
-                np.multiply(a, np.float32(res * (1 << k)), out=out_sup)
+                np.multiply(a, _level_support_m(res, k), out=out_sup)
                 np.subtract(1.0, a, out=om)
                 np.multiply(om, upsample(sup), out=om)
                 out_sup += om
@@ -759,7 +778,7 @@ def _pull_push_descent(
             else:
                 parent = upsample(val)
                 val = np.where(a >= 1.0, local, a * local + (1.0 - a) * parent)
-                sup = a * np.float32(res * (1 << k)) + (1.0 - a) * upsample(sup)
+                sup = a * _level_support_m(res, k) + (1.0 - a) * upsample(sup)
         if free_levels:
             sums[k + 1] = None
             counts[k + 1] = None
@@ -904,12 +923,18 @@ def pull_push(
         Tuple of interpolated value grid and support grid in metres.
 
     Raises:
-        ValueError: If grid shapes mismatch or dimensions are not divisible
-            by 2**levels.
+        ValueError: If grid shapes mismatch, dimensions are not divisible
+            by 2**levels, or saturation <= 0.
 
     """
     if sum_grid.shape != count_grid.shape:
         msg = f"sum_grid shape {sum_grid.shape} != count_grid shape {count_grid.shape}"
+        raise ValueError(msg)
+    if saturation <= 0:
+        # a = min(count / saturation, 1) is negative or NaN for saturation
+        # <= 0, which silently poisons the value and support fields (issue
+        # #84 a5): fail up front on the public API.
+        msg = f"saturation must be > 0, got {saturation!r}"
         raise ValueError(msg)
     step = 1 << levels
     for dim in sum_grid.shape:
@@ -988,7 +1013,7 @@ def bin_points_banded(
     ws = w[order]
     _nohuge(order, xs, ys, ws)
     bounds = np.concatenate((np.zeros(1, xs.dtype), np.flatnonzero(np.diff(xs)) + 1, np.array([xs.size], xs.dtype)))
-    if bounds.size < 2 or bounds[1] == 0:
+    if bounds[1] == 0:
         # Zero points: fill both grids so a caller that skips its own
         # pre-fill never reads an uninitialised memmap as data (issue #82;
         # the flat twin bin_points raises on empty ix, this one is the

@@ -142,6 +142,9 @@ ppgrid help
 
 ### CLI Options
 
+The table mirrors the run CLI; `ppgrid --help` (and `ppgrid help`) is the
+source of truth — update this table when the parser changes.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `input` | — | CSV or Parquet input path (bare `ppgrid` exits 2 with a hint; `ppgrid help` prints usage) |
@@ -155,9 +158,10 @@ ppgrid help
 | `--saturation` | `1.0` | Counts for a cell to fully self-trust |
 | `--block` | `2048` | Block size in cells |
 | `--workers` | `4` | Number of parallel workers (positive integer, or `auto` = `os.cpu_count()`) |
+| `--max-band-parallel` | `--workers` | Cap parallel row-band workers for the low-RAM shared descent |
 | `--scale` | `100.0` | DN = percentile * scale |
 | `--percentile-step` | (none) | Round output percentiles to the nearest step (e.g. `5` -> 90/95/100) |
-| `--compress` | `ZSTD` | GeoTIFF compression |
+| `--compress` | `ZSTD` | GeoTIFF tile compression (`NONE, ZSTD, LZW, DEFLATE, PACKBITS, LERC, LZMA`; unknown values exit 2) |
 | `--calibration` | (none) | Path to existing calibration.json |
 | `--calib-max-points` | `2000000` | Max points to use for calibration |
 | `--src-crs` | `4326` | Input CRS (bare int or `EPSG:<code>` string) |
@@ -250,6 +254,13 @@ subcommand — run it as `ppgrid ./compare` (any path form works). Run
 - `1` — pipeline / I/O error (bad output path, missing input file, disk full)
 - `2` — validation error (bad flag value, missing input column, out dir not empty without `--force`)
 - `3` — `--turbo-strict`: shared path infeasible under the RAM budget
+
+### Environment variables
+
+- `PPGRID_FORCE_MEMMAP=1` — force the tmpfs memmap shared-grid regime even on
+  small grids (normally auto-selected past 1e8 cells). A development/testing
+  switch: it changes the memory regime only — the output is bit-identical to
+  the in-RAM pass.
 
 ### Turbo mode
 

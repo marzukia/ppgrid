@@ -810,11 +810,12 @@ def test_cli_o_is_file_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture
 
 
 def test_cli_non_numeric_cell_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """#16: a non-numeric cell is a clean error."""
+    """#16: a non-numeric cell is a clean error naming the offending column (audit #84 a1)."""
     csv = tmp_path / "badcell.csv"
     csv.write_text("value,longitude,latitude\n1.0,144.0,-37.0\nabc,145.0,-38.0\n")
     code, err = _run_cli(capsys, str(csv), "-o", str(tmp_path / "out"))
     _assert_clean_error(code, err, "abc")
+    assert "column 'value'" in err  # audit #84 a1: the column is named, not just the value
 
 
 def test_cli_malformed_csv_clean_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -923,6 +924,29 @@ def _assert_rasters_equivalent(out_path: Path, ref_path: Path) -> None:
     assert max_diff <= 4, f"{out_path.name}: max DN delta {max_diff} > 4"
 
 
+def _assert_rasters_exact(out_path: Path, ref_path: Path) -> None:
+    """Same-stack anchor check: exact decoded arrays + exact grid metadata.
+
+    Byte-pinning the raw file tracked the ENCODER version, not the data: the
+    anchor tifs had to be regenerated on rasterio/GDAL bumps. Decoded arrays
+    + exact metadata pin the same-stack bit-identity that matters (#23), and
+    the raw-byte gate stays in bench/check_anchors.py, where an encoder bump
+    is a deliberate, noticed event (issue #84 a8).
+
+    """
+    with rasterio.open(out_path) as a, rasterio.open(ref_path) as b:
+        assert a.width == b.width
+        assert a.height == b.height
+        assert a.count == b.count
+        assert a.dtypes == b.dtypes, f"{out_path.name} dtype differs"
+        assert a.crs == b.crs, f"{out_path.name} CRS differs"
+        assert a.transform == b.transform, f"{out_path.name} transform differs"
+        assert a.nodata == b.nodata, f"{out_path.name} nodata differs"
+        da = a.read(1)
+        db = b.read(1)
+    assert (da == db).all(), f"{out_path.name}: decoded arrays differ from anchor"
+
+
 def _assert_json_equivalent(a: Any, b: Any, path: str = "") -> None:
     """Recursive JSON compare: exact for str/int keys+values, numeric tol for floats."""
     if isinstance(a, dict) and isinstance(b, dict):
@@ -942,23 +966,35 @@ def _assert_json_equivalent(a: Any, b: Any, path: str = "") -> None:
 
 
 def test_auto_path_byte_identical_to_af13522_anchor(tmp_path: Path) -> None:
-    """#23: the auto (non-forced) path must stay byte-identical to af13522.
+    """#23: the auto (non-forced) path must stay identical to the af13522 anchor.
 
     The cal file write moved after transform resolution; its content must not
     have changed. Anchor was generated with the af13522 code.
 
+    Rasters are compared as decoded arrays + exact grid metadata, not raw
+    file bytes: the byte pin tracked the encoder version (the anchor tifs
+    were regenerated on rasterio/GDAL bumps) while the raw-byte gate stays
+    in bench/check_anchors.py (issue #84 a8). calibration.json is pure JSON
+    and stays byte-exact.
+
+    calibration.json was regenerated for the #84 a7 cv-format change (per-bin
+    rows now ship, per-block cap_km copies dropped); the anchor rasters and
+    input.csv are untouched and all other cal fields are byte-identical.
+
     On the canonical platform (x86_64 Linux, where the anchor was cut) the
-    comparison is byte-exact. On other platforms the vendored PROJ/GDAL/zstd
-    wheels emit different (functionally equivalent) tile bytes, so the rasters
-    are compared as decoded arrays + exact metadata and the calibration as
-    structured values (see the platform predicate in ppgrid._platform).
+    comparison is exact (arrays, metadata, cal bytes). On other platforms the
+    vendored PROJ/GDAL/zstd wheels emit different (functionally equivalent)
+    tile bytes, so the rasters are compared as decoded arrays with tolerance
+    and the calibration as structured values (see the platform predicate in
+    ppgrid._platform).
     """
     out = tmp_path / "out"
     p = Pipeline(str(ANCHOR / "input.csv"), "val", "lon", "lat", str(out), res=500.0, workers=1)
     p.run()
     if is_canonical_platform():
-        for name in ("value.tif", "support_km.tif", "calibration.json"):
-            assert (out / name).read_bytes() == (ANCHOR / name).read_bytes(), f"{name} differs from af13522 anchor"
+        for name in ("value.tif", "support_km.tif"):
+            _assert_rasters_exact(out / name, ANCHOR / name)
+        assert (out / "calibration.json").read_bytes() == (ANCHOR / "calibration.json").read_bytes()
         return
     for name in ("value.tif", "support_km.tif"):
         _assert_rasters_equivalent(out / name, ANCHOR / name)

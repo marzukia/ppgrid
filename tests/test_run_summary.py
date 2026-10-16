@@ -92,7 +92,7 @@ _EXPECTED_LIVE_PANEL_LONG_80 = """╭──────────────�
 # F4: the real ``--plan`` kv block (equakes example) at 80 cols. Inner width
 # 78 clips the two longest kv lines at branch head; the fix wraps them with a
 # 4-space hang and the box hugs the wrapped content (all box lines exactly 80).
-_PLAN_HEADER = "ppgrid run plan (--plan: nothing written, exit 0)"
+_PLAN_HEADER = "ppgrid run plan (--plan: nothing written, exit 0; 3 with --turbo-strict infeasible)"
 _PLAN_KV = [
     "  input:         data/all_equakes.csv",
     "  columns:       value='mag' lng='longitude' lat='latitude'",
@@ -106,12 +106,13 @@ _PLAN_KV = [
     "  saturation:    1",
     "  scale:         100 (DN = percentile * scale), percentile-step: off",
     "  seed:          0",
-    "  workers:       4, max-band-parallel: default (--workers)",
+    "  workers:       4 (block pool), n_threads: 1 (warp/ingest)",
+    "  max-band-parallel: default (--workers)",
     "  compress:      ZSTD",
     "  outputs:       value.tif (EPSG:3857) + support_km.tif",
     "  turbo:         off",
 ]
-_EXPECTED_PLAN_BOX_80 = """ppgrid run plan (--plan: nothing written, exit 0)
+_EXPECTED_PLAN_BOX_80 = """ppgrid run plan (--plan: nothing written, exit 0; 3 with --turbo-strict infeasible)
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  input:         data/all_equakes.csv                                         │
 │  columns:       value='mag' lng='longitude' lat='latitude'                   │
@@ -127,7 +128,8 @@ _EXPECTED_PLAN_BOX_80 = """ppgrid run plan (--plan: nothing written, exit 0)
 │  saturation:    1                                                            │
 │  scale:         100 (DN = percentile * scale), percentile-step: off          │
 │  seed:          0                                                            │
-│  workers:       4, max-band-parallel: default (--workers)                    │
+│  workers:       4 (block pool), n_threads: 1 (warp/ingest)                   │
+│  max-band-parallel: default (--workers)                                      │
 │  compress:      ZSTD                                                         │
 │  outputs:       value.tif (EPSG:3857) + support_km.tif                       │
 │  turbo:         off                                                          │

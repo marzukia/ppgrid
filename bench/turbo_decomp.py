@@ -7,6 +7,8 @@ measures the parallelisable part in isolation.
 Repro: uv run python -m bench.turbo_decomp
 """
 
+import atexit
+import shutil
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -19,9 +21,22 @@ import rasterio
 from rasterio.warp import calculate_default_transform
 
 from ppgrid import pipeline as pm
-from tests.test_turbo import _write_src_tif
 
-TMP = Path(tempfile.mkdtemp(prefix="turbo_bench2"))
+try:
+    from bench._helpers import write_src_tif  # python -m bench.turbo_decomp
+except ImportError:  # python bench/turbo_decomp.py (script dir on sys.path)
+    from _helpers import write_src_tif
+
+_TMP: Path | None = None
+
+
+def _tmp() -> Path:
+    """Scratch dir, created on first use and removed at exit (no import-time leak)."""
+    global _TMP
+    if _TMP is None:
+        _TMP = Path(tempfile.mkdtemp(prefix="turbo_bench2"))
+        atexit.register(shutil.rmtree, str(_TMP), ignore_errors=True)
+    return _TMP
 
 
 def median(f, runs=3):
@@ -34,8 +49,8 @@ def median(f, runs=3):
 
 
 def warp_only():
-    src = TMP / "src.tif"
-    _write_src_tif(src, 5000, 4000)
+    src = _tmp() / "src.tif"
+    write_src_tif(src, 5000, 4000)
     with rasterio.open(src) as ds:
         t, w, h = calculate_default_transform(ds.crs, "EPSG:3857", ds.width, ds.height, *ds.bounds)
 
@@ -69,7 +84,7 @@ def warp_only():
 
 def parse_only(n_rows=1_000_000):
     rng = np.random.default_rng(0)
-    csv = TMP / "big.csv"
+    csv = _tmp() / "big.csv"
     pd.DataFrame(
         {
             "value": rng.normal(0.0, 100.0, n_rows),

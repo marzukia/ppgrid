@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 
 import pytest
+import rasterio
 
 from ppgrid import turbop
 from ppgrid.pipeline import _build_parser, _parse_args_cli, _resolve_log_level, main
@@ -216,8 +217,14 @@ def test_json_summary(tmp_path: Path) -> None:
     assert t["total"] >= t["ingest"] >= 0
     v = s["volumetrics"]
     assert len(v["cells_per_level"]) == g["levels"] + 1
+    # raw_bytes is the FINAL (output-CRS) raster's uncompressed int16
+    # payload, not the work grid (audit #84 a1: the rescale was previously
+    # conflated into compression_ratio).
+    with rasterio.open(out / "value.tif") as ds:
+        dst_cells = ds.width * ds.height
+    assert dst_cells != g["cells"]  # out_crs 3857 != work_crs 6933 rescales
     for band in ("value", "support"):
-        assert v[band]["raw_bytes"] == g["cells"] * 2
+        assert v[band]["raw_bytes"] == dst_cells * 2
         assert 0 < v[band]["compressed_bytes"] <= v[band]["raw_bytes"]
         assert v[band]["compression_ratio"] > 1.0
     assert s["turbo"] is None  # not a turbo run

@@ -140,6 +140,13 @@ ignore = [
     "subprocess-without-shell-equals-true",   # no shell, fixed argv
     "subprocess-run-without-check",   # returncode checked explicitly
 ]
+# tests/test_audit_84.py runs the venv interpreter directly for the shim
+# (`python -m ppgrid.idwgrid`) and touches the summary JSON internals.
+"tests/test_audit_84.py" = [
+    "suspicious-subprocess-import",   # S404: own interpreter, fixed argv
+    "subprocess-run-without-check",   # returncode asserted explicitly
+    "private-member-access",    # _sanitize_json is the unit under test
+]
 # tests/test_tier2_shared.py wraps _prepare_shared to capture the per-box refs
 # before the write phase releases cfg.pts (Windows WinError 32 fix).
 "tests/test_tier2_shared.py" = [

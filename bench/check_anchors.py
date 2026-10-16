@@ -1,6 +1,6 @@
 """Cross-OS anchor gate: byte-identity of pipeline outputs vs committed examples.
 
-Re-runs the CI-safe tier2 configs (melb10, melb500 by default) into a temp
+Re-runs the CI-safe tier2 configs (all six melb resolutions by default) into a temp
 outdir and checks the resulting value.tif / support_km.tif against the
 committed examples/ files.
 
@@ -25,7 +25,7 @@ the CI anchor scope; they remain Linux/hydrogen-anchored via
 compare_tier2.py.
 
 Usage (from the repo root, or anywhere — it chdirs itself):
-    python bench/check_anchors.py                # melb10 + melb500
+    python bench/check_anchors.py                # all six melb resolutions
     python bench/check_anchors.py melb10         # subset
     python bench/check_anchors.py equakes500     # where the box can hold it
 
@@ -58,10 +58,14 @@ REPO = Path(__file__).resolve().parent.parent
 # Keep in sync with bench/compare_tier2.py's ANCHORS.
 ANCHORS: dict[str, tuple[str, str]] = {
     "melb10": ("examples/melb/10m/value.tif", "examples/melb/10m/support_km.tif"),
+    "melb25": ("examples/melb/25m/value.tif", "examples/melb/25m/support_km.tif"),
+    "melb50": ("examples/melb/50m/value.tif", "examples/melb/50m/support_km.tif"),
+    "melb100": ("examples/melb/100m/value.tif", "examples/melb/100m/support_km.tif"),
+    "melb250": ("examples/melb/250m/value.tif", "examples/melb/250m/support_km.tif"),
     "melb500": ("examples/melb/500m/value.tif", "examples/melb/500m/support_km.tif"),
     "equakes500": ("examples/equakes/value.tif", "examples/equakes/support_km.tif"),
 }
-DEFAULT_CONFIGS = ("melb10", "melb500")
+DEFAULT_CONFIGS = ("melb10", "melb25", "melb50", "melb100", "melb250", "melb500")
 
 _CHUNK = 1 << 20
 

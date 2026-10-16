@@ -22,6 +22,10 @@ TILE = 1024
 # Committed-example anchors: (config, committed value tif, committed support tif)
 ANCHORS = [
     ("melb10", "examples/melb/10m/value.tif", "examples/melb/10m/support_km.tif"),
+    ("melb25", "examples/melb/25m/value.tif", "examples/melb/25m/support_km.tif"),
+    ("melb50", "examples/melb/50m/value.tif", "examples/melb/50m/support_km.tif"),
+    ("melb100", "examples/melb/100m/value.tif", "examples/melb/100m/support_km.tif"),
+    ("melb250", "examples/melb/250m/value.tif", "examples/melb/250m/support_km.tif"),
     ("melb500", "examples/melb/500m/value.tif", "examples/melb/500m/support_km.tif"),
     ("equakes500", "examples/equakes/value.tif", "examples/equakes/support_km.tif"),
 ]

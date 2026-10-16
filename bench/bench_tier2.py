@@ -55,10 +55,33 @@ CONFIGS: list[tuple[str, str, dict]] = [
     # Multi-block halo stress: 1M pts, 100km x 100km, res 10m, cap 2km.
     ("wide1m", "synth_wide.csv", {"res": 10.0, "cap_km": 2.0, "workers": 4}),
     # Anchors: must bit-match the committed examples (see compare_tier2.py).
+    # All six melb resolutions are anchored (issue #84 a8: the 25/50/100/250m
+    # rasters were previously unanchored); each is coarser and lighter than
+    # melb10, so the CI-safe bound stays the 10m run's 2.4 GB peak RSS.
     (
         "melb10",
         "data/melb_houses.csv",
         {"value_col": "price", "res": 10.0, "cap_km": 10.0, "skip_calibration": True, "workers": 4},
+    ),
+    (
+        "melb25",
+        "data/melb_houses.csv",
+        {"value_col": "price", "res": 25.0, "cap_km": 10.0, "skip_calibration": True, "workers": 4},
+    ),
+    (
+        "melb50",
+        "data/melb_houses.csv",
+        {"value_col": "price", "res": 50.0, "cap_km": 10.0, "skip_calibration": True, "workers": 4},
+    ),
+    (
+        "melb100",
+        "data/melb_houses.csv",
+        {"value_col": "price", "res": 100.0, "cap_km": 10.0, "skip_calibration": True, "workers": 4},
+    ),
+    (
+        "melb250",
+        "data/melb_houses.csv",
+        {"value_col": "price", "res": 250.0, "cap_km": 10.0, "skip_calibration": True, "workers": 4},
     ),
     (
         "melb500",
