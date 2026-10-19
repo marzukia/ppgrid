@@ -223,6 +223,14 @@ ignore = [
     "INP001",     # implicit namespace package (script dir)
     "T201",       # print (generator output)
 ]
+# scripts/size_ratchet.py is the CI size gate (harden-repo, 2026-10-20):
+# fixed-argv git subprocess calls and stdout gate output are the point.
+"scripts/size_ratchet.py" = [
+    "suspicious-subprocess-import",   # S404: git with fixed argv, no shell
+    "subprocess-without-shell-equals-true",   # fixed argv, no shell
+    "start-process-with-partial-path",   # "git" from PATH, no shell
+    "print",   # T201: gate output
+]
 # bench/*.py are local perf/repro harnesses (not shipped); relax style rules.
 "bench/*.py" = [
     "INP001",     # implicit namespace package (script dir)
