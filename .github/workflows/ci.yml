@@ -92,6 +92,23 @@ jobs:
       - name: Anchor gate (outputs must be byte-identical to committed examples)
         run: uv run python bench/check_anchors.py
 
+  # Deterministic size gate (harden-repo skill, 2026-10-20): line ratchet
+  # (size-ratchet.json budgets may only shrink) + AST top-level-unit gate vs
+  # the PR base. Pushes to main run the line ratchet only (no base ref -> no
+  # diff gate). Stdlib-only script, no third-party deps.
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v4
+        with:
+          # Pinned to match the other legs; the gate script itself is stdlib-only.
+          python-version: "3.13"
+      - run: uv sync --all-extras --locked
+      - run: uv run python scripts/size_ratchet.py --base "${GITHUB_BASE_REF}"
+
   # Built-artifact gate (issue #98): uv build -> fresh stdlib venv (plain
   # pip, no dev extras) -> installed console-script e2e -> anchor gate.
   # The wheel must install and run on every OS in the matrix (s2: per-OS

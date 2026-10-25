@@ -106,3 +106,16 @@ not downstream calculation).
 Dated change notes live in [CHANGELOG.md](CHANGELOG.md), not here — this file
 is stable rules and gotchas only. If a change alters how this file's rules
 read, update the rule in the same PR; do not add a "what changed" entry here.
+
+## File size gate (harden-repo, 2026-10-20)
+
+- File size is a load-bearing signal, checked by `python3 scripts/size_ratchet.py`
+  (CI `size` job + pre-commit hook). >800 non-blank lines = must be in
+  size-ratchet.json; ratcheted files may only shrink. `--update` lowers budgets
+  after a split — never to raise one. .py files only; data/, examples/, dist/,
+  build/, .venv, node_modules excluded.
+- >2,000-line file: no NEW top-level units (top-level def / async def / class;
+  CI export gate vs the PR base ref). New code goes to a sibling module.
+  Test files (`tests/`, `*_test.py`): x3 budget.
+- Task rule: a change adding code to a >2,000-line file must name the target
+  module, not the god file. "Add X to ppgrid/pipeline.py" is an invalid task.
