@@ -57,6 +57,28 @@ def git_out(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
 
 
+def _resolve_ref(ref: str) -> str:
+    """Resolve a base ref usable in ``git diff <ref>...HEAD``.
+
+    CI PR checkouts expose the base as ``origin/<ref>`` with no local
+    branch (actions/checkout checks out the merge ref detached), so a
+    bare ref name can fail rev-parse. Try local ``<ref>``, then
+    ``origin/<ref>``; if neither resolves, fetch ``origin/<ref>`` once.
+    """
+    def _ok(r: str) -> bool:
+        try:
+            git_out("rev-parse", "--verify", f"{r}^{{commit}}")
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    for cand in (ref, f"origin/{ref}"):
+        if _ok(cand):
+            return cand
+    git_out("fetch", "origin", ref)
+    return ref
+
+
 def main() -> int:
     """Run the size gate; return 0 on pass, 1 on fail."""
     args = sys.argv[1:]
@@ -70,6 +92,7 @@ def main() -> int:
 
     changed: set[str] = set()
     if base:
+        base = _resolve_ref(base)
         changed = set(git_out("diff", "--name-only", f"{base}...HEAD").split())
 
     ratchet: dict[str, int] = {}
